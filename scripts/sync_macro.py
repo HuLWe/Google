@@ -32,7 +32,7 @@ def create_http_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; GlobalMacroBot/2.1)",
+        "User-Agent": "Mozilla/5.0 (compatible; GlobalMacroBot/2.2)",
         "Accept": "application/json",
     })
     return session
@@ -40,7 +40,7 @@ def create_http_session():
 
 HTTP = create_http_session()
 
-# ================= 2. 有效 FRED 指标字典 (已剔除下线的 IRLTLT01CNM156N) =================
+# ================= 2. 有效 FRED 指标字典 =================
 FRED_SERIES = [
     # L2: 美元水管 (WALCL与WDTGAL均为百万美元周三水平，RRPONTSYD为十亿美元)
     {"id": "WALCL", "country": "US", "layer": "L2-流动性管道", "name": "美联储总资产 (百万美元)"},
@@ -123,32 +123,43 @@ def fetch_fred_data():
 def fetch_external_apis(series_obs):
     records = []
     wb_metrics = {}
+    imf_metrics = {}
     extra_vals = {}
 
-    # 0. 使用 AkShare 替代已下线的 FRED 中国国债序列，获取日频中债 2Y/10Y 收益率
+    # 0. 使用 AkShare 新版接口 bond_zh_us_yield_em 获取日频中债 2Y/10Y 收益率
     try:
         import akshare as ak
-        df_bond = ak.bond_zh_us_rate(start_date="20250101").dropna(subset=["中国国债收益率10年", "中国国债收益率2年"])
-        if len(df_bond) >= 2:
-            latest_row = df_bond.iloc[-1]
-            prev_row = df_bond.iloc[-2]
-            dt_str = str(latest_row["日期"])[:10]
-            cn10_c, cn10_p = float(latest_row["中国国债收益率10年"]), float(prev_row["中国国债收益率10年"])
-            cn2_c, cn2_p = float(latest_row["中国国债收益率2年"]), float(prev_row["中国国债收益率2年"])
-            series_obs["CN_DGS10"] = [cn10_c, cn10_p]
-            series_obs["CN_DGS2"] = [cn2_c, cn2_p]
-            records.append({
-                "观测日期": dt_str, "国家/地区": "CN", "六层归属": "L2-利率之锚",
-                "指标代码": "CN_DGS10", "指标名称": "中国10年期国债收益率-日频 (%)",
-                "最新值": round(cn10_c, 4), "前值": round(cn10_p, 4), "边际变化": round(cn10_c - cn10_p, 4),
-                "数据源": "ChinaBond / AkShare", "同步时间": NOW_STR,
-            })
-            records.append({
-                "观测日期": dt_str, "国家/地区": "CN", "六层归属": "L2-利率之锚",
-                "指标代码": "CN_DGS2", "指标名称": "中国2年期国债收益率-日频 (%)",
-                "最新值": round(cn2_c, 4), "前值": round(cn2_p, 4), "边际变化": round(cn2_c - cn2_p, 4),
-                "数据源": "ChinaBond / AkShare", "同步时间": NOW_STR,
-            })
+        if hasattr(ak, "bond_zh_us_yield_em"):
+            df_bond = ak.bond_zh_us_yield_em()
+        else:
+            df_bond = ak.bond_zh_us_rate(start_date="20250101")
+
+        col_10y = next((c for c in df_bond.columns if "中国" in str(c) and "10年" in str(c)), None)
+        col_2y = next((c for c in df_bond.columns if "中国" in str(c) and "2年" in str(c)), None)
+        col_dt = next((c for c in df_bond.columns if "日期" in str(c)), df_bond.columns[0])
+
+        if col_10y and col_2y:
+            df_clean = df_bond.dropna(subset=[col_10y, col_2y]).sort_values(by=col_dt)
+            if len(df_clean) >= 2:
+                latest_row = df_clean.iloc[-1]
+                prev_row = df_clean.iloc[-2]
+                dt_str = str(latest_row[col_dt])[:10]
+                cn10_c, cn10_p = float(latest_row[col_10y]), float(prev_row[col_10y])
+                cn2_c, cn2_p = float(latest_row[col_2y]), float(prev_row[col_2y])
+                series_obs["CN_DGS10"] = [cn10_c, cn10_p]
+                series_obs["CN_DGS2"] = [cn2_c, cn2_p]
+                records.append({
+                    "观测日期": dt_str, "国家/地区": "CN", "六层归属": "L2-利率之锚",
+                    "指标代码": "CN_DGS10", "指标名称": "中国10年期国债收益率-日频 (%)",
+                    "最新值": round(cn10_c, 4), "前值": round(cn10_p, 4), "边际变化": round(cn10_c - cn10_p, 4),
+                    "数据源": "ChinaBond / AkShare", "同步时间": NOW_STR,
+                })
+                records.append({
+                    "观测日期": dt_str, "国家/地区": "CN", "六层归属": "L2-利率之锚",
+                    "指标代码": "CN_DGS2", "指标名称": "中国2年期国债收益率-日频 (%)",
+                    "最新值": round(cn2_c, 4), "前值": round(cn2_p, 4), "边际变化": round(cn2_c - cn2_p, 4),
+                    "数据源": "ChinaBond / AkShare", "同步时间": NOW_STR,
+                })
     except Exception as e:
         print(f"[WARN] ChinaBond AkShare failed: {e}")
 
@@ -210,6 +221,7 @@ def fetch_external_apis(series_obs):
                     curr = vals[c].get(str(year)) or vals[c].get(str(year - 1))
                     prev = vals[c].get(str(year - 1)) or curr
                     if curr is not None:
+                        imf_metrics[(c, code)] = round(float(curr), 2)
                         records.append({
                             "观测日期": f"{year}-12-31", "国家/地区": c, "六层归属": layer,
                             "指标代码": f"IMF_{code}", "指标名称": name,
@@ -246,10 +258,10 @@ def fetch_external_apis(series_obs):
         except Exception as e:
             print(f"[WARN] WorldBank {code} failed: {e}")
 
-    return records, wb_metrics, extra_vals
+    return records, wb_metrics, imf_metrics, extra_vals
 
 
-def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
+def analyze_macro_and_blackswan(s_obs, wb_metrics, imf_metrics, extra_vals):
     derived_rows = []
     blackswan_rows = []
     ts_snapshot_dict = {}
@@ -314,7 +326,7 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         pce_sig = "通胀黏性偏高 (>2.5%)" if pce_3m_ann > 2.5 else "通胀温和可控 (<=2.5%)"
         derived_rows.append(["L3-周期象限", "美国核心PCE 3M环比折年率 (%)", pce_3m_ann, "-", pce_sig])
 
-    # E. 跨境套息利差 (含日频中美10Y与2Y利差)
+    # E. 跨境套息利差
     for c_name, sid in [
         ("中美10Y利差 (US-CN)", "CN_DGS10"),
         ("美日10Y利差 (US-JP)", "IRLTLT01JPM156N"),
@@ -392,15 +404,31 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             status = "🟢 正常 (外汇套息波动可控)"
         blackswan_rows.append(["BS-5 套息交易踩踏", "USD/JPY 5日涨跌幅 (%)", jpy_5d_pct, "黄<=-2.5% / 红<=-4.0%", status])
 
-    for iso3 in ["BRA", "IND", "IDN", "TUR"]:
+    # G. 多国横向对比表 (05_多国周期对比_Countries)
+    country_names = {
+        "USA": "美国", "CHN": "中国", "JPN": "日本", "DEU": "德国(欧元区)",
+        "IND": "印度", "BRA": "巴西", "IDN": "印度尼西亚", "TUR": "土耳其"
+    }
+    bond_10y_map = {
+        "USA": get("DGS10"), "CHN": get("CN_DGS10"),
+        "JPN": get("IRLTLT01JPM156N"), "DEU": get("IRLTLT01DEM156N")
+    }
+    country_rows = []
+    for iso3 in COUNTRIES_LIST:
+        gdp = imf_metrics.get((iso3, "NGDP_RPCH"), "-")
+        cpi = imf_metrics.get((iso3, "PCPIPCH"), "-")
+        ca = imf_metrics.get((iso3, "BCA_NGDPD"), "-")
+        fiscal = imf_metrics.get((iso3, "GGXCNL_NGDP"), "-")
+        b10 = bond_10y_map.get(iso3, "-")
         res = wb_metrics.get((iso3, "FI.RES.TOTL.CD"))
         debt = wb_metrics.get((iso3, "DT.DOD.DSTC.CD"))
-        if res and debt:
-            ratio = round((debt / res) * 100, 1)
-            st = "🔴 高危 (>100%)" if ratio > 100 else ("🟡 警戒 (50%-100%)" if ratio > 50 else "🟢 安全 (<50%)")
-            blackswan_rows.append([f"BS-6 EM外债({iso3})", "短期外债/外储比率 (%)", ratio, "黄>50% / 红>100%", st])
+        debt_ratio = round((debt / res) * 100, 1) if (res and debt) else "-"
+        if isinstance(debt_ratio, float):
+            st = "🔴 高危 (>100%)" if debt_ratio > 100 else ("🟡 警戒 (50%-100%)" if debt_ratio > 50 else "🟢 安全 (<50%)")
+            blackswan_rows.append([f"BS-6 EM外债({iso3})", "短期外债/外储比率 (%)", debt_ratio, "黄>50% / 红>100%", st])
+        country_rows.append([iso3, country_names.get(iso3, iso3), gdp, cpi, b10, ca, fiscal, debt_ratio])
 
-    # G. 生成五步研判报告
+    # H. 生成五步研判报告
     sahm = get("SAHMREALTIME") or 0.0
     tips10 = get("DFII10") or 0.0
     growth_weak = sahm >= 0.5
@@ -439,69 +467,81 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         f"③ 美联储净流动性连续两周反向变动超 1,500 亿美元。"
     )
 
-    return derived_rows, blackswan_rows, ts_snapshot_dict, report_text
+    return derived_rows, blackswan_rows, country_rows, ts_snapshot_dict, report_text
 
 
-def sync_all_sheets(raw_records, derived_rows, blackswan_rows, ts_dict, report_text):
+def sync_all_sheets(raw_records, derived_rows, blackswan_rows, country_rows, ts_dict, report_text):
     if not raw_records:
         raise RuntimeError("所有外部接口均未返回有效数据，中止写入以保护表格。")
 
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(GCP_SA_JSON, scopes=scopes)
     gc = gspread.authorize(creds)
-    sa_email = GCP_SA_JSON.get("client_email", "未知服务账号")
+    sh = gc.open_by_key(SPREADSHEET_ID)
 
-    try:
-        sh = gc.open_by_key(SPREADSHEET_ID)
-    except Exception as e:
-        raise RuntimeError(
-            f"Google 返回 404（无权限或格式不符）。请检查：\n"
-            f"1) 打开表格右上角【共享】，将 '{sa_email}' 添加为【编辑者】；\n"
-            f"2) 若表格左上角有绿色 .XLSX 标识，请点击【文件 -> 保存为 Google 表格】后再共享。\n"
-            f"当前解析的 ID: {SPREADSHEET_ID} | 原始错误: {e}"
-        )
-
+    # 1. 更新 01_最新快照_Snapshot
     df_raw = pd.DataFrame(raw_records)
     ws_snap = get_or_create_ws(sh, "01_最新快照_Snapshot")
     ws_snap.clear()
-    ws_snap.update([df_raw.columns.tolist()] + df_raw.values.tolist())
+    ws_snap.update(range_name="A1", values=[df_raw.columns.tolist()] + df_raw.values.tolist())
 
+    # 2. 增量追加/更新 02_历史时序库_TimeSeries (过滤空行防止 IndexError)
     ws_ts = get_or_create_ws(sh, "02_历史时序库_TimeSeries", rows=2000, cols=50)
-    existing = ws_ts.get_all_values()
+    existing = [r for r in ws_ts.get_all_values() if r and len(r) > 0 and str(r[0]).strip()]
     all_keys = ["Date"] + sorted(ts_dict.keys())
     if not existing:
         row_vals = [TODAY_STR] + [ts_dict.get(k, "") for k in all_keys[1:]]
-        ws_ts.update([all_keys, row_vals])
+        ws_ts.update(range_name="A1", values=[all_keys, row_vals])
     else:
         headers = existing[0]
         new_cols = [k for k in all_keys if k not in headers]
         if new_cols:
             headers = headers + new_cols
-            ws_ts.update("A1", [headers])
+            ws_ts.update(range_name="A1", values=[headers])
         new_row = [TODAY_STR] + [ts_dict.get(col, "") for col in headers[1:]]
         if len(existing) > 1 and existing[-1][0] == TODAY_STR:
-            ws_ts.update(f"A{len(existing)}", [new_row])
+            ws_ts.update(range_name=f"A{len(existing)}", values=[new_row])
         else:
             ws_ts.append_row(new_row, value_input_option="USER_ENTERED")
 
+    # 3. 更新 03_衍生组合与信号_Derived
     ws_der = get_or_create_ws(sh, "03_衍生组合与信号_Derived")
     ws_der.clear()
-    ws_der.update([["层级归属", "衍生组合名称", "当前计算值", "边际变化", "第一性原理诊断信号"]] + derived_rows)
+    ws_der.update(
+        range_name="A1",
+        values=[["层级归属", "衍生组合名称", "当前计算值", "边际变化", "第一性原理诊断信号"]] + derived_rows
+    )
 
+    # 4. 更新 04_黑天鹅雷达_BlackSwan
     ws_bs = get_or_create_ws(sh, "04_黑天鹅雷达_BlackSwan")
     ws_bs.clear()
-    ws_bs.update([["风险类别", "监控指标", "当前读数", "黄/红灯阈值", "当前警报状态"]] + blackswan_rows)
+    ws_bs.update(
+        range_name="A1",
+        values=[["风险类别", "监控指标", "当前读数", "黄/红灯阈值", "当前警报状态"]] + blackswan_rows
+    )
 
+    # 5. 更新 05_多国周期对比_Countries
+    ws_cty = get_or_create_ws(sh, "05_多国周期对比_Countries")
+    ws_cty.clear()
+    ws_cty.update(
+        range_name="A1",
+        values=[["代码", "国家/地区", "实际GDP增速(%)", "CPI通胀(%)", "10Y国债(%)", "经常账户/GDP(%)", "财政余额/GDP(%)", "短期外债/外储(%)"]] + country_rows
+    )
+
+    # 6. 更新 00_总览与自动研判_Dashboard & 06_情景与证伪日志_Journal
     ws_dash = get_or_create_ws(sh, "00_总览与自动研判_Dashboard", rows=100, cols=15)
-    ws_dash.update("A1", [["全球宏观第一性原理实时监测中枢（自动化文字研判输出）"]])
-    ws_dash.update("A2", [[report_text]])
+    ws_dash.update(range_name="A1", values=[["全球宏观第一性原理实时监测中枢（自动化文字研判输出）"]])
+    ws_dash.update(range_name="A2", values=[[report_text]])
 
     ws_journal = get_or_create_ws(sh, "06_情景与证伪日志_Journal", rows=1000, cols=5)
-    j_vals = ws_journal.get_all_values()
+    j_vals = [r for r in ws_journal.get_all_values() if r and len(r) > 0 and str(r[0]).strip()]
     if not j_vals:
-        ws_journal.update([["日期", "同步时间", "自动研判与情景证伪记录"], [TODAY_STR, NOW_STR, report_text]])
-    elif j_vals[-1][0] == TODAY_STR:
-        ws_journal.update(f"A{len(j_vals)}", [[TODAY_STR, NOW_STR, report_text]])
+        ws_journal.update(
+            range_name="A1",
+            values=[["日期", "同步时间", "自动研判与情景证伪记录"], [TODAY_STR, NOW_STR, report_text]]
+        )
+    elif len(j_vals) > 1 and j_vals[-1][0] == TODAY_STR:
+        ws_journal.update(range_name=f"A{len(j_vals)}", values=[[TODAY_STR, NOW_STR, report_text]])
     else:
         ws_journal.append_row([TODAY_STR, NOW_STR, report_text], value_input_option="USER_ENTERED")
 
@@ -515,8 +555,8 @@ def get_or_create_ws(sh, title, rows=200, cols=15):
 
 if __name__ == "__main__":
     fred_recs, obs_map = fetch_fred_data()
-    ext_recs, wb_map, extra = fetch_external_apis(obs_map)
+    ext_recs, wb_map, imf_map, extra = fetch_external_apis(obs_map)
     all_raw = fred_recs + ext_recs
-    derived, blackswan, ts_dict, report = analyze_macro_and_blackswan(obs_map, wb_map, extra)
-    sync_all_sheets(all_raw, derived, blackswan, ts_dict, report)
+    derived, blackswan, countries, ts_dict, report = analyze_macro_and_blackswan(obs_map, wb_map, imf_map, extra)
+    sync_all_sheets(all_raw, derived, blackswan, countries, ts_dict, report)
     print(f"[SUCCESS] Synced {len(all_raw)} metrics, {len(blackswan)} BlackSwan monitors, and updated narrative report.")
