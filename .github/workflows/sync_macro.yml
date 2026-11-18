@@ -1,0 +1,29 @@
+name: Sync Global Macro Database to Google Sheets
+
+on:
+  schedule:
+    # 每个交易日 UTC 01:00（北京时间/台北时间 09:00，美债与 FRED 日频更新完毕后）自动同步
+    - cron: "0 1 * * 2-6"
+  workflow_dispatch: # 支持在 GitHub Actions 页面随时点击按钮手动立即同步
+
+jobs:
+  sync-macro:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Macro ETL & Push to Google Sheets
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          GCP_SA_KEY: ${{ secrets.GCP_SA_KEY }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+        run: python scripts/sync_macro.py
