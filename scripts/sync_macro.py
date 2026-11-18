@@ -1,19 +1,51 @@
 import os
+import re
 import json
 import time
 from datetime import datetime, timezone, timedelta
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ================= 1. 读取 GitHub Secrets =================
+# ================= 1. 读取并清洗 GitHub Secrets =================
 FRED_API_KEY = os.environ["FRED_API_KEY"].strip()
-SPREADSHEET_ID = os.environ["SPREADSHEET_ID"].strip()
+
+# 自动兼容用户填入“完整 Google Sheets 网址”或“纯 ID”两种情况
+_raw_ss = os.environ["SPREADSHEET_ID"].strip()
+_match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", _raw_ss)
+SPREADSHEET_ID = _match.group(1) if _match else _raw_ss.split("/")[0].split("?")[0].strip()
+
 GCP_SA_JSON = json.loads(os.environ["GCP_SA_KEY"])
 
 TZ_CST = timezone(timedelta(hours=8))
 NOW_STR = datetime.now(TZ_CST).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def create_http_session():
+    """构建带指数退避重试与标准请求头的 HTTP 会话"""
+    session = requests.Session()
+    retries = Retry(
+        total=4,
+        connect=4,
+        read=4,
+        backoff_factor=1.5,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; GlobalMacroBot/1.0)",
+        "Accept": "application/json",
+    })
+    return session
+
+
+HTTP = create_http_session()
 
 # ================= 2. 多国核心指标字典 (L1 - L5) =================
 FRED_SERIES = [
@@ -63,8 +95,9 @@ def fetch_fred_data():
             f"&file_type=json&sort_order=desc&limit=15"
         )
         try:
-            r = requests.get(url, timeout=15).json()
-            obs = [o for o in r.get("observations", []) if o.get("value") != "."]
+            resp = HTTP.get(url, timeout=(10, 30))
+            resp.raise_for_status()
+            obs = [o for o in resp.json().get("observations", []) if o.get("value") != "."]
             if not obs:
                 continue
             val_curr = float(obs[0]["value"])
@@ -82,7 +115,7 @@ def fetch_fred_data():
                 "数据源": "FRED API",
                 "同步时间": NOW_STR,
             })
-            time.sleep(0.12)
+            time.sleep(0.15)
         except Exception as e:
             print(f"[WARN] FRED {item['id']} failed: {e}")
     return records, latest_map
@@ -92,11 +125,11 @@ def fetch_nyfed_and_wb():
     records = []
     wb_metrics = {}
 
-    # 1. NY Fed 日频 SOFR (零 Key)
+    # 1. NY Fed 日频 SOFR
     try:
-        sofr = requests.get(
-            "https://markets.newyorkfed.org/api/rates/secured/sofr/last/2.json", timeout=15
-        ).json()["refRates"]
+        resp = HTTP.get("https://markets.newyorkfed.org/api/rates/secured/sofr/last/2.json", timeout=(10, 30))
+        resp.raise_for_status()
+        sofr = resp.json().get("refRates", [])
         if len(sofr) >= 2:
             c, p = float(sofr[0]["percentRate"]), float(sofr[1]["percentRate"])
             records.append({
@@ -114,7 +147,7 @@ def fetch_nyfed_and_wb():
     except Exception as e:
         print(f"[WARN] NYFed failed: {e}")
 
-    # 2. IMF DataMapper 多国宏观结构 (GDP / 通胀 / 经常账户 / 财政赤字)
+    # 2. IMF DataMapper 多国宏观结构
     year = datetime.now().year
     imf_codes = {
         "NGDP_RPCH": ("L3-周期象限", "实际GDP年增速 (%)"),
@@ -125,7 +158,9 @@ def fetch_nyfed_and_wb():
     for code, (layer, name) in imf_codes.items():
         try:
             url = f"https://www.imf.org/external/datamapper/api/v1/{code}/{'/'.join(COUNTRIES_LIST)}?periods={year-1},{year}"
-            vals = requests.get(url, timeout=15).json().get("values", {}).get(code, {})
+            resp = HTTP.get(url, timeout=(10, 35))
+            resp.raise_for_status()
+            vals = resp.json().get("values", {}).get(code, {})
             for c in COUNTRIES_LIST:
                 if c in vals:
                     curr = vals[c].get(str(year)) or vals[c].get(str(year - 1))
@@ -146,7 +181,7 @@ def fetch_nyfed_and_wb():
         except Exception as e:
             print(f"[WARN] IMF {code} failed: {e}")
 
-    # 3. World Bank 新兴市场短期外债 & 外汇储备 (计算L4防爆比率)
+    # 3. World Bank 新兴市场短期外债 & 外汇储备 (放宽 read timeout 至 45 秒)
     wb_codes = {
         "FI.RES.TOTL.CD": "官方外汇储备总额 (美元)",
         "DT.DOD.DSTC.CD": "短期外债余额 (美元)",
@@ -154,7 +189,9 @@ def fetch_nyfed_and_wb():
     for code, name in wb_codes.items():
         try:
             url = f"https://api.worldbank.org/v2/country/{';'.join(COUNTRIES_LIST)}/indicator/{code}?format=json&mrv=2"
-            data = requests.get(url, timeout=15).json()
+            resp = HTTP.get(url, timeout=(10, 45))
+            resp.raise_for_status()
+            data = resp.json()
             if len(data) > 1 and data[1]:
                 seen = {}
                 for row in data[1]:
@@ -184,26 +221,25 @@ def fetch_nyfed_and_wb():
 
 
 def build_derived_signals(latest_map, wb_metrics):
-    """基于六层第一性原理计算高阶衍生组合与预警信号"""
     derived = []
 
     def get_val(sid, idx=0):
         arr = latest_map.get(sid, [])
         return arr[idx] if len(arr) > idx else None
 
-    # 1. 美联储净流动性 = WALCL(百万) - WTREGEN(百万) - RRPONTSYD(十亿)*1000
+    # 1. 美联储净流动性
     walcl, tga, rrp = get_val("WALCL"), get_val("WTREGEN"), get_val("RRPONTSYD")
     walcl_p, tga_p, rrp_p = get_val("WALCL", 1), get_val("WTREGEN", 1), get_val("RRPONTSYD", 1)
     if all(v is not None for v in [walcl, tga, rrp]):
-        net_liq = (walcl - tga - rrp * 1000) / 1000.0  # 换算为十亿美元
+        net_liq = (walcl - tga - rrp * 1000) / 1000.0
         net_liq_p = (walcl_p - tga_p - rrp_p * 1000) / 1000.0
         delta = round(net_liq - net_liq_p, 2)
         signal = "放水扩张 (利好风险资产)" if delta > 0 else "抽水收缩 (警惕流动性紧缩)"
         derived.append(["L2-美元水管", "美联储净流动性 (十亿美元)", round(net_liq, 2), delta, signal])
 
-    # 2. 美债收益率曲线牛陡 / 熊陡分类器
+    # 2. 美债收益率曲线牛陡 / 熊陡
     y10, y2 = get_val("DGS10"), get_val("DGS2")
-    y10_p, y2_p = get_val("DGS10", 5), get_val("DGS2", 5)  # 对比5个交易日前
+    y10_p, y2_p = get_val("DGS10", 5), get_val("DGS2", 5)
     if all(v is not None for v in [y10, y2, y10_p, y2_p]):
         spread = round(y10 - y2, 3)
         spread_chg = round(spread - (y10_p - y2_p), 3)
@@ -217,17 +253,19 @@ def build_derived_signals(latest_map, wb_metrics):
             regime = "曲线趋平 (紧缩或观望过渡期)"
         derived.append(["L2-利率之锚", "美债10Y-2Y利差与曲线形态 (%)", spread, spread_chg, regime])
 
-    # 3. 跨境套息利差 (中美 / 美日 / 美德 10Y)
-    for c_name, sid in [("中美10Y利差 (US-CN)", "IRLTLT01CNM156N"),
-                        ("美日10Y利差 (US-JP)", "IRLTLT01JPM156N"),
-                        ("美德10Y利差 (US-DE)", "IRLTLT01DEM156N")]:
+    # 3. 跨境套息利差
+    for c_name, sid in [
+        ("中美10Y利差 (US-CN)", "IRLTLT01CNM156N"),
+        ("美日10Y利差 (US-JP)", "IRLTLT01JPM156N"),
+        ("美德10Y利差 (US-DE)", "IRLTLT01DEM156N"),
+    ]:
         c_y = get_val(sid)
         if y10 is not None and c_y is not None:
             diff = round(y10 - c_y, 3)
             note = "美元高息虹吸，警惕非美货币贬值/套息波动" if diff > 2.0 else "利差收窄，跨境套息资金回流风险上升"
             derived.append(["L4-跨境利差", c_name, diff, "-", note])
 
-    # 4. 萨姆规则衰退触发器 (当前失业率3M均值 - 过去12M最低3M均值 >= 0.50%)
+    # 4. 萨姆规则衰退触发器
     unrate_arr = latest_map.get("UNRATE", [])
     if len(unrate_arr) >= 12:
         ma3_list = [sum(unrate_arr[i:i+3]) / 3.0 for i in range(len(unrate_arr) - 2)]
@@ -248,18 +286,27 @@ def build_derived_signals(latest_map, wb_metrics):
 
 
 def write_to_gsheet(raw_records, derived_rows):
+    if not raw_records:
+        raise RuntimeError("所有外部数据源本次均未返回有效数据，已中止写入以保护表格原有历史记录。")
+
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(GCP_SA_JSON, scopes=scopes)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # 写入 01_原始指标库_Raw
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        sa_email = GCP_SA_JSON.get("client_email", "未知服务账号")
+        raise RuntimeError(
+            f"无法打开 Google 表格 (解析后的 ID: '{SPREADSHEET_ID}')。"
+            f"请检查两点：1) 该 ID 是否正确；2) 是否已在 Google 表格右上角【共享】中将 '{sa_email}' 设为编辑者。原始错误: {e}"
+        )
+
     df_raw = pd.DataFrame(raw_records)
     ws_raw = get_or_create_ws(sh, "01_原始指标库_Raw")
     ws_raw.clear()
     ws_raw.update([df_raw.columns.tolist()] + df_raw.values.tolist())
 
-    # 写入 03_衍生组合与信号_Derived
     ws_der = get_or_create_ws(sh, "03_衍生组合与信号_Derived")
     ws_der.clear()
     der_headers = ["层级归属", "衍生组合名称", "当前计算值", "边际变化", "第一性原理诊断信号"]
