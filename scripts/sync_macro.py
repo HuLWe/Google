@@ -323,6 +323,7 @@ def fetch_fred_data():
 
 
 def fetch_china_macro_akshare(series_obs, series_dates):
+    """兼容 AkShare >= 1.20.42 标准化接口名与自然年月排序"""
     records = []
     try:
         import akshare as ak
@@ -340,67 +341,98 @@ def fetch_china_macro_akshare(series_obs, series_dates):
             "数据源": "NBS / PBOC (AkShare)", "同步时间": NOW_STR,
         })
 
+    def get_latest_two(df, dt_col, val_col):
+        temp = df[[dt_col, val_col]].copy()
+        temp["_num"] = pd.to_numeric(
+            temp[val_col].astype(str).str.replace("%", "", regex=False).str.replace(",", "", regex=False).str.strip(),
+            errors="coerce"
+        )
+        temp = temp.dropna(subset=["_num"])
+        if len(temp) < 2:
+            return None
+        # 按提取出的数字元组 (年, 月, 日) 升序排列，避免 "9月份" > "10月份" 字符串比较错位
+        temp["_sort"] = temp[dt_col].apply(
+            lambda x: tuple(int(n) for n in re.findall(r"\d+", str(x))) or (0,)
+        )
+        temp = temp.sort_values(by="_sort", ascending=True)
+        r_curr, r_prev = temp.iloc[-1], temp.iloc[-2]
+        return str(r_curr[dt_col])[:12].strip(), float(r_curr["_num"]), float(r_prev["_num"])
+
+    # 1. 中国官方制造业与非制造业 PMI
     try:
         df_pmi = ak.macro_china_pmi()
         col_dt = next((c for c in df_pmi.columns if "月份" in str(c) or "日期" in str(c)), df_pmi.columns[0])
         col_mfg = next((c for c in df_pmi.columns if "制造业" in str(c) and "非制造业" not in str(c) and "指数" in str(c)), None)
         col_non = next((c for c in df_pmi.columns if "非制造业" in str(c) and "指数" in str(c)), None)
         if col_mfg:
-            df_c = df_pmi.dropna(subset=[col_mfg]).copy()
-            if len(df_c) >= 2:
-                r0, r1 = (df_c.iloc[0], df_c.iloc[1]) if str(df_c.iloc[0][col_dt]) > str(df_c.iloc[-1][col_dt]) else (df_c.iloc[-1], df_c.iloc[-2])
-                dt_pmi = str(r0[col_dt])[:10]
-                add_cn_rec(dt_pmi, "L3-工业与消费", "CN_PMI_MFG", "中国官方制造业PMI (荣枯线=50)", float(r0[col_mfg]), float(r1[col_mfg]))
-                if col_non and pd.notna(r0[col_non]) and pd.notna(r1[col_non]):
-                    add_cn_rec(dt_pmi, "L3-工业与消费", "CN_PMI_NONMFG", "中国官方非制造业PMI (荣枯线=50)", float(r0[col_non]), float(r1[col_non]))
+            res_mfg = get_latest_two(df_pmi, col_dt, col_mfg)
+            if res_mfg:
+                dt_pmi, c_val, p_val = res_mfg
+                add_cn_rec(dt_pmi, "L3-工业与消费", "CN_PMI_MFG", "中国官方制造业PMI (荣枯线=50)", c_val, p_val)
+        if col_non:
+            res_non = get_latest_two(df_pmi, col_dt, col_non)
+            if res_non:
+                dt_pmi, c_val, p_val = res_non
+                add_cn_rec(dt_pmi, "L3-工业与消费", "CN_PMI_NONMFG", "中国官方非制造业PMI (荣枯线=50)", c_val, p_val)
     except Exception as e:
         print(f"[WARN] CN PMI failed: {e}")
 
+    # 2. 中国规模以上工业增加值同比 (%) -> 适配 1.20.42+ 新接口名 macro_china_industrial_value_added
     try:
-        df_ind = ak.macro_china_gyzjz()
+        fn_ind = getattr(ak, "macro_china_industrial_value_added", None) or getattr(ak, "macro_china_gyzjz")
+        df_ind = fn_ind()
         col_dt = next((c for c in df_ind.columns if "月份" in str(c) or "日期" in str(c)), df_ind.columns[0])
-        col_yoy = next((c for c in df_ind.columns if "同比" in str(c)), None)
+        col_yoy = next(
+            (c for c in df_ind.columns if "同比" in str(c) or "今值" in str(c) or "最新" in str(c)),
+            df_ind.columns[1] if len(df_ind.columns) > 1 else None
+        )
         if col_yoy:
-            df_c = df_ind.dropna(subset=[col_yoy])
-            if len(df_c) >= 2:
-                r0, r1 = (df_c.iloc[0], df_c.iloc[1]) if str(df_c.iloc[0][col_dt]) > str(df_c.iloc[-1][col_dt]) else (df_c.iloc[-1], df_c.iloc[-2])
-                add_cn_rec(str(r0[col_dt])[:10], "L3-工业与消费", "CN_IND_YOY", "中国规模以上工业增加值同比 (%)", float(r0[col_yoy]), float(r1[col_yoy]))
+            res_ind = get_latest_two(df_ind, col_dt, col_yoy)
+            if res_ind:
+                add_cn_rec(res_ind[0], "L3-工业与消费", "CN_IND_YOY", "中国规模以上工业增加值同比 (%)", res_ind[1], res_ind[2])
     except Exception as e:
         print(f"[WARN] CN Industrial failed: {e}")
 
+    # 3. 中国社会融资规模增量 (亿元) -> 适配 1.20.42+ 新接口名 macro_china_social_financing
     try:
-        df_tsf = ak.macro_china_shrzgm()
+        fn_tsf = getattr(ak, "macro_china_social_financing", None) or getattr(ak, "macro_china_shrzgm")
+        df_tsf = fn_tsf()
         col_dt = next((c for c in df_tsf.columns if "月份" in str(c) or "日期" in str(c)), df_tsf.columns[0])
-        col_val = next((c for c in df_tsf.columns if "社会融资规模增量" in str(c)), None)
+        col_val = next(
+            (c for c in df_tsf.columns if ("社会融资" in str(c) or "增量" in str(c) or "总计" in str(c)) and "同比" not in str(c) and "环比" not in str(c)),
+            df_tsf.columns[1] if len(df_tsf.columns) > 1 else None
+        )
         if col_val:
-            df_c = df_tsf.dropna(subset=[col_val])
-            if len(df_c) >= 2:
-                r0, r1 = (df_c.iloc[0], df_c.iloc[1]) if str(df_c.iloc[0][col_dt]) > str(df_c.iloc[-1][col_dt]) else (df_c.iloc[-1], df_c.iloc[-2])
-                add_cn_rec(str(r0[col_dt])[:10], "L1-信用引擎", "CN_TSF_NEW", "中国社会融资规模增量 (亿元)", float(r0[col_val]), float(r1[col_val]))
+            res_tsf = get_latest_two(df_tsf, col_dt, col_val)
+            if res_tsf:
+                add_cn_rec(res_tsf[0], "L1-信用引擎", "CN_TSF_NEW", "中国社会融资规模增量 (亿元)", res_tsf[1], res_tsf[2])
     except Exception as e:
         print(f"[WARN] CN TSF failed: {e}")
 
+    # 4. 中国 CPI 同比 (%)
     try:
         df_cpi = ak.macro_china_cpi()
         col_dt = next((c for c in df_cpi.columns if "月份" in str(c) or "日期" in str(c)), df_cpi.columns[0])
-        col_yoy = next((c for c in df_cpi.columns if "全国" in str(c) and "同比" in str(c)), next((c for c in df_cpi.columns if "同比" in str(c)), None))
+        col_yoy = next(
+            (c for c in df_cpi.columns if "全国" in str(c) and "同比" in str(c)),
+            next((c for c in df_cpi.columns if "同比" in str(c)), None)
+        )
         if col_yoy:
-            df_c = df_cpi.dropna(subset=[col_yoy])
-            if len(df_c) >= 2:
-                r0, r1 = (df_c.iloc[0], df_c.iloc[1]) if str(df_c.iloc[0][col_dt]) > str(df_c.iloc[-1][col_dt]) else (df_c.iloc[-1], df_c.iloc[-2])
-                add_cn_rec(str(r0[col_dt])[:10], "L3-通胀硬数据", "CN_CPI_YOY", "中国CPI同比增速 (%)", float(r0[col_yoy]), float(r1[col_yoy]))
+            res_cpi = get_latest_two(df_cpi, col_dt, col_yoy)
+            if res_cpi:
+                add_cn_rec(res_cpi[0], "L3-通胀硬数据", "CN_CPI_YOY", "中国CPI同比增速 (%)", res_cpi[1], res_cpi[2])
     except Exception as e:
         print(f"[WARN] CN CPI failed: {e}")
 
+    # 5. 中国 PPI 同比 (%)
     try:
         df_ppi = ak.macro_china_ppi()
         col_dt = next((c for c in df_ppi.columns if "月份" in str(c) or "日期" in str(c)), df_ppi.columns[0])
-        col_yoy = next((c for c in df_ppi.columns if "同比" in str(c)), None)
+        col_yoy = next((c for c in df_ppi.columns if "同比" in str(c) or "今值" in str(c)), None)
         if col_yoy:
-            df_c = df_ppi.dropna(subset=[col_yoy])
-            if len(df_c) >= 2:
-                r0, r1 = (df_c.iloc[0], df_c.iloc[1]) if str(df_c.iloc[0][col_dt]) > str(df_c.iloc[-1][col_dt]) else (df_c.iloc[-1], df_c.iloc[-2])
-                add_cn_rec(str(r0[col_dt])[:10], "L3-通胀硬数据", "CN_PPI_YOY", "中国PPI工业品出厂价格同比 (%)", float(r0[col_yoy]), float(r1[col_yoy]))
+            res_ppi = get_latest_two(df_ppi, col_dt, col_yoy)
+            if res_ppi:
+                add_cn_rec(res_ppi[0], "L3-通胀硬数据", "CN_PPI_YOY", "中国PPI工业品出厂价格同比 (%)", res_ppi[1], res_ppi[2])
     except Exception as e:
         print(f"[WARN] CN PPI failed: {e}")
 
@@ -554,7 +586,6 @@ def build_historical_seed_rows(series_hist_dates, ts_snapshot_dict):
     for dt in base_dates[-20:]:
         row_dict = {"Date": dt}
         for sid, dmap in series_hist_dates.items():
-            # 取 <= dt 的最近有效值（前向填充周频/月频宏观序列）
             valid_dts = [d for d in dmap.keys() if d <= dt]
             if valid_dts:
                 val = round(dmap[max(valid_dts)], 4)
@@ -564,7 +595,6 @@ def build_historical_seed_rows(series_hist_dates, ts_snapshot_dict):
                 row_dict[sid] = last_known[sid]
             elif sid in ts_snapshot_dict:
                 row_dict[sid] = ts_snapshot_dict[sid]
-        # 同步计算历史每日衍生指标
         if all(k in row_dict for k in ["WALCL", "WDTGAL", "RRPONTSYD"]):
             row_dict["NET_LIQUIDITY"] = round((row_dict["WALCL"] - row_dict["WDTGAL"]) / 1000.0 - row_dict["RRPONTSYD"], 2)
         if all(k in row_dict for k in ["DGS10", "DGS2"]):
@@ -687,7 +717,7 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     if gl_ind_stat.get("price"):
         macro_indicator_rows.append(["全球 (GLOBAL)", "工业景气", "全球工业指数 ETF (EXI)", f"{gl_ind_stat['price']}", f"5日 {gl_ind_stat.get('pct_5d', 0):+.2f}% | 20日 {gl_ind_stat.get('pct_20d', 0):+.2f}%", TODAY_STR, "全球制造业资本开支高频温度计"])
 
-    # ================= B. 衍生指标 Python 侧状态计算 (用于时序存储与解读文本) =================
+    # ================= B. 衍生指标 Python 侧状态计算 =================
     walcl, tga, rrp = get("WALCL"), get("WDTGAL"), get("RRPONTSYD")
     walcl_p, tga_p, rrp_p = get("WALCL", 1), get("WDTGAL", 1), get("RRPONTSYD", 1)
     net_liq, net_liq_chg = None, 0.0
@@ -846,7 +876,7 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
         debt_ratio = round((debt / res) * 100, 1) if (res and debt) else ""
         if isinstance(debt_ratio, float):
             st = "🔴 红灯熔断" if debt_ratio > 100 else ("🟡 黄灯警戒" if debt_ratio > 50 else "🟢 正常")
-            blackswan_rows.append([f"BS-7", f"EM外债({iso3})", "短期外债/外储比率 (%)", debt_ratio, "50.0%", "100.0%", st, "外储不足以覆盖1年内到期外债，强美元下易发货币危机"])
+            blackswan_rows.append(["BS-7", f"EM外债({iso3})", "短期外债/外储比率 (%)", debt_ratio, "50.0%", "100.0%", st, "外储不足以覆盖1年内到期外债，强美元下易发货币危机"])
         country_rows.append([iso3, country_names.get(iso3, iso3), gdp, cpi, b10, "", ca, fiscal, debt_ratio])
 
     # ================= E. 生成五步中文研判报告 =================
@@ -954,12 +984,11 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
             except Exception:
                 pass
 
-    # ================= 1. 更新 02_历史时序库_TimeSeries (含首日自动历史回填) =================
+    # ================= 1. 更新 02_历史时序库_TimeSeries =================
     existing = [r for r in ws_ts.get_all_values() if r and len(r) > 0 and str(r[0]).strip()]
     all_keys = ["Date"] + sorted(ts_dict.keys())
 
     if len(existing) <= 2 and seed_rows:
-        # 历史数据不足时，写入近20个交易日历史回填基底 + 今日最新值
         merged_by_dt = {r["Date"]: r for r in seed_rows}
         today_entry = {"Date": TODAY_STR}
         today_entry.update(ts_dict)
@@ -988,7 +1017,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
             ts_row_count = len(existing) + 1
         ts_headers = headers
 
-    # 建立 {指标代码: 列字母} 映射字典，供驾驶舱动态生成科学公式与原生图表
     ts_col_map = {col_name: col_idx_to_letter(i) for i, col_name in enumerate(ts_headers)}
     ts_idx_map = {col_name: i for i, col_name in enumerate(ts_headers)}
 
@@ -1025,7 +1053,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
         values=[df_raw.columns.tolist()] + df_raw.values.tolist(),
         value_input_option="USER_ENTERED"
     )
-    # 右侧 L:N 写入研判与证伪日志
     log_rows = [["日期", "同步时间", "自动研判与强制证伪记录"]] + legacy_logs
     if log_rows[-1][0] == TODAY_STR:
         log_rows[-1] = [TODAY_STR, NOW_STR, report_text]
@@ -1047,7 +1074,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
             item["driver"]
         ])
 
-    mac_start_row = len(mkt_matrix) + 2
     mac_headers = ["国家/区域", "经济维度", "核心指标名称", "最新核心读数", "前值/参考基准", "数据发布期", "第一性原理周期信号"]
     mkt_matrix.append([])
     mkt_matrix.append(["【第二部分】全球主要经济体高权重宏观硬数据（非农 / PMI / 工业产出 / 社融 / CPI-PPI）"])
@@ -1057,19 +1083,16 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
 
     ws_mkt_mac.update(range_name="A1", values=mkt_matrix, value_input_option="USER_ENTERED")
 
-    # ================= 4. 更新 00_宏观驾驶舱_Dashboard (科学公式矩阵 + 雷达 + 多国对比) =================
+    # ================= 4. 更新 00_宏观驾驶舱_Dashboard =================
     ws_dash.clear()
     dash_rows = []
-    # Row 1-2: 标题与五步研判简报
     dash_rows.append(["全球宏观第一性原理实时监测驾驶舱（科学公式计算 + 多维可视化中枢）"])
     dash_rows.append([report_text])
     dash_rows.append([])
 
-    # Row 4-5: 模块一表头
     dash_rows.append(["【模块一】科学公式动态计算矩阵（实时联动全量底表与历史时序库）"])
     dash_rows.append(["层级归属", "复合衍生指标", "公式实时计算值", "边际变化", "历史分位", "Z-Score偏离", "20日走势图", "科学公式定义", "第一性原理诊断信号"])
 
-    # 动态生成 12 行科学公式指标 (从 Row 6 开始)
     sci_specs = [
         ("L2-美元水管", "美联储净流动性 (十亿美元)",
          f"=IFERROR(({raw_lookup('WALCL')}-{raw_lookup('WDTGAL')})/1000-{raw_lookup('RRPONTSYD')}, \"\")",
@@ -1120,17 +1143,13 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
             formula_desc, sig
         ])
 
-    # 模块二：黑天鹅 8 维熔断雷达
     dash_rows.append([])
     bs_title_row = len(dash_rows) + 1
     dash_rows.append(["【模块二】黑天鹅 8 维系统性风险熔断雷达（实时阈值监控）"])
     dash_rows.append(["风险编号", "风险维度", "核心监控指标", "当前读数", "黄灯警戒线", "红灯熔断线", "当前状态灯", "传导机制与熔断触发后果", ""])
-    bs_data_start = len(dash_rows) + 1
     for bs in blackswan_rows:
         dash_rows.append([bs[0], bs[1], bs[2], bs[3], bs[4], bs[5], bs[6], bs[7], ""])
-    bs_data_end = len(dash_rows)
 
-    # 模块三：多国周期与真实无风险利率对比
     dash_rows.append([])
     cty_title_row = len(dash_rows) + 1
     dash_rows.append(["【模块三】全球主要经济体周期与费雪真实利率对比（公式自动计算）"])
@@ -1138,7 +1157,7 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
     cty_data_start = len(dash_rows) + 1
     for idx_c, c_row in enumerate(country_rows, start=cty_data_start):
         row_copy = list(c_row)
-        row_copy[5] = f'=IFERROR(E{idx_c}-D{idx_c}, "-")'  # 费雪公式: 10Y名义国债 - CPI通胀
+        row_copy[5] = f'=IFERROR(E{idx_c}-D{idx_c}, "-")'
         dash_rows.append(row_copy)
     cty_data_end = len(dash_rows)
 
@@ -1152,13 +1171,11 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
 
     requests_batch = []
 
-    # 5.1 删除驾驶舱上已有的旧图表，防止每日定时运行产生重复图表
     for s in meta.get("sheets", []):
         if s["properties"]["sheetId"] == dash_id:
             for ch in s.get("charts", []):
                 requests_batch.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
 
-    # 5.2 合并研判简报单元格 A2:I2 并开启自动换行与行高
     requests_batch.extend([
         {
             "unmergeCells": {
@@ -1192,7 +1209,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
                 "fields": "userEnteredFormat(backgroundColor,wrapStrategy,verticalAlignment,textFormat)"
             }
         },
-        # 设置主标题行样式 (Row 1)
         {
             "repeatCell": {
                 "range": {"sheetId": dash_id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 9},
@@ -1207,7 +1223,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
         }
     ])
 
-    # 为三个模块的表头行设置深蓝底白字
     for hdr_row_1based in [5, bs_title_row + 1, cty_title_row + 1]:
         requests_batch.append({
             "repeatCell": {
@@ -1222,7 +1237,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
             }
         })
 
-    # 格式化模块一的历史分位(E列百分比)和Z-Score(F列两位小数)
     requests_batch.extend([
         {
             "repeatCell": {
@@ -1238,7 +1252,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
                 "fields": "userEnteredFormat.numberFormat"
             }
         },
-        # 格式化 01_跨资产表 涨跌幅为百分比
         {
             "repeatCell": {
                 "range": {"sheetId": mkt_id, "startRowIndex": 2, "endRowIndex": 2 + len(cross_asset_items), "startColumnIndex": 4, "endColumnIndex": 7},
@@ -1260,7 +1273,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
         }
     ])
 
-    # 5.3 构建 6 幅原生 Google Sheets 可视化图表 (放置在驾驶舱右侧 K:V 列)
     def build_dual_axis_line_chart(title, left_codes, right_codes, anchor_row, anchor_col):
         series_list = []
         for c in left_codes:
@@ -1309,15 +1321,10 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
         }
 
     charts_to_add = [
-        # 图1 (K1): 美债10Y名义利率 & 10Y TIPS实际利率 vs 黄金价格
         build_dual_axis_line_chart("图1：美债10Y名义/TIPS实际利率(左) vs 黄金(右)", ["DGS10", "DFII10"], ["GOLD"], 0, 10),
-        # 图2 (Q1): 美联储净流动性 vs 标普500 & 比特币
         build_dual_axis_line_chart("图2：美联储净流动性(左) vs 标普500(右)", ["NET_LIQUIDITY"], ["SPX"], 0, 16),
-        # 图3 (K17): ICE美元指数 vs 美元/日元
         build_dual_axis_line_chart("图3：美元指数 DXY(左) vs 美元/日元 USDJPY(右)", ["DXY"], ["USDJPY"], 16, 10),
-        # 图4 (Q17): 美债10Y-2Y利差 vs 铜金比
         build_dual_axis_line_chart("图4：美债10Y-2Y利差(左) vs 铜金比(右)", ["SPREAD_10Y2Y"], ["COPPER_GOLD_RATIO"], 16, 16),
-        # 图5 (K33): 多国横向周期对比柱状图 (GDP增速 vs CPI通胀 vs 10Y国债)
         {
             "addChart": {
                 "chart": {
@@ -1346,7 +1353,6 @@ def sync_all_sheets(raw_records, cross_asset_items, blackswan_rows, country_rows
                 }
             }
         },
-        # 图6 (Q33): 全球跨资产 5日 vs 20日涨跌幅对比
         {
             "addChart": {
                 "chart": {
