@@ -32,7 +32,7 @@ def create_http_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (compatible; GlobalMacroBot/2.0)",
+        "User-Agent": "Mozilla/5.0 (compatible; GlobalMacroBot/2.1)",
         "Accept": "application/json",
     })
     return session
@@ -40,7 +40,7 @@ def create_http_session():
 
 HTTP = create_http_session()
 
-# ================= 2. 全面指标字典 (含修正后的量纲与黑天鹅序列) =================
+# ================= 2. 有效 FRED 指标字典 (已剔除下线的 IRLTLT01CNM156N) =================
 FRED_SERIES = [
     # L2: 美元水管 (WALCL与WDTGAL均为百万美元周三水平，RRPONTSYD为十亿美元)
     {"id": "WALCL", "country": "US", "layer": "L2-流动性管道", "name": "美联储总资产 (百万美元)"},
@@ -52,7 +52,7 @@ FRED_SERIES = [
     {"id": "DGS10", "country": "US", "layer": "L2-利率之锚", "name": "美国10年期国债收益率 (%)"},
     {"id": "DFII10", "country": "US", "layer": "L2-利率之锚", "name": "美国10Y TIPS实际利率 (%)"},
     {"id": "T10Y2Y", "country": "US", "layer": "L2-利率之锚", "name": "美债10Y-2Y期限利差 (%)"},
-    # L1: 信用引擎与货币存量 (拉取15期以上用于计算12个月YoY增速)
+    # L1: 信用引擎与货币存量
     {"id": "M1SL", "country": "US", "layer": "L1-信用引擎", "name": "美国M1存量 (十亿美元)"},
     {"id": "M2SL", "country": "US", "layer": "L1-信用引擎", "name": "美国M2存量 (十亿美元)"},
     {"id": "DRTSCILM", "country": "US", "layer": "L1-信用引擎", "name": "美联储SLOOS银行收紧贷款比例 (%)"},
@@ -62,7 +62,6 @@ FRED_SERIES = [
     {"id": "MYAGM1JPM189S", "country": "JP", "layer": "L1-信用引擎", "name": "日本M1存量 (本币)"},
     {"id": "MYAGM2JPM189S", "country": "JP", "layer": "L1-信用引擎", "name": "日本M2存量 (本币)"},
     # L2/L3: 多国10Y国债与周期象限
-    {"id": "IRLTLT01CNM156N", "country": "CN", "layer": "L2-利率之锚", "name": "中国10年期国债收益率 (%)"},
     {"id": "IRLTLT01JPM156N", "country": "JP", "layer": "L2-利率之锚", "name": "日本10年期国债收益率 (%)"},
     {"id": "IRLTLT01DEM156N", "country": "DE", "layer": "L2-利率之锚", "name": "德国(欧元区)10Y国债收益率 (%)"},
     {"id": "PCEPILFE", "country": "US", "layer": "L3-周期象限", "name": "美国核心PCE物价指数"},
@@ -86,7 +85,7 @@ COUNTRIES_LIST = ["USA", "CHN", "JPN", "DEU", "IND", "BRA", "IDN", "TUR"]
 
 def fetch_fred_data():
     records = []
-    series_obs = {}  # 保存最近20期数值序列，用于计算同比/3M年化/5日变化
+    series_obs = {}
     for item in FRED_SERIES:
         url = (
             f"https://api.stlouisfed.org/fred/series/observations"
@@ -121,10 +120,37 @@ def fetch_fred_data():
     return records, series_obs
 
 
-def fetch_external_apis():
+def fetch_external_apis(series_obs):
     records = []
     wb_metrics = {}
     extra_vals = {}
+
+    # 0. 使用 AkShare 替代已下线的 FRED 中国国债序列，获取日频中债 2Y/10Y 收益率
+    try:
+        import akshare as ak
+        df_bond = ak.bond_zh_us_rate(start_date="20250101").dropna(subset=["中国国债收益率10年", "中国国债收益率2年"])
+        if len(df_bond) >= 2:
+            latest_row = df_bond.iloc[-1]
+            prev_row = df_bond.iloc[-2]
+            dt_str = str(latest_row["日期"])[:10]
+            cn10_c, cn10_p = float(latest_row["中国国债收益率10年"]), float(prev_row["中国国债收益率10年"])
+            cn2_c, cn2_p = float(latest_row["中国国债收益率2年"]), float(prev_row["中国国债收益率2年"])
+            series_obs["CN_DGS10"] = [cn10_c, cn10_p]
+            series_obs["CN_DGS2"] = [cn2_c, cn2_p]
+            records.append({
+                "观测日期": dt_str, "国家/地区": "CN", "六层归属": "L2-利率之锚",
+                "指标代码": "CN_DGS10", "指标名称": "中国10年期国债收益率-日频 (%)",
+                "最新值": round(cn10_c, 4), "前值": round(cn10_p, 4), "边际变化": round(cn10_c - cn10_p, 4),
+                "数据源": "ChinaBond / AkShare", "同步时间": NOW_STR,
+            })
+            records.append({
+                "观测日期": dt_str, "国家/地区": "CN", "六层归属": "L2-利率之锚",
+                "指标代码": "CN_DGS2", "指标名称": "中国2年期国债收益率-日频 (%)",
+                "最新值": round(cn2_c, 4), "前值": round(cn2_p, 4), "边际变化": round(cn2_c - cn2_p, 4),
+                "数据源": "ChinaBond / AkShare", "同步时间": NOW_STR,
+            })
+    except Exception as e:
+        print(f"[WARN] ChinaBond AkShare failed: {e}")
 
     # 1. NY Fed 日频 SOFR
     try:
@@ -143,7 +169,7 @@ def fetch_external_apis():
     except Exception as e:
         print(f"[WARN] NYFed failed: {e}")
 
-    # 2. 美国财政部近期 10Y/30Y 美债拍卖尾部利差 (Tail)
+    # 2. 美国财政部近期 10Y/30Y 美债拍卖投标倍数
     try:
         url = (
             "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
@@ -224,14 +250,9 @@ def fetch_external_apis():
 
 
 def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
-    """
-    1) 计算修正后的精确衍生组合
-    2) 扫描 8 大黑天鹅指标与三级熔断标准
-    3) 生成结构化中文研判报告 (事实 -> 机制 -> 资金流向 -> 情景概率 -> 证伪条件)
-    """
     derived_rows = []
     blackswan_rows = []
-    ts_snapshot_dict = {}  # 用于写入 02_历史时序库_TimeSeries
+    ts_snapshot_dict = {}
 
     def get(sid, idx=0):
         arr = s_obs.get(sid, [])
@@ -241,7 +262,7 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         if arr:
             ts_snapshot_dict[sid] = round(arr[0], 4)
 
-    # --- A. 精确计算美联储净流动性 (十亿美元) ---
+    # A. 美联储净流动性 (十亿美元)
     walcl, tga, rrp = get("WALCL"), get("WDTGAL"), get("RRPONTSYD")
     walcl_p, tga_p, rrp_p = get("WALCL", 1), get("WDTGAL", 1), get("RRPONTSYD", 1)
     net_liq, net_liq_chg = None, 0.0
@@ -254,7 +275,7 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         liq_sig = "放水扩张 (支撑风险资产估值)" if net_liq_chg > 0 else "抽水收缩 (警惕准备金消耗)"
         derived_rows.append(["L2-美元水管", "美联储净流动性 (十亿美元)", net_liq, net_liq_chg, liq_sig])
 
-    # --- B. 美债收益率曲线四象限形态 (牛陡/熊陡/牛平/熊平) ---
+    # B. 美债收益率曲线四象限形态
     y10, y2 = get("DGS10"), get("DGS2")
     y10_5, y2_5 = get("DGS10", 5), get("DGS2", 5)
     curve_regime = "数据不足"
@@ -275,19 +296,16 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             curve_regime = "倒挂震荡区间" if spread_10_2 < 0 else "曲线温和震荡"
         derived_rows.append(["L2-利率之锚", "美债10Y-2Y利差与形态 (%)", spread_10_2, d_spread, curve_regime])
 
-    # --- C. 精确计算中美/美国 M1-M2 同比剪刀差 (使用 t 与 t-12) ---
+    # C. 中国 M1-M2 同比剪刀差
     cn_m1_0, cn_m1_12 = get("MYAGM1CNM189N", 0), get("MYAGM1CNM189N", 12)
     cn_m2_0, cn_m2_12 = get("MYAGM2CNM189N", 0), get("MYAGM2CNM189N", 12)
-    cn_scissors = None
     if all(v is not None and v > 0 for v in [cn_m1_0, cn_m1_12, cn_m2_0, cn_m2_12]):
-        cn_m1_yoy = (cn_m1_0 / cn_m1_12 - 1) * 100
-        cn_m2_yoy = (cn_m2_0 / cn_m2_12 - 1) * 100
-        cn_scissors = round(cn_m1_yoy - cn_m2_yoy, 2)
+        cn_scissors = round(((cn_m1_0 / cn_m1_12) - (cn_m2_0 / cn_m2_12)) * 100, 2)
         ts_snapshot_dict["CN_M1_M2_SCISSORS"] = cn_scissors
         sc_sig = "资金定期化沉淀 (宽货币但紧信用)" if cn_scissors < -3.0 else "资金活化改善 (企业活期扩张)"
         derived_rows.append(["L1-信用引擎", "中国 M1-M2 同比剪刀差 (%)", cn_scissors, "-", sc_sig])
 
-    # --- D. 核心 PCE 3个月环比折年率 & 真实利率 ---
+    # D. 核心 PCE 3个月环比折年率
     pce_0, pce_3 = get("PCEPILFE", 0), get("PCEPILFE", 3)
     pce_3m_ann = None
     if pce_0 and pce_3 and pce_3 > 0:
@@ -296,20 +314,23 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         pce_sig = "通胀黏性偏高 (>2.5%)" if pce_3m_ann > 2.5 else "通胀温和可控 (<=2.5%)"
         derived_rows.append(["L3-周期象限", "美国核心PCE 3M环比折年率 (%)", pce_3m_ann, "-", pce_sig])
 
-    # --- E. 跨境套息利差 ---
-    for c_name, sid in [("中美10Y利差 (US-CN)", "IRLTLT01CNM156N"), ("美日10Y利差 (US-JP)", "IRLTLT01JPM156N")]:
+    # E. 跨境套息利差 (含日频中美10Y与2Y利差)
+    for c_name, sid in [
+        ("中美10Y利差 (US-CN)", "CN_DGS10"),
+        ("美日10Y利差 (US-JP)", "IRLTLT01JPM156N"),
+        ("美德10Y利差 (US-DE)", "IRLTLT01DEM156N"),
+    ]:
         cy = get(sid)
         if y10 is not None and cy is not None:
             diff = round(y10 - cy, 3)
             derived_rows.append(["L4-跨境利差", c_name, diff, "-", "高利差吸引美元回流" if diff > 2.0 else "利差收窄，关注套息平仓"])
 
-    # --- F. 黑天鹅 8 维雷达评估 ---
+    # F. 黑天鹅雷达评估
     red_alerts, yellow_alerts = [], []
 
-    # BS-1: SOFR - IORB 利差
     sofr, iorb = extra_vals.get("SOFR"), get("IORB")
     if sofr is not None and iorb is not None:
-        sofr_sp = round((sofr - iorb) * 100, 1)  # bps
+        sofr_sp = round((sofr - iorb) * 100, 1)
         if sofr_sp >= 25:
             status = "🔴 红灯熔断 (银行间美元钱荒)"
             red_alerts.append(f"SOFR-IORB 利差飙升至 +{sofr_sp}bps")
@@ -320,7 +341,6 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             status = "🟢 正常 (银行间流动性充裕)"
         blackswan_rows.append(["BS-1 美元回购管道", "SOFR - IORB 利差 (bps)", sofr_sp, "黄>=10 / 红>=25", status])
 
-    # BS-2: 高收益债信用利差
     hy = get("BAMLH0A0HYM2")
     if hy is not None:
         hy_bps = round(hy * 100, 0)
@@ -334,7 +354,6 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             status = "🟢 正常 (信用市场平稳)"
         blackswan_rows.append(["BS-2 企业信用违约", "高收益债信用利差 (bps)", hy_bps, "黄>=350 / 红>=500", status])
 
-    # BS-3: 圣路易斯联储金融压力指数 STLFSI4
     fsi = get("STLFSI4")
     if fsi is not None:
         if fsi >= 2.0:
@@ -347,7 +366,6 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             status = "🟢 正常 (低于历史均值压力)"
         blackswan_rows.append(["BS-3 综合金融压力", "STLFSI4 压力指数", round(fsi, 2), "黄>=0.5 / 红>=2.0", status])
 
-    # BS-4: VIX 恐慌及期限结构倒挂 (VIX / VIX3M)
     vix, vix3m = get("VIXCLS"), get("VXVCLS")
     if vix is not None and vix3m is not None and vix3m > 0:
         vix_ratio = round(vix / vix3m, 2)
@@ -361,7 +379,6 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             status = "🟢 正常 (波动率期限结构正常)"
         blackswan_rows.append(["BS-4 波动率倒挂", f"VIX={vix} | VIX/VIX3M", vix_ratio, "黄>=1.0 / 红>=1.15", status])
 
-    # BS-5: 日元套息踩踏 (USD/JPY 5日急跌)
     jpy_0, jpy_5 = get("DEXJPUS", 0), get("DEXJPUS", 5)
     if jpy_0 and jpy_5 and jpy_5 > 0:
         jpy_5d_pct = round((jpy_0 / jpy_5 - 1) * 100, 2)
@@ -375,7 +392,6 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             status = "🟢 正常 (外汇套息波动可控)"
         blackswan_rows.append(["BS-5 套息交易踩踏", "USD/JPY 5日涨跌幅 (%)", jpy_5d_pct, "黄<=-2.5% / 红<=-4.0%", status])
 
-    # BS-6: 新兴市场外债覆盖率最大值检查
     for iso3 in ["BRA", "IND", "IDN", "TUR"]:
         res = wb_metrics.get((iso3, "FI.RES.TOTL.CD"))
         debt = wb_metrics.get((iso3, "DT.DOD.DSTC.CD"))
@@ -384,10 +400,9 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
             st = "🔴 高危 (>100%)" if ratio > 100 else ("🟡 警戒 (50%-100%)" if ratio > 50 else "🟢 安全 (<50%)")
             blackswan_rows.append([f"BS-6 EM外债({iso3})", "短期外债/外储比率 (%)", ratio, "黄>50% / 红>100%", st])
 
-    # --- G. 自动生成中文结构化研判报告 (五步法) ---
+    # G. 生成五步研判报告
     sahm = get("SAHMREALTIME") or 0.0
     tips10 = get("DFII10") or 0.0
-    # 判定四象限
     growth_weak = sahm >= 0.5
     infl_high = (pce_3m_ann is not None and pce_3m_ann > 2.5)
     if not growth_weak and not infl_high:
@@ -403,7 +418,6 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         quadrant = "【象限四：衰退防御（增长走弱 + 通胀回落）】"
         regime_logic = "总需求收缩主导市场，央行进入被动降息周期，占优资产为长久期国债，警惕信用利差走阔引发的信用紧缩。"
 
-    # 动态调整情景概率
     if red_alerts:
         probs = "基准情景(风险释放): 45% | 乐观情景(政策急转救市): 15% | 悲观情景(尾部危机扩散): 40%"
     elif yellow_alerts:
@@ -417,7 +431,7 @@ def analyze_macro_and_blackswan(s_obs, wb_metrics, extra_vals):
         f"美债 10Y-2Y 利差为 {spread_10_2}%（形态：{curve_regime}），10Y TIPS 实际利率为 {tips10}%，萨姆规则读数 {sahm}%。\n"
         f"2. 传导机制与定价主导：{regime_logic}\n"
         f"3. 资金流向与水管诊断：ON RRP 余额为 {rrp} 十亿美元，TGA 余额为 {round(tga/1000, 1) if tga else '-'} 十亿美元。"
-        f"{'⚠️ 黑天鹅预警触发：' + '；'.join(red_alerts + yellow_alerts) if (red_alerts or yellow_alerts) else '✅ 8大黑天鹅雷达均处于绿灯常态区间，未见流动性挤兑信号。'}\n"
+        f"{'⚠️ 黑天鹅预警触发：' + '；'.join(red_alerts + yellow_alerts) if (red_alerts or yellow_alerts) else '✅ 黑天鹅雷达均处于绿灯常态区间，未见流动性挤兑信号。'}\n"
         f"4. 情景概率分布：{probs}\n"
         f"5. 强制证伪条件（若以下任一条件在未来 10 个交易日发生，需推翻当前基准判断）："
         f"① 10Y TIPS 实际利率反向突破 {'1.80%' if tips10 > 2.0 else '2.25%'}；"
@@ -435,15 +449,23 @@ def sync_all_sheets(raw_records, derived_rows, blackswan_rows, ts_dict, report_t
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(GCP_SA_JSON, scopes=scopes)
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(SPREADSHEET_ID)
+    sa_email = GCP_SA_JSON.get("client_email", "未知服务账号")
 
-    # 1. 更新 01_最新快照_Snapshot
+    try:
+        sh = gc.open_by_key(SPREADSHEET_ID)
+    except Exception as e:
+        raise RuntimeError(
+            f"Google 返回 404（无权限或格式不符）。请检查：\n"
+            f"1) 打开表格右上角【共享】，将 '{sa_email}' 添加为【编辑者】；\n"
+            f"2) 若表格左上角有绿色 .XLSX 标识，请点击【文件 -> 保存为 Google 表格】后再共享。\n"
+            f"当前解析的 ID: {SPREADSHEET_ID} | 原始错误: {e}"
+        )
+
     df_raw = pd.DataFrame(raw_records)
     ws_snap = get_or_create_ws(sh, "01_最新快照_Snapshot")
     ws_snap.clear()
     ws_snap.update([df_raw.columns.tolist()] + df_raw.values.tolist())
 
-    # 2. 增量追加/更新 02_历史时序库_TimeSeries (永不清空历史)
     ws_ts = get_or_create_ws(sh, "02_历史时序库_TimeSeries", rows=2000, cols=50)
     existing = ws_ts.get_all_values()
     all_keys = ["Date"] + sorted(ts_dict.keys())
@@ -452,29 +474,24 @@ def sync_all_sheets(raw_records, derived_rows, blackswan_rows, ts_dict, report_t
         ws_ts.update([all_keys, row_vals])
     else:
         headers = existing[0]
-        # 若有新增指标列，自动向右扩展表头
         new_cols = [k for k in all_keys if k not in headers]
         if new_cols:
             headers = headers + new_cols
             ws_ts.update("A1", [headers])
         new_row = [TODAY_STR] + [ts_dict.get(col, "") for col in headers[1:]]
-        # 如果今天已经运行过一次，覆盖今天那一行；否则在末尾追加新的一天
         if len(existing) > 1 and existing[-1][0] == TODAY_STR:
             ws_ts.update(f"A{len(existing)}", [new_row])
         else:
             ws_ts.append_row(new_row, value_input_option="USER_ENTERED")
 
-    # 3. 更新 03_衍生组合与信号_Derived
     ws_der = get_or_create_ws(sh, "03_衍生组合与信号_Derived")
     ws_der.clear()
     ws_der.update([["层级归属", "衍生组合名称", "当前计算值", "边际变化", "第一性原理诊断信号"]] + derived_rows)
 
-    # 4. 更新 04_黑天鹅雷达_BlackSwan
     ws_bs = get_or_create_ws(sh, "04_黑天鹅雷达_BlackSwan")
     ws_bs.clear()
     ws_bs.update([["风险类别", "监控指标", "当前读数", "黄/红灯阈值", "当前警报状态"]] + blackswan_rows)
 
-    # 5. 更新 00_总览与自动研判_Dashboard 的文字研判区 & 06_情景与证伪日志_Journal
     ws_dash = get_or_create_ws(sh, "00_总览与自动研判_Dashboard", rows=100, cols=15)
     ws_dash.update("A1", [["全球宏观第一性原理实时监测中枢（自动化文字研判输出）"]])
     ws_dash.update("A2", [[report_text]])
@@ -498,7 +515,7 @@ def get_or_create_ws(sh, title, rows=200, cols=15):
 
 if __name__ == "__main__":
     fred_recs, obs_map = fetch_fred_data()
-    ext_recs, wb_map, extra = fetch_external_apis()
+    ext_recs, wb_map, extra = fetch_external_apis(obs_map)
     all_raw = fred_recs + ext_recs
     derived, blackswan, ts_dict, report = analyze_macro_and_blackswan(obs_map, wb_map, extra)
     sync_all_sheets(all_raw, derived, blackswan, ts_dict, report)
