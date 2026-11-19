@@ -18,11 +18,11 @@ _match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", _raw_ss)
 SPREADSHEET_ID = _match.group(1) if _match else _raw_ss.split("/")[0].split("?")[0].strip()
 GCP_SA_JSON = json.loads(os.environ["GCP_SA_KEY"])
 
-# AI 模型与中转站配置：默认使用 https://api.starwish.fit/v1 + GPT-6.2 Astra + 最高思考程度
+# AI 模型与中转站配置：https://api.starwish.fit/v1 + GPT-6.2 Astra + 最高思考程度
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.starwish.fit/v1").strip().rstrip("/")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6.2-astra").strip()
-OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "max").strip()  # 自动兼容 max -> high
+OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "max").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
@@ -30,7 +30,6 @@ TZ_CST = timezone(timedelta(hours=8))
 NOW_STR = datetime.now(TZ_CST).strftime("%Y-%m-%d %H:%M:%S")
 TODAY_STR = datetime.now(TZ_CST).strftime("%Y-%m-%d")
 
-# 5 张核心工作表名称
 TAB_DASH = "00_宏观驾驶舱_Dashboard"
 TAB_MKT_MAC = "01_跨资产与宏观硬数据_MarketsAndMacro"
 TAB_TS = "02_日频短周期库_TimeSeries"
@@ -71,7 +70,7 @@ def create_http_session():
     session.mount("https://", adapter)
     session.mount("http://", adapter)
     session.headers.update({
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "application/json, application/xml, text/xml, */*",
     })
     return session
@@ -79,7 +78,7 @@ def create_http_session():
 
 HTTP = create_http_session()
 
-# ================= 2. 宏观基础指标字典 (含扩充版36维黑天鹅+灰犀牛FRED数据库) =================
+# ================= 2. 宏观基础指标字典 (已剔除FRED下架代码并替换为有效最新序列) =================
 FRED_SERIES = [
     # L1: 信用引擎与货币存量
     {"id": "M1SL", "country": "US", "layer": "L1-信用引擎", "freq": "M", "lt": False, "name": "美国M1存量 (十亿美元)"},
@@ -128,17 +127,16 @@ FRED_SERIES = [
     {"id": "LRHUTTTTEZM156S", "country": "EA", "layer": "L3-就业硬数据", "freq": "M", "lt": False, "name": "欧元区失业率 (%)"},
     {"id": "JPNPRMNTO01GPSAM", "country": "JP", "layer": "L3-工业与消费", "freq": "M", "lt": False, "name": "日本制造业生产环比增速 (%)"},
     {"id": "JPNCPIALLMINMEI", "country": "JP", "layer": "L3-通胀硬数据", "freq": "M", "lt": False, "name": "日本全国CPI物价指数"},
-    # L4/L5: 跨境资金流量与实物库存
+    # L4/L5: 跨境资金流量与能源现货
     {"id": "DTWEXBGS", "country": "US", "layer": "L4-跨境汇率", "freq": "D", "lt": False, "name": "美联储广义贸易加权美元指数"},
     {"id": "FDHBFIN", "country": "US", "layer": "L4-跨境资本流", "freq": "Q", "lt": False, "name": "海外投资者持有美债总额-TIC (十亿美元)"},
-    {"id": "WCESTUS1", "country": "US", "layer": "L5-实物库存", "freq": "W", "lt": True, "name": "EIA美国商业原油库存-不含SPR (千桶)"},
-    # L6: 黑天鹅 + 灰犀牛专属风险数据库 (扩充版)
+    {"id": "DCOILWTICO", "country": "US", "layer": "L5-能源现货", "freq": "D", "lt": True, "name": "FRED WTI原油现货价格 (美元/桶)"},
+    # L6: 黑天鹅 + 灰犀牛专属风险数据库
     {"id": "VXVCLS", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "D", "lt": False, "name": "CBOE 3个月期VIX3M指数"},
     {"id": "STLFSI4", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "W", "lt": True, "name": "圣路易斯联储金融压力指数"},
     {"id": "NFCI", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "W", "lt": False, "name": "芝加哥联储金融状况指数"},
     {"id": "ANFCI", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "W", "lt": False, "name": "芝加哥联储调整后金融状况指数"},
-    {"id": "DISBORROW", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "W", "lt": False, "name": "美联储贴现窗口紧急借款总额 (百万美元)"},
-    {"id": "TEDRATE", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "D", "lt": False, "name": "TED离岸美元拆借信用利差 (%)"},
+    {"id": "WDISBORROW", "country": "US", "layer": "L6-黑天鹅雷达", "freq": "W", "lt": False, "name": "美联储贴现窗口紧急借款周均值 (百万美元)"},
     {"id": "DRCRELEXFACBS", "country": "US", "layer": "L6-灰犀牛雷达", "freq": "Q", "lt": False, "name": "美国商业地产(CRE)银行贷款违约率 (%)"},
     {"id": "DRCCLACBS", "country": "US", "layer": "L6-灰犀牛雷达", "freq": "Q", "lt": False, "name": "美国商业银行信用卡贷款违约率 (%)"},
     {"id": "DRSFRMACBS", "country": "US", "layer": "L6-灰犀牛雷达", "freq": "Q", "lt": False, "name": "美国居民住房抵押贷款违约率 (%)"},
@@ -152,12 +150,12 @@ FRED_SERIES = [
 DAILY_WEEKLY_FRED_IDS = {x["id"] for x in FRED_SERIES if x["freq"] in ("D", "W")}
 LT_FRED_IDS = {x["id"] for x in FRED_SERIES if x.get("lt")}
 
-# ================= 3. 全球跨资产实时行情字典 (新增费城半导体等风险锚) =================
+# ================= 3. 全球跨资产实时行情字典 (修复沪深300备用代码与离岸人民币代码) =================
 MARKET_ASSETS = [
     {"cat": "重要股指", "ticker": "^GSPC", "code": "SPX", "country": "US", "lt": True, "name": "标普500指数 (S&P 500)", "driver": "美股盈利预期 × 10Y贴现率"},
     {"cat": "重要股指", "ticker": "^NDX", "code": "NDX", "country": "US", "lt": True, "name": "纳斯达克100指数 (Nasdaq 100)", "driver": "远期现金流久期资产，对10Y TIPS极敏感"},
     {"cat": "重要股指", "ticker": "^SOX", "code": "SOX", "country": "US", "lt": False, "name": "费城半导体指数 (SOX-AI泡沫温度计)", "driver": "全球AI资本开支与半导体周期景气度核心锚"},
-    {"cat": "重要股指", "ticker": "000300.SS", "code": "CSI300", "country": "CN", "lt": True, "name": "沪深300指数 (CSI 300)", "driver": "中国社融脉冲与M1-M2活化剪刀差"},
+    {"cat": "重要股指", "ticker": "000300.SS", "fallback_ticker": "ASHR", "code": "CSI300", "country": "CN", "lt": True, "name": "沪深300指数/ASHR (CSI 300)", "driver": "中国社融脉冲与M1-M2活化剪刀差"},
     {"cat": "重要股指", "ticker": "^HSI", "code": "HSI", "country": "HK", "lt": False, "name": "香港恒生指数 (Hang Seng)", "driver": "中国基本面分子 × 美元流动性分母双重定价"},
     {"cat": "重要股指", "ticker": "^N225", "code": "N225", "country": "JP", "lt": False, "name": "日经225指数 (Nikkei 225)", "driver": "日元汇率与日本央行加息路径"},
     {"cat": "重要股指", "ticker": "^GDAXI", "code": "DAX", "country": "DE", "lt": False, "name": "德国DAX指数", "driver": "欧元区制造业周期与欧央行利率路径"},
@@ -169,7 +167,7 @@ MARKET_ASSETS = [
     {"cat": "全球工业", "ticker": "XLI", "code": "US_IND_ETF", "country": "US", "lt": False, "name": "美国工业板块指数ETF (XLI)", "driver": "北美基建回流与制造业PMI市场领先指标"},
     {"cat": "全球货币", "ticker": "DX-Y.NYB", "code": "DXY", "country": "US", "lt": True, "name": "ICE美元指数 (DXY)", "driver": "全球离岸美元松紧总阀门"},
     {"cat": "全球货币", "ticker": "JPY=X", "code": "USDJPY", "country": "JP", "lt": True, "name": "美元兑日元 (USD/JPY)", "driver": "全球套息交易(Carry Trade)核心风向标"},
-    {"cat": "全球货币", "ticker": "CNH=X", "code": "USDCNH", "country": "CN", "lt": True, "name": "美元兑离岸人民币 (USD/CNH)", "driver": "中美利差与出口企业结汇意愿"},
+    {"cat": "全球货币", "ticker": "USDCNH=X", "fallback_ticker": "CNY=X", "code": "USDCNH", "country": "CN", "lt": True, "name": "美元兑离岸人民币 (USD/CNH)", "driver": "中美利差与出口企业结汇意愿"},
     {"cat": "全球货币", "ticker": "EURUSD=X", "code": "EURUSD", "country": "EA", "lt": False, "name": "欧元兑美元 (EUR/USD)", "driver": "欧美真实利差与能源贸易条件"},
     {"cat": "全球货币", "ticker": "GBPUSD=X", "code": "GBPUSD", "country": "UK", "lt": False, "name": "英镑兑美元 (GBP/USD)", "driver": "英美利差与英国财政信用溢价"},
     {"cat": "全球货币", "ticker": "AUDUSD=X", "code": "AUDUSD", "country": "AU", "lt": False, "name": "澳元兑美元 (AUD/USD)", "driver": "全球工业大宗商品周期与亚洲需求"},
@@ -193,7 +191,7 @@ COUNTRIES_LIST = ["USA", "CHN", "JPN", "DEU", "IND", "BRA", "IDN", "TUR"]
 
 
 def fetch_global_macro_news():
-    """零成本抓取全球顶级财经与央行 RSS 头条，用于提升 GPT-6.2 Astra 跨因子推演准确率"""
+    """零成本抓取全球顶级财经与央行 RSS 头条"""
     rss_sources = [
         ("CNBC宏观", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258"),
         ("CNBC金融", "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=10000664"),
@@ -296,7 +294,11 @@ def fetch_market_assets(series_obs, series_hist_dates, lt_hist_dates):
         return None
 
     for item in MARKET_ASSETS:
-        dt_str, prices, date_val_map = fetch_yahoo_chart(item["ticker"], "1mo", "1d")
+        active_ticker = item["ticker"]
+        dt_str, prices, date_val_map = fetch_yahoo_chart(active_ticker, "1mo", "1d")
+        if not prices and item.get("fallback_ticker"):
+            active_ticker = item["fallback_ticker"]
+            dt_str, prices, date_val_map = fetch_yahoo_chart(active_ticker, "1mo", "1d")
         if not prices:
             print(f"[WARN] Market asset {item['ticker']} unavailable")
             continue
@@ -313,7 +315,7 @@ def fetch_market_assets(series_obs, series_hist_dates, lt_hist_dates):
         }
 
         if item.get("lt"):
-            _, _, lt_map = fetch_yahoo_chart(item["ticker"], "3y", "1wk")
+            _, _, lt_map = fetch_yahoo_chart(active_ticker, "3y", "1wk")
             if lt_map:
                 lt_hist_dates[item["code"]] = lt_map
 
@@ -507,11 +509,19 @@ def fetch_china_macro_akshare(series_obs, series_dates):
     except Exception as e:
         print(f"[WARN] CN PMI failed: {e}")
 
+    # 修复 AkShare 1.20.42+ 接口更名: macro_china_money_supply_em
     try:
-        df_ms = ak.macro_china_money_supply()
+        fn_ms = getattr(ak, "macro_china_money_supply_em", None) or getattr(ak, "macro_china_money_supply")
+        df_ms = fn_ms()
         col_dt = next((c for c in df_ms.columns if "月份" in str(c) or "日期" in str(c)), df_ms.columns[0])
-        col_m1_yoy = next((c for c in df_ms.columns if "M1" in str(c) and "同比" in str(c)), None)
-        col_m2_yoy = next((c for c in df_ms.columns if "M2" in str(c) and "同比" in str(c)), None)
+        col_m1_yoy = next(
+            (c for c in df_ms.columns if ("M1" in str(c) or ("货币" in str(c) and "准货币" not in str(c))) and "同比" in str(c)),
+            None
+        )
+        col_m2_yoy = next(
+            (c for c in df_ms.columns if ("M2" in str(c) or "准货币" in str(c)) and "同比" in str(c)),
+            None
+        )
         if col_m1_yoy:
             res_m1 = get_latest_two(df_ms, col_dt, col_m1_yoy)
             if res_m1:
@@ -676,10 +686,15 @@ def fetch_external_apis(series_obs, series_dates):
         "BCA_NGDPD": ("L4-跨境汇率", "经常账户占GDP比重 (%)"),
         "GGXCNL_NGDP": ("L3-周期象限", "财政净借贷占GDP比重 (%)"),
     }
+    imf_headers = {"Referer": "https://www.imf.org/external/datamapper/", "Accept": "application/json"}
     for code, (layer, name) in imf_codes.items():
         try:
             url = f"https://www.imf.org/external/datamapper/api/v1/{code}/{'/'.join(COUNTRIES_LIST)}?periods={year-1},{year}"
-            vals = HTTP.get(url, timeout=(10, 35)).json().get("values", {}).get(code, {})
+            resp = HTTP.get(url, headers=imf_headers, timeout=(10, 35))
+            txt = resp.text.strip()
+            if resp.status_code != 200 or not txt.startswith("{"):
+                continue
+            vals = json.loads(txt).get("values", {}).get(code, {})
             for c in COUNTRIES_LIST:
                 if c in vals:
                     curr = vals[c].get(str(year)) or vals[c].get(str(year - 1))
@@ -694,7 +709,7 @@ def fetch_external_apis(series_obs, series_dates):
                             "数据源": "IMF DataMapper", "同步时间": NOW_STR,
                         })
         except Exception as e:
-            print(f"[WARN] IMF {code} failed: {e}")
+            print(f"[WARN] IMF {code} skipped: {e}")
 
     wb_codes = {"FI.RES.TOTL.CD": "官方外汇储备总额 (美元)", "DT.DOD.DSTC.CD": "短期外债余额 (美元)"}
     for code, name in wb_codes.items():
@@ -739,8 +754,6 @@ def enrich_derived_rows(row_dict):
         row_dict["COPPER_GOLD_RATIO"] = round((row_dict["COPPER"] * 1000) / row_dict["GOLD"], 3)
     if all(k in row_dict for k in ["GOLD", "BRENT"]) and row_dict["BRENT"] > 0:
         row_dict["GOLD_OIL_RATIO"] = round(row_dict["GOLD"] / row_dict["BRENT"], 2)
-    if "WCESTUS1" in row_dict:
-        row_dict["EIA_CRUDE_MBBL"] = round(row_dict["WCESTUS1"] / 1000.0, 2)
 
 
 def build_historical_seed_rows(series_hist_dates):
@@ -807,23 +820,22 @@ def _extract_responses_text(resp_json):
 
 
 def generate_macro_synthesis(context_payload, fallback_report):
-    """通过中转站 https://api.starwish.fit/v1 调用 GPT-6.2 Astra (思考程度最高，自动兼容 max/high 枚举 + 双协议)"""
+    """通过中转站 https://api.starwish.fit/v1 调用 GPT-6.2 Astra (思考程度最高，自动兼容 max/high + 双协议)"""
     prompt = (
         "你是严格遵循《宏观经济六层第一性原理实战通关总纲》的首席宏观策略师。"
-        "现在每天执行一次日频全景扫描，请充分发挥深度推理能力，结合【六层硬数据 + 36维黑天鹅/灰犀牛全全景风险数据库 + 预计算背离因子 + 今日全球财经/央行头条】，"
+        "现在每天执行一次日频全景扫描，请充分发挥深度推理能力，结合【六层硬数据 + 35维黑天鹅/灰犀牛全全景风险数据库 + 预计算背离因子 + 今日全球财经/央行头条】，"
         "输出一份高密度、硬核、具备深度因果链条推演的中文机构级研判内参（控制在 1000~1400 字，不写任何废话套话）。\n"
         "必须严格按以下五步输出：\n"
         "1.【周期定位与新闻催化（主线判定与抢跑背离）】：结合今日重磅新闻头条与硬数据，判断市场正在交易哪条主线（增长分子 vs 利率分母 vs 供给冲击），并严密排查是否存在“低频月度硬数据滞后 vs 高频资产价格抢跑背离”；\n"
         "2.【美元水管与财政生死线（流动性二阶导数）】：深度拆解净流动性 1W/4W/13W 冲量加速度、ON RRP 缓冲垫剩余水位、美债曲线形态（牛陡/熊陡/牛平/熊平）及美国联邦利息吞噬率与 r-g 债务雪球压力；\n"
-        "3.【跨资产定价与核心利差博弈】：穿透分析 10Y TIPS 实际利率与黄金/纳指/费城半导体的估值张力、铜金比与原油库存的实体需求信号、市场隐含降息定价(DGS2-EFFR)及中美/美日利差传导；\n"
-        "4.【黑天鹅(BS-1~18)与灰犀牛(GR-1~18)36维极端压力扫描】：分别点名当前距离红线最近的【Top3 急性黑天鹅】与【Top3 慢性灰犀牛】，并推演一旦其中某个因子触发红灯熔断，将如何通过跨市场传染链条引爆下一个多米诺骨牌；\n"
+        "3.【跨资产定价与核心利差博弈】：穿透分析 10Y TIPS 实际利率与黄金/纳指/费城半导体的估值张力、铜金比与原油价格的实体需求信号、市场隐含降息定价(DGS2-EFFR)及中美/美日利差传导；\n"
+        "4.【黑天鹅(BS-1~17)与灰犀牛(GR-1~18)极端压力扫描】：分别点名当前距离红线最近的【Top3 急性黑天鹅】与【Top3 慢性灰犀牛】，并推演一旦其中某个因子触发红灯熔断，将如何通过跨市场传染链条引爆下一个多米诺骨牌；\n"
         "5.【三情景概率矩阵与强制证伪条件】：给出基准/乐观/悲观精确概率分布及对应占优资产配置，并写出未来 10 个交易日推翻当前基准判断的 3 条具体量化证伪红线。\n\n"
-        f"今日实时宏观因子、36维风险库与新闻JSON：\n{json.dumps(context_payload, ensure_ascii=False)}"
+        f"今日实时宏观因子、风险库与新闻JSON：\n{json.dumps(context_payload, ensure_ascii=False)}"
     )
 
     if OPENAI_API_KEY:
         headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        # 自动构造思考强度降级列表：用户指定 max 时，若中转站仅支持 OpenAI 官方标准枚举 high，自动无缝回退
         effort_candidates = [OPENAI_REASONING_EFFORT]
         if OPENAI_REASONING_EFFORT.lower() == "max" and "high" not in effort_candidates:
             effort_candidates.append("high")
@@ -842,7 +854,7 @@ def generate_macro_synthesis(context_payload, fallback_report):
                 if resp.status_code == 200:
                     txt = _extract_responses_text(resp.json())
                     if txt:
-                        return f"【{OPENAI_MODEL} (思考:{effort} | 中转:{OPENAI_BASE_URL}) 跨因子+36维风险库研判 | {NOW_STR}】\n{txt}"
+                        return f"【{OPENAI_MODEL} (思考:{effort} | 中转:{OPENAI_BASE_URL}) 跨因子+35维风险库研判 | {NOW_STR}】\n{txt}"
                 elif resp.status_code == 400 and effort == "max":
                     print("[INFO] Relay /responses rejected effort='max', retrying with 'high'...")
                     continue
@@ -867,7 +879,7 @@ def generate_macro_synthesis(context_payload, fallback_report):
                 if resp.status_code == 200:
                     txt = resp.json()["choices"][0]["message"]["content"].strip()
                     if txt:
-                        return f"【{OPENAI_MODEL} (思考:{effort} | 中转:{OPENAI_BASE_URL}) 跨因子+36维风险库研判 | {NOW_STR}】\n{txt}"
+                        return f"【{OPENAI_MODEL} (思考:{effort} | 中转:{OPENAI_BASE_URL}) 跨因子+35维风险库研判 | {NOW_STR}】\n{txt}"
                 elif resp.status_code == 400 and effort == "max":
                     print("[INFO] Relay /chat/completions rejected reasoning_effort='max', retrying with 'high'...")
                     continue
@@ -878,7 +890,6 @@ def generate_macro_synthesis(context_payload, fallback_report):
                 print(f"[WARN] Relay /chat/completions failed: {e}")
                 break
 
-    # 2. 次选 OpenRouter 路由
     if OPENROUTER_API_KEY:
         try:
             or_model = OPENAI_MODEL if "/" in OPENAI_MODEL else f"openai/{OPENAI_MODEL}"
@@ -898,7 +909,6 @@ def generate_macro_synthesis(context_payload, fallback_report):
         except Exception as e:
             print(f"[WARN] OpenRouter synthesis failed: {e}")
 
-    # 3. 备选 Gemini
     if GEMINI_API_KEY:
         try:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
@@ -932,6 +942,9 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
         if arr:
             ts_snapshot_dict[sid] = round(arr[0], 4)
 
+    # 提前初始化核心宏观变量，防止后续风险扫描未定义
+    sahm = get("SAHMREALTIME") or 0.0
+
     # ================= A. 经济硬数据汇总 =================
     us_credit_yoy = calc_yoy("TOTLL", lag=52)
     if us_credit_yoy is not None:
@@ -953,7 +966,7 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
 
     unrate_0, unrate_1 = get("UNRATE", 0), get("UNRATE", 1)
     if unrate_0 is not None:
-        macro_indicator_rows.append(["美国 (US)", "就业(L3)", "美国失业率 (%)", f"{unrate_0:.1f}%", f"{unrate_1:.1f}%" if unrate_1 else "-", s_dates.get("UNRATE", "-"), f"萨姆规则={get('SAHMREALTIME') or 0:.2f}%"])
+        macro_indicator_rows.append(["美国 (US)", "就业(L3)", "美国失业率 (%)", f"{unrate_0:.1f}%", f"{unrate_1:.1f}%" if unrate_1 else "-", s_dates.get("UNRATE", "-"), f"萨姆规则={sahm:.2f}%"])
 
     wage_yoy = calc_yoy("CES0500000003")
     if wage_yoy is not None:
@@ -997,13 +1010,9 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     if us_nom_gdp_yoy is not None:
         ts_snapshot_dict["US_NOM_GDP_YOY"] = us_nom_gdp_yoy
 
-    eia_inv_0, eia_inv_1, eia_inv_4 = get("WCESTUS1", 0), get("WCESTUS1", 1), get("WCESTUS1", 4)
-    eia_4w_chg = None
-    if eia_inv_0 is not None and eia_inv_1 is not None:
-        inv_chg = round((eia_inv_0 - eia_inv_1) / 1000.0, 2)
-        eia_4w_chg = round((eia_inv_0 - eia_inv_4) / 1000.0, 2) if eia_inv_4 is not None else inv_chg
-        ts_snapshot_dict["EIA_CRUDE_MBBL"] = round(eia_inv_0 / 1000.0, 2)
-        macro_indicator_rows.append(["美国 (US)", "原油库存(L5)", "EIA商业原油库存 (百万桶)", f"{eia_inv_0/1000.0:.2f}", f"周变动 {inv_chg:+.2f}M桶", s_dates.get("WCESTUS1", "-"), "去库支撑油价" if inv_chg < 0 else "累库压制油价"])
+    wti_spot = get("DCOILWTICO")
+    if wti_spot is not None:
+        macro_indicator_rows.append(["美国 (US)", "能源现货(L5)", "FRED WTI 原油现货价格 (美元/桶)", f"${wti_spot:.2f}", "-", s_dates.get("DCOILWTICO", "-"), "全球能源成本基准锚"])
 
     cn_pmi = get("CN_PMI_MFG")
     if cn_pmi is not None:
@@ -1096,10 +1105,8 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     gold_stat = market_stats.get("GOLD", {})
     copper_stat = market_stats.get("COPPER", {})
     brent_stat = market_stats.get("BRENT", {})
-    cg_ratio_curr = None
     if gold_stat.get("price") and copper_stat.get("price"):
-        cg_ratio_curr = round((copper_stat["price"] * 1000) / gold_stat["price"], 3)
-        ts_snapshot_dict["COPPER_GOLD_RATIO"] = cg_ratio_curr
+        ts_snapshot_dict["COPPER_GOLD_RATIO"] = round((copper_stat["price"] * 1000) / gold_stat["price"], 3)
     if gold_stat.get("price") and brent_stat.get("price"):
         ts_snapshot_dict["GOLD_OIL_RATIO"] = round(gold_stat["price"] / brent_stat["price"], 2)
 
@@ -1175,7 +1182,7 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     if btc_auc is not None and btc_auc > 0:
         add_risk("BS-7", "黑天鹅", "美债一级拍卖失灵", f"投标倍数(Tail={tail_bps}bp)", btc_auc, "2.25x", "2.10x", max(2.10 / btc_auc, tail_bps / 3.0), "一级交易商承接意愿枯竭引发长端美债收益率无序飙升")
 
-    disc_0 = get("DISBORROW")
+    disc_0 = get("WDISBORROW")
     if disc_0 is not None:
         disc_b = round(disc_0 / 1000.0, 2)
         add_risk("BS-8", "黑天鹅", "银行贴现窗口挤兑", "美联储贴现窗口借款 ($B)", disc_b, "$15.0B", "$50.0B", disc_b / 50.0, "商业银行被迫向美联储紧急求助流动性（类似2023 SVB前兆）")
@@ -1188,7 +1195,6 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     if brent_5d is not None:
         add_risk("BS-10", "黑天鹅", "能源供给断供冲击", "布伦特原油 5日暴涨 (%)", brent_5d, "+6.5%", "+12.0%", max(0.0, brent_5d / 12.0), "地缘战争或航道封锁导致油价脉冲暴涨，触发全球突发滞胀冲击")
 
-    # 新增 BS-11 ~ BS-18
     nfci_0 = get("NFCI")
     if nfci_0 is not None:
         add_risk("BS-11", "黑天鹅", "金融条件骤紧熔断", "芝加哥联储 NFCI 指数", round(nfci_0, 2), "0.00", "+0.50", max(0.0, (nfci_0 + 0.5) / 1.0), "跨市场金融条件由松转紧突破零轴，信用与融资环境骤冷")
@@ -1272,9 +1278,8 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     if tdsp_0 is not None:
         add_risk("GR-10", "灰犀牛", "美家庭债务偿付负担", "家庭偿债占可支配收入比(%)", round(tdsp_0, 2), "10.5%", "12.0%", max(0.0, (tdsp_0 - 8.0) / 4.0), "高利率向存量房贷/车贷/消费贷传导，挤压居民可选消费现金流")
 
-    # 新增 GR-11 ~ GR-18
     if rrp is not None:
-        rrp_depletion_ratio = max(0.0, (400.0 - rrp) / 350.0)  # 低于50B触发红灯
+        rrp_depletion_ratio = max(0.0, (400.0 - rrp) / 350.0)
         add_risk("GR-11", "灰犀牛", "ON RRP流动性缓冲耗尽", "隔夜逆回购余额 ($B)", round(rrp, 1), "$150B", "$50B", rrp_depletion_ratio, "逆回购蓄水池见底后，美联储QT与TGA发债将直接抽干商业银行准备金")
 
     if tips_0 is not None:
@@ -1289,12 +1294,12 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
         add_risk("GR-14", "灰犀牛", "居民住房抵押贷款违约", "银行居民房贷违约率 (%)", round(mtg_delinq, 2), "2.20%", "3.20%", max(0.0, mtg_delinq / 3.20), "失业率上升叠加高房贷利率开始击穿美国家庭核心资产负债表")
 
     if psav is not None:
-        sav_stress = max(0.0, (6.5 - psav) / 3.5)  # 储蓄率低于3.0%触发红灯
+        sav_stress = max(0.0, (6.5 - psav) / 3.5)
         add_risk("GR-15", "灰犀牛", "美居民超额储蓄枯竭", "个人储蓄率占可支配收入(%)", round(psav, 1), "4.2%", "3.0%", sav_stress, "居民消费高度依赖信用卡透支，一旦就业降温消费将断崖失速")
 
     bus_yoy = calc_yoy("BUSLOANS", lag=12)
     if bus_yoy is not None:
-        bus_stress = max(0.0, (3.0 - bus_yoy) / 4.0)  # 工商业贷款同比低于-1.0%触发红灯
+        bus_stress = max(0.0, (3.0 - bus_yoy) / 4.0)
         add_risk("GR-16", "灰犀牛", "美国工商业信贷萎缩", "工商业贷款余额同比 (%)", bus_yoy, "+0.5%", "-1.0%", bus_stress, "企业停止主动加杠杆扩产，经济内生信用派生引擎熄火")
 
     add_risk("GR-17", "灰犀牛", "萨姆规则衰退临界逼近", "萨姆规则实时指标 (%)", round(sahm, 2), "0.35%", "0.50%", max(0.0, sahm / 0.50), "失业率3个月均值较12个月低点上升超0.50%触发历史100%准度衰退铁律")
@@ -1322,7 +1327,7 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
         debt_ratio = em_ratios.get(iso3, "")
         country_rows.append([iso3, country_names.get(iso3, iso3), gdp, cpi, b10, "", ca, fiscal, debt_ratio])
 
-    # ================= E. 生成五步中文研判报告 (GPT-6.2 Astra 最高思考 + 36维风险库 + 新闻) =================
+    # ================= E. 生成五步中文研判报告 =================
     tips10 = tips_0 or 0.0
     growth_weak = (sahm >= 0.5) or (nfp_add_10k is not None and nfp_add_10k < 8.0)
     infl_high = (pce_3m_ann is not None and pce_3m_ann > 2.5) or (us_cpi_yoy is not None and us_cpi_yoy > 2.8)
@@ -1358,9 +1363,9 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
     fallback_report = (
         f"【宏观第一性原理自动研判简报 | 更新时间: {NOW_STR}】\n"
         f"1. 周期定位与硬数据：{quadrant} 美非农 {nfp_add_10k if nfp_add_10k is not None else '-'} 万、CPI {us_cpi_yoy if us_cpi_yoy is not None else '-'}%、萨姆规则 {sahm}%、美联邦利息占财政收入 {interest_rev_ratio if interest_rev_ratio is not None else '-'}%；中国PMI {cn_pmi if cn_pmi is not None else '-'}、M1-M2剪刀差 {cn_scissors if cn_scissors is not None else '-'}%。\n"
-        f"2. 水管与跨资产锚点：净流动性 {net_liq}B（1W {net_liq_chg:+}B | 4W {net_liq_4w}B | 13W {net_liq_13w}B），10Y TIPS {tips10}%，10Y-2Y利差 {spread_10_2}%（{curve_regime}）。市场：SPX={spx_p} | 沪深300={csi_p} | DXY={dxy_p} | USD/JPY={jpy_p} | 黄金={au_p} | 布油={br_p} | BTC={btc_p}。\n"
+        f"2. 水管与跨资产锚点：净流动性 {net_liq}B（1W {net_liq_chg:+}B | 4W {net_liq_4w}B | 13W {net_liq_13w}B），10Y TIPS {tips10}%，10Y-2Y利差 {spread_10_2}%（{curve_regime}）。市场：SPX={spx_p} | 沪深300/ASHR={csi_p} | DXY={dxy_p} | USD/JPY={jpy_p} | 黄金={au_p} | 布油={br_p} | BTC={btc_p}。\n"
         f"3. 传导机制与背离监控：{regime_logic} {' '.join(divergence_flags)}\n"
-        f"4. 黑天鹅&灰犀牛36维雷达：ON RRP {rrp}B，CRE违约率 {cre_delinq}%，SLOOS收紧 {sloos_0}%，贴现窗口借款 ${round(disc_0/1000,1) if disc_0 else '-'}B。{'⚠️ 预警：' + '；'.join(red_alerts + yellow_alerts) if (red_alerts or yellow_alerts) else '✅ 36大风险维度均处绿灯常态区间。'}\n"
+        f"4. 黑天鹅&灰犀牛全全景雷达：ON RRP {rrp}B，CRE违约率 {cre_delinq}%，SLOOS收紧 {sloos_0}%，贴现窗口借款 ${round(disc_0/1000,1) if disc_0 else '-'}B。{'⚠️ 预警：' + '；'.join(red_alerts + yellow_alerts) if (red_alerts or yellow_alerts) else '✅ 36大风险维度均处绿灯常态区间。'}\n"
         f"5. 情景概率与强制证伪：{probs} ｜ 证伪点：① 10Y TIPS 突破 {'1.80%' if tips10 > 2.0 else '2.25%'}；② 高收益债利差破 500bps 或 VIX 破 30；③ 净流动性连续两周反向变动超 150B。"
     )
 
@@ -1369,7 +1374,7 @@ def analyze_macro_and_blackswan(s_obs, s_dates, wb_metrics, imf_metrics, extra_v
         "quadrant": quadrant,
         "liquidity_impulse_B": {"current": net_liq, "chg_1w": net_liq_chg, "chg_4w": net_liq_4w, "chg_13w": net_liq_13w, "on_rrp": rrp, "tga_B": round(tga/1000, 1) if tga else None},
         "rates_and_fiscal": {"tips10": tips10, "spread_10_2": spread_10_2, "curve_regime": curve_regime, "implied_rate_cut_bps": implied_rate_cut_bps, "interest_rev_ratio_pct": interest_rev_ratio, "us_nom_gdp_yoy": us_nom_gdp_yoy},
-        "growth_and_inflation": {"pce_3m_ann": pce_3m_ann, "us_cpi_yoy": us_cpi_yoy, "nfp_10k": nfp_add_10k, "sahm": sahm, "eia_crude_4w_chg_mbbl": eia_4w_chg, "cn_pmi": cn_pmi, "cn_m1_m2_scissors": cn_scissors, "cn_ppi_cpi_gap": ppi_cpi_gap},
+        "growth_and_inflation": {"pce_3m_ann": pce_3m_ann, "us_cpi_yoy": us_cpi_yoy, "nfp_10k": nfp_add_10k, "sahm": sahm, "cn_pmi": cn_pmi, "cn_m1_m2_scissors": cn_scissors, "cn_ppi_cpi_gap": ppi_cpi_gap},
         "cross_asset_prices": {k: {"price": v["price"], "pct_5d": v["pct_5d"], "pct_20d": v["pct_20d"]} for k, v in market_stats.items() if k in ["SPX", "NDX", "SOX", "CSI300", "US_REG_BANK", "US_HY_ETF", "US_20Y_BOND", "DXY", "USDJPY", "USDCNH", "GOLD", "BRENT", "COPPER", "VIX", "BTC"]},
         "precomputed_divergence_flags": divergence_flags,
         "blackswan_and_grayrhino_36d": sorted(
@@ -1427,12 +1432,10 @@ def sync_all_sheets(raw_records, cross_asset_items, risk_rows, country_rows, mac
             except Exception:
                 pass
 
-    # ================= 1. 更新 04_长期结构周期库_LongTermCycle =================
     if lt_matrix and len(lt_matrix) > 1:
         ws_lt.clear()
         ws_lt.update(range_name="A1", values=lt_matrix, value_input_option="USER_ENTERED")
 
-    # ================= 2. 更新 02_日频短周期库_TimeSeries =================
     existing = [r for r in ws_ts.get_all_values() if r and len(r) > 0 and str(r[0]).strip()]
     all_keys = ["Date"] + sorted(ts_dict.keys())
 
@@ -1460,7 +1463,6 @@ def sync_all_sheets(raw_records, cross_asset_items, risk_rows, country_rows, mac
         else:
             ws_ts.append_row(new_row, value_input_option="USER_ENTERED")
 
-    # ================= 3. 更新 01_跨资产与宏观硬数据_MarketsAndMacro =================
     mkt_matrix = [["资产类别", "代码", "资产名称", "最新价", "1D涨跌", "5D涨跌", "20D涨跌", "第一性原理定价驱动"]]
     for item in cross_asset_items:
         mkt_matrix.append([item["cat"], item["code"], item["name"], item["price"], item["pct_1d"], item["pct_5d"], item["pct_20d"], item["driver"]])
@@ -1470,13 +1472,11 @@ def sync_all_sheets(raw_records, cross_asset_items, risk_rows, country_rows, mac
     ws_mkt_mac.clear()
     ws_mkt_mac.update(range_name="A1", values=mkt_matrix, value_input_option="USER_ENTERED")
 
-    # ================= 4. 更新 03_全量指标底表与日志_RawAndLog =================
     raw_headers = ["观测日期", "国家/地区", "六层归属", "指标代码", "指标名称", "最新值", "前值", "边际变化", "数据源", "同步时间"]
     raw_matrix = [raw_headers] + [[r.get(h, "") for h in raw_headers] for r in raw_records]
     ws_raw_log.clear()
     ws_raw_log.update(range_name="A1", values=raw_matrix, value_input_option="USER_ENTERED")
 
-    # ================= 5. 更新 00_宏观驾驶舱_Dashboard (AI深度研判 + 36维风险雷达 + 多国对比) =================
     dash_matrix = [
         ["🌍 全球宏观第一性原理自动驾驶舱 (36维黑天鹅/灰犀牛雷达版)", "", "", "", "", "", "", "", f"同步时间: {NOW_STR}"],
         [report_text],
@@ -1484,7 +1484,6 @@ def sync_all_sheets(raw_records, cross_asset_items, risk_rows, country_rows, mac
         ["🚨 36维系统性风险雷达 (BS-1~18 急性黑天鹅 | GR-1~18 慢性灰犀牛)"],
         ["风险编号", "风险类型与维度", "核心监测指标", "当前最新值", "黄灯警戒线", "红灯熔断线", "当前状态", "传导引爆机制", "距红线进度"],
     ]
-    # 按距离红灯熔断线危急程度降序排列，最危险的排在最前面
     sorted_risks = sorted(risk_rows, key=lambda x: x[8], reverse=True)
     dash_matrix.extend(sorted_risks)
     dash_matrix.append([])
