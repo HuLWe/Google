@@ -1401,7 +1401,10 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
 # ================= 8. 工作表写入 + 12张金字塔结构图 + 逐图 AI 解说卡片 + 颜色预警高亮 =================
 def get_or_create_ws(sh, title, rows=300, cols=45):
     try:
-        return sh.worksheet(title)
+        ws = sh.worksheet(title)
+        if ws.row_count < rows or ws.col_count < cols:
+            ws.resize(rows=max(ws.row_count, rows), cols=max(ws.col_count, cols))
+        return ws
     except gspread.WorksheetNotFound:
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
