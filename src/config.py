@@ -6,7 +6,9 @@ SEC_USER_AGENT = os.getenv("SEC_USER_AGENT", "HuLiweiQuantResearch admin@example
 # 环境变量与 API 密钥
 FRED_API_KEY = os.getenv("FRED_API_KEY", "")
 AI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.openai.com/v1")
+
+# AI 中转站配置 (支持传入 https://api.starwish.fit)
+AI_BASE_URL = os.getenv("AI_BASE_URL", "https://api.starwish.fit")
 AI_MODEL_NAME = os.getenv("AI_MODEL_NAME", "gpt-astra-6.2")
 SHEET_ID = os.getenv("SPREADSHEET_ID", "")
 
