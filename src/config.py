@@ -15,7 +15,8 @@ SHEET_ID = os.getenv("SPREADSHEET_ID", "")
 # ----------------------------------------------------
 # 📌【核心配置】：自定义自选股监控清单（在此随意增删股票代码）
 # ----------------------------------------------------
-WATCHLIST = ["MSFT", "COST", "NVDA", "AAPL", "GOOGL", "AMZN", "META", "TSLA"]
+# src/config.py
+WATCHLIST = ["MSFT", "COST", "NVDA", "AAPL", "GOOGL", "AMZN", "META", "TSLA", "AMD", "PLTR"]
 
 # 全中文工作表标签页映射
 SHEET_NAMES = {
