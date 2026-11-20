@@ -4,14 +4,12 @@ import requests
 from config import AI_API_KEY, AI_BASE_URL, AI_MODEL_NAME
 
 def get_api_endpoint() -> str:
-    '''安全拼装 API Endpoint，自动处理尾部斜杠与 /v1 路径追加'''
     base = AI_BASE_URL.rstrip('/')
     if not base.endswith('/v1'):
         base += '/v1'
     return f"{base}/chat/completions"
 
 def extract_10k_notes_with_ai(ticker: str, cik: str, subs: dict, total_revenue: float) -> dict:
-    '''调用 AI API 解析 10-K 附注文本并提取结构化指标'''
     cache_dir = "cache_10k"
     os.makedirs(cache_dir, exist_ok=True)
     cache_file = os.path.join(cache_dir, f"{ticker}_10k_ai.json")
@@ -40,7 +38,6 @@ def extract_10k_notes_with_ai(ticker: str, cik: str, subs: dict, total_revenue: 
     }
     
     endpoint = get_api_endpoint()
-    
     payload = {
         "model": AI_MODEL_NAME,
         "messages": [{"role": "user", "content": prompt}],
@@ -56,7 +53,6 @@ def extract_10k_notes_with_ai(ticker: str, cik: str, subs: dict, total_revenue: 
             
         data = json.loads(raw_text)
         
-        # 分部守恒校验: 占比之和不在 [0.90, 1.10] 内则判定为误算并降级
         seg_sum = sum(data.get("segment_shares", [1.0]))
         if not (0.90 <= seg_sum <= 1.10):
             data["segment_shares"] = [1.0]
@@ -66,7 +62,6 @@ def extract_10k_notes_with_ai(ticker: str, cik: str, subs: dict, total_revenue: 
             
         return data
     except Exception:
-        # 网络请求超时或 API 返回非标准 JSON 时的降级兜底数据
         return {
             "segment_shares": [1.0], "geo_shares": [1.0], "max_single_foreign_geo_pct": 0.0,
             "max_single_customer_pct": 0.0, "top5_customers_pct": 0.0, "employees_count": 50000,
