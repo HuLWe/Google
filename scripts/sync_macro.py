@@ -20,24 +20,30 @@ _match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", _raw_ss)
 SPREADSHEET_ID = _match.group(1) if _match else _raw_ss.split("/")[0].split("?")[0].strip()
 GCP_SA_JSON = json.loads(os.environ["GCP_SA_KEY"])
 
-# AI 模型与中转站配置：https://api.starwish.fit/v1 + GPT-6.2 Astra + 最高思考程度
+# AI 模型与三级备用通道配置（主中转站 -> OpenRouter -> Gemini）
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "https://api.starwish.fit/v1").strip().rstrip("/")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-6.2-astra").strip()
 OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "max").strip()
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o").strip()
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 TZ_CST = timezone(timedelta(hours=8))
 NOW_STR = datetime.now(TZ_CST).strftime("%Y-%m-%d %H:%M:%S")
 TODAY_STR = datetime.now(TZ_CST).strftime("%Y-%m-%d")
 
-# 精简后的 3 张核心工作表
+# 严格精简为 3 张核心工作表（1张驾驶舱前端 + 2张底层数据库）
 TAB_DASH = "00_宏观驾驶舱_总览"
 TAB_RISK_NEWS = "01_风险雷达与多板块新闻库"
 TAB_TS_CALC = "02_底层时序与衍生运算库"
 
+# 包含历史遗留僵尸表 01_原始指标库_Raw，运行时自动清理
 OLD_TABS_TO_REMOVE = [
+    "01_原始指标库_Raw",
+    "03_原始指标库_Raw",
+    "原始指标库",
     "00_宏观驾驶舱_Dashboard",
     "01_跨资产与宏观硬数据_MarketsAndMacro",
     "02_日频短周期库_TimeSeries",
@@ -74,6 +80,7 @@ def create_http_session():
 
 
 HTTP = create_http_session()
+
 
 # ================= 2. 六层第一性原理全量宏观指标字典 =================
 FRED_SERIES = [
@@ -142,7 +149,7 @@ MARKET_ASSETS = [
     {"cat": "核心股指", "ticker": "^GSPC", "code": "SPX", "lt": True, "flow_chart": True, "short_name": "美股标普500", "name": "美国标普500指数", "driver": "美股盈利预期 × 10年期国债贴现率"},
     {"cat": "核心股指", "ticker": "^NDX", "code": "NDX", "lt": True, "flow_chart": True, "short_name": "纳斯达克100", "name": "美国纳斯达克100指数", "driver": "远期现金流久期资产，对实际利率极敏感"},
     {"cat": "核心股指", "ticker": "^SOX", "code": "SOX", "lt": False, "flow_chart": True, "short_name": "费城半导体", "name": "美国费城半导体指数", "driver": "全球人工智能算力资本开支与芯片周期温度计"},
-    {"cat": "核心股指", "ticker": "000300.SS", "fallback_ticker": "ASHR", "code": "CSI300", "lt": True, "flow_chart": True, "short_name": "中国沪深300", "name": "中国沪深300指数（含A股映射）", "driver": "中国社融信贷脉冲与货币活化剪刀差"},
+    {"cat": "核心股指", "ticker": "000300.SS", "fallback_ticker": "ASHR", "fallback_name": "中国沪深300ETF(ASHR)", "code": "CSI300", "lt": True, "flow_chart": True, "short_name": "中国沪深300", "name": "中国沪深300指数", "driver": "中国社融信贷脉冲与货币活化剪刀差"},
     {"cat": "核心股指", "ticker": "^HSI", "code": "HSI", "lt": False, "flow_chart": True, "short_name": "香港恒生指数", "name": "中国香港恒生指数", "driver": "中国经济基本面分子 × 美元流动性分母双重定价"},
     {"cat": "核心股指", "ticker": "^N225", "code": "N225", "lt": False, "flow_chart": True, "short_name": "日本日经225", "name": "日本日经225指数", "driver": "日元汇率波动与日本央行货币政策转向预期"},
     {"cat": "核心股指", "ticker": "^GDAXI", "code": "DAX", "lt": False, "flow_chart": True, "short_name": "德国DAX指数", "name": "德国法兰克福DAX指数", "driver": "欧元区制造业周期与欧央行降息路径"},
@@ -169,7 +176,18 @@ CRYPTO_ASSETS = [
 COUNTRIES_LIST = ["USA", "CHN", "JPN", "DEU", "IND", "BRA", "IDN", "TUR"]
 
 
-# ================= 4. 通用安全格式化与多板块新闻抓取 =================
+# ================= 4. 通用安全格式化与三级 AI 容灾引擎 =================
+def safe_sheet_val(val):
+    """防止以 + / - / = 开头的描述性文本在 USER_ENTERED 模式下触发 Google Sheets #ERROR!"""
+    if isinstance(val, str) and val and val[0] in ("+", "-", "=", "@"):
+        return "'" + val
+    return val
+
+
+def sanitize_matrix_for_sheets(matrix):
+    return [[safe_sheet_val(cell) for cell in row] for row in matrix]
+
+
 def fmt_num(val, fmt_str="{:,.2f}", suffix="", fallback="待刷新"):
     if val is None or not isinstance(val, (int, float)):
         return fallback
@@ -184,67 +202,147 @@ def clean_html_text(raw_txt):
     return re.sub(r"\s+", " ", txt).strip()
 
 
+def call_llm_with_fallback(prompt, max_tokens=6000, reasoning_effort=""):
+    """三级 AI 容灾调用链：1.主中转站 -> 2.OpenRouter -> 3.Google Gemini"""
+    if OPENAI_API_KEY:
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+        efforts = [reasoning_effort] if reasoning_effort else [""]
+        if reasoning_effort.lower() == "max":
+            efforts.append("high")
+        for eff in efforts:
+            try:
+                body = {
+                    "model": OPENAI_MODEL,
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": max_tokens,
+                }
+                if eff:
+                    body["reasoning_effort"] = eff
+                resp = HTTP.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=body, timeout=(15, 210))
+                if resp.status_code == 200:
+                    content = resp.json()["choices"][0]["message"]["content"].strip()
+                    if content:
+                        return content, f"主引擎({OPENAI_MODEL})"
+                elif resp.status_code == 400 and eff == "max":
+                    continue
+            except Exception as e:
+                print(f"[INFO] 主 AI 接口尝试异常 ({eff}): {e}")
+
+    if OPENROUTER_API_KEY:
+        try:
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            body = {
+                "model": OPENROUTER_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+            }
+            resp = HTTP.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=body, timeout=(15, 180))
+            if resp.status_code == 200:
+                content = resp.json()["choices"][0]["message"]["content"].strip()
+                if content:
+                    return content, f"备用OpenRouter({OPENROUTER_MODEL})"
+        except Exception as e:
+            print(f"[INFO] OpenRouter 备用接口异常: {e}")
+
+    if GEMINI_API_KEY:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+            body = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {"maxOutputTokens": max_tokens, "temperature": 0.3},
+            }
+            resp = HTTP.post(url, json=body, timeout=(15, 180))
+            if resp.status_code == 200:
+                data = resp.json()
+                parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                content = "".join(p.get("text", "") for p in parts).strip()
+                if content:
+                    return content, f"备用Gemini({GEMINI_MODEL})"
+        except Exception as e:
+            print(f"[INFO] Gemini 备用接口异常: {e}")
+
+    return None, "本地规则兜底引擎"
+
+
+def is_relevant_macro_news(title, desc):
+    """过滤个人理财八卦/情感杂文，仅保留宏观、央行、利率、大宗、产业与地缘财经新闻"""
+    combined = f"{title} {desc}".lower()
+    noise_patterns = [
+        r"\bmy wife\b", r"\bmy husband\b", r"\bmy family\b", r"\bshould i\b",
+        r"\bannuity\b", r"\bretirement savings\b", r"\bpersonal finance\b",
+        r"\bcredit card\b", r"\bmortgage rate for\b", r"\bhow much money\b",
+        r"\bhoroscope\b", r"\bcelebrity\b", r"\bnetflix\b", r"\bvideo game\b",
+    ]
+    if any(re.search(p, combined) for p in noise_patterns):
+        return False
+
+    macro_keywords = [
+        "fed", "powell", "fomc", "rate", "inflation", "cpi", "pce", "gdp",
+        "treasury", "yield", "bond", "debt", "deficit", "bank", "credit",
+        "ecb", "boj", "pboc", "china", "japan", "yen", "yuan", "dollar", "euro",
+        "oil", "opec", "crude", "gold", "copper", "commodity", "energy",
+        "tariff", "trade", "sanction", "supply chain", "semiconductor", "chip",
+        "ai", "nvidia", "nasdaq", "s&p", "earnings", "recession", "jobs", "payroll",
+    ]
+    return any(kw in combined for kw in macro_keywords)
+
+
 def translate_and_summarize_news_zh(news_items):
     if not news_items:
         return news_items
 
-    if OPENAI_API_KEY:
+    payload_lines = [
+        f"{i+1}. 板块:【{n['sector']}】 | 原标题: {n['raw_title']} | 原文摘要: {n['raw_desc'][:240]}"
+        for i, n in enumerate(news_items)
+    ]
+    prompt = (
+        "请将以下全球财经新闻逐条翻译并提炼为规范的简体中文，"
+        "要求每条输出一个 JSON 对象，包含：\n"
+        "- index: 序号（整数）\n"
+        "- zh_title: 简明准确的中文新闻标题（全部使用中文，机构与人名使用标准中文译名）\n"
+        "- zh_summary: 55至85字的中文核心摘要，必须交代清楚事件数据及对股、债、汇或大宗商品的传导影响（全部使用中文）\n"
+        "严格返回 JSON 数组，不要输出任何额外解释文字：\n"
+        + "\n".join(payload_lines)
+    )
+    raw_resp, _ = call_llm_with_fallback(prompt, max_tokens=4500)
+    if raw_resp:
         try:
-            payload_lines = []
-            for i, n in enumerate(news_items):
-                payload_lines.append(
-                    f"{i+1}. 板块:【{n['sector']}】 | 原标题: {n['raw_title']} | 原文摘要: {n['raw_desc'][:260]}"
-                )
-            prompt = (
-                "请将以下全球财经新闻逐条处理为规范的简体中文，"
-                "要求每条输出一个 JSON 对象，包含：\n"
-                "- index: 序号（整数）\n"
-                "- zh_title: 简明准确的中文新闻标题（严禁任何英文单词，人名机构名使用中文标准译名）\n"
-                "- zh_summary: 60至90字的中文核心摘要，必须交代清楚核心事件数据及对股、债、汇或大宗商品的传导影响（严禁任何英文单词）\n"
-                "严格返回 JSON 数组，不要输出任何额外解释文字：\n"
-                + "\n".join(payload_lines)
-            )
-            headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-            body = {
-                "model": OPENAI_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 4500,
-            }
-            resp = HTTP.post(f"{OPENAI_BASE_URL}/chat/completions", headers=headers, json=body, timeout=(12, 90))
-            if resp.status_code == 200:
-                content = resp.json()["choices"][0]["message"]["content"].strip()
-                json_match = re.search(r"\[.*\]", content, re.DOTALL)
-                if json_match:
-                    parsed = json.loads(json_match.group(0))
-                    parsed_map = {int(x["index"]): x for x in parsed if "index" in x}
-                    for i, n in enumerate(news_items):
-                        item = parsed_map.get(i + 1)
-                        if item:
-                            if item.get("zh_title"):
-                                n["title"] = str(item["zh_title"]).strip()
-                            if item.get("zh_summary"):
-                                n["summary"] = str(item["zh_summary"]).strip()
-                    return news_items
+            json_match = re.search(r"\[.*\]", raw_resp, re.DOTALL)
+            if json_match:
+                parsed = json.loads(json_match.group(0))
+                parsed_map = {int(x["index"]): x for x in parsed if "index" in x}
+                for i, n in enumerate(news_items):
+                    item = parsed_map.get(i + 1)
+                    if item:
+                        if item.get("zh_title"):
+                            n["title"] = str(item["zh_title"]).strip()
+                        if item.get("zh_summary"):
+                            n["summary"] = str(item["zh_summary"]).strip()
+                return news_items
         except Exception as e:
-            print(f"[INFO] AI 新闻翻译摘要回退至本地规则引擎: {e}")
+            print(f"[INFO] AI 新闻翻译解析回退: {e}")
 
     replacements = [
         (r"\bFederal Reserve\b|\bFed\b", "美联储"),
+        (r"\bFOMC\b", "联邦公开市场委员会"),
         (r"\bPowell\b", "鲍威尔"),
         (r"\bTreasury\b", "美国财政部/美债"),
         (r"\bYields?\b", "国债收益率"),
         (r"\bInflation\b", "通胀"),
-        (r"\bCPI\b", "居民消费价格指数"),
-        (r"\bPCE\b", "个人消费支出物价指数"),
+        (r"\bCPI\b", "消费物价指数"),
+        (r"\bPCE\b", "个人消费支出物价"),
         (r"\bGDP\b", "国内生产总值"),
         (r"\bRecession\b", "经济衰退"),
-        (r"\bTariffs?\b", "关税贸易政策"),
+        (r"\bTariffs?\b", "关税政策"),
         (r"\bChina\b", "中国"),
         (r"\bPBOC\b", "中国央行"),
         (r"\bBOJ\b", "日本央行"),
         (r"\bECB\b", "欧洲央行"),
         (r"\bOil\b|\bCrude\b", "国际原油"),
-        (r"\bOPEC\b", "欧佩克产油国组织"),
+        (r"\bOPEC\b", "欧佩克产油国"),
         (r"\bGold\b", "黄金"),
         (r"\bDollar\b", "美元"),
         (r"\bYen\b", "日元"),
@@ -254,21 +352,21 @@ def translate_and_summarize_news_zh(news_items):
         (r"\bSemiconductors?\b|\bChips?\b", "半导体芯片"),
     ]
     sector_impact_hint = {
-        "央行与货币政策": "核心影响：直接重塑短端利率预期与全球美元流动性松紧阀门。",
-        "债市信用与财政": "核心影响：牵动长端美债贴现率分母与高收益企业债再融资信用利差。",
-        "美股科技与盈利": "核心影响：影响权益市场分子端盈利预期与科技成长股估值风险偏好。",
-        "大宗商品与能源": "核心影响：决定全球供给端通胀黏性与实体制造业补库周期强度。",
-        "中国与全球外汇": "核心影响：反映跨境资本流动方向、中美利差传导与非美货币汇率弹性。",
-        "地缘贸易与供应链": "核心影响：影响全球供应链成本溢价、避险资产定价与滞胀尾部风险。",
+        "央行与货币政策": "传导影响：直接重塑短端利率预期与全球美元流动性松紧阀门。",
+        "债市信用与财政": "传导影响：牵动长端美债贴现率分母与高收益企业债再融资信用利差。",
+        "美股科技与盈利": "传导影响：影响权益市场分子端盈利预期与科技成长股估值风险偏好。",
+        "大宗商品与能源": "传导影响：决定全球供给端通胀黏性与实体制造业补库周期强度。",
+        "中国与全球外汇": "传导影响：反映跨境资本流动方向、中美利差传导与非美货币汇率弹性。",
+        "地缘贸易与供应链": "传导影响：影响全球供应链成本溢价、避险资产定价与滞胀尾部风险。",
     }
     for n in news_items:
         t = n["raw_title"]
-        d = n["raw_desc"][:120]
+        d = n["raw_desc"][:110]
         for pat, zh in replacements:
             t = re.sub(pat, zh, t, flags=re.IGNORECASE)
             d = re.sub(pat, zh, d, flags=re.IGNORECASE)
         n["title"] = t
-        hint = sector_impact_hint.get(n["sector"], "核心影响：需结合跨资产价格验证流动性方向。")
+        hint = sector_impact_hint.get(n["sector"], "传导影响：需结合跨资产价格验证流动性方向。")
         n["summary"] = f"{d}（{hint}）" if d else f"该动态涉及{n['sector']}最新边际变化。{hint}"
     return news_items
 
@@ -308,13 +406,15 @@ def fetch_global_macro_news():
                 continue
             root = ET.fromstring(resp.content)
             count_per_src = 0
-            for item in root.findall(".//item")[:12]:
+            for item in root.findall(".//item")[:15]:
                 title_el = item.find("title")
                 desc_el = item.find("description")
                 if title_el is None or not title_el.text:
                     continue
                 raw_title = clean_html_text(title_el.text)
                 raw_desc = clean_html_text(desc_el.text if desc_el is not None else "")
+                if not is_relevant_macro_news(raw_title, raw_desc):
+                    continue
                 norm_key = raw_title.lower()[:55]
                 if norm_key in seen_titles:
                     continue
@@ -335,10 +435,10 @@ def fetch_global_macro_news():
         except Exception as e:
             print(f"[WARN] 新闻源 {src_name} 抓取跳过: {e}")
 
-    return translate_and_summarize_news_zh(collected[:18])
+    return translate_and_summarize_news_zh(collected[:16])
 
 
-# ================= 5. 多源精准数据抓取与解析引擎（含 FRED CSV 兜底） =================
+# ================= 5. 多源精准数据抓取与解析引擎 =================
 def fetch_yahoo_chart(ticker, range_str="1mo", interval_str="1d"):
     for host in ["query1.finance.yahoo.com", "query2.finance.yahoo.com"]:
         url = f"https://{host}/v8/finance/chart/{ticker}?range={range_str}&interval={interval_str}"
@@ -405,9 +505,11 @@ def fetch_market_assets(series_obs, lt_hist_dates):
 
     for item in MARKET_ASSETS:
         active_ticker = item["ticker"]
+        display_name = item["name"]
         _, prices, _ = fetch_yahoo_chart(active_ticker, "1mo", "1d")
         if not prices and item.get("fallback_ticker"):
             active_ticker = item["fallback_ticker"]
+            display_name = item.get("fallback_name", display_name)
             _, prices, _ = fetch_yahoo_chart(active_ticker, "1mo", "1d")
         if not prices:
             print(f"[WARN] 行情资产 {item['name']} 暂不可用")
@@ -434,7 +536,7 @@ def fetch_market_assets(series_obs, lt_hist_dates):
 
         cross_asset_items.append({
             "cat": item["cat"],
-            "name": item["name"],
+            "name": display_name,
             "price": p0,
             "pct_1d": pct_1d / 100.0,
             "pct_5d": (pct_5d / 100.0) if pct_5d is not None else "",
@@ -506,7 +608,6 @@ def fetch_market_assets(series_obs, lt_hist_dates):
 
 
 def fetch_fred_csv_fallback(sid, obs_start):
-    """FRED 官方公共 CSV 直连兜底通道（防 JSON API 限流导致 PAYEMS 等核心指标解析失败）"""
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}&cosd={obs_start}"
     try:
         resp = HTTP.get(url, timeout=(10, 25))
@@ -531,7 +632,8 @@ def fetch_fred_data():
     series_dates = {}
     series_date_maps = {}
     lt_hist_dates = {}
-    obs_start = (datetime.now(TZ_CST) - timedelta(days=1260)).strftime("%Y-%m-%d")
+    # 放宽至 1680 天（约 4.6 年），确保 156 周（3 年）内月度同比指标均有真实历史基数，杜绝首年平铺失真
+    obs_start = (datetime.now(TZ_CST) - timedelta(days=1680)).strftime("%Y-%m-%d")
 
     for item in FRED_SERIES:
         sid = item["id"]
@@ -554,7 +656,6 @@ def fetch_fred_data():
         except Exception as e:
             print(f"[INFO] JSON 接口获取 {sid} 异常，切换 CSV 直连通道: {e}")
 
-        # 若 JSON API 失败或点数不足 2 个，自动启用官方 CSV 通道补齐
         if len(dmap) < 2:
             csv_dmap = fetch_fred_csv_fallback(sid, obs_start)
             if len(csv_dmap) > len(dmap):
@@ -564,7 +665,6 @@ def fetch_fred_data():
             print(f"[WARN] 底层序列 {item['name']} ({sid}) 暂不可用")
             continue
 
-        # 严格按日期降序排列生成 series_obs，彻底消除顺序错位
         sorted_desc_dts = sorted(dmap.keys(), reverse=True)
         vals = [dmap[d] for d in sorted_desc_dts]
         series_obs[sid] = vals
@@ -572,7 +672,7 @@ def fetch_fred_data():
         series_date_maps[sid] = dmap
         if item.get("lt"):
             lt_hist_dates[sid] = dmap
-        time.sleep(0.06)
+        time.sleep(0.05)
 
     return series_obs, series_dates, series_date_maps, lt_hist_dates
 
@@ -592,10 +692,11 @@ def get_val_by_days_ago(series_date_maps, sid, days_ago=0):
 
 
 def fetch_china_macro_akshare(series_obs, series_dates, lt_hist_dates):
+    cn_ok = 0
     try:
         import akshare as ak
     except Exception:
-        return
+        return cn_ok
 
     def get_latest_two(df, dt_col, val_col):
         temp = df[[dt_col, val_col]].copy()
@@ -622,6 +723,7 @@ def fetch_china_macro_akshare(series_obs, series_dates, lt_hist_dates):
             if res:
                 series_obs["CN_PMI_MFG"] = [res[1], res[2]]
                 series_dates["CN_PMI_MFG"] = res[0]
+                cn_ok += 1
     except Exception:
         pass
 
@@ -636,11 +738,13 @@ def fetch_china_macro_akshare(series_obs, series_dates, lt_hist_dates):
             if r1:
                 series_obs["CN_M1_YOY"] = [r1[1], r1[2]]
                 series_dates["CN_M1_YOY"] = r1[0]
+                cn_ok += 1
         if col_m2:
             r2 = get_latest_two(df_ms, col_dt, col_m2)
             if r2:
                 series_obs["CN_M2_YOY"] = [r2[1], r2[2]]
                 series_dates["CN_M2_YOY"] = r2[0]
+                cn_ok += 1
     except Exception:
         pass
 
@@ -653,42 +757,7 @@ def fetch_china_macro_akshare(series_obs, series_dates, lt_hist_dates):
         if res:
             series_obs["CN_IND_YOY"] = [res[1], res[2]]
             series_dates["CN_IND_YOY"] = res[0]
-    except Exception:
-        pass
-
-    try:
-        fn_tsf = getattr(ak, "macro_china_social_financing", None) or getattr(ak, "macro_china_shrzgm")
-        df_tsf = fn_tsf()
-        col_dt = next((c for c in df_tsf.columns if "月份" in str(c) or "日期" in str(c)), df_tsf.columns[0])
-        col_val = next((c for c in df_tsf.columns if ("社会融资" in str(c) or "增量" in str(c) or "总计" in str(c)) and "同比" not in str(c)), df_tsf.columns[1])
-        res = get_latest_two(df_tsf, col_dt, col_val)
-        if res:
-            series_obs["CN_TSF_NEW"] = [res[1], res[2]]
-            series_dates["CN_TSF_NEW"] = res[0]
-    except Exception:
-        pass
-
-    try:
-        df_cpi = ak.macro_china_cpi()
-        col_dt = next((c for c in df_cpi.columns if "月份" in str(c) or "日期" in str(c)), df_cpi.columns[0])
-        col_yoy = next((c for c in df_cpi.columns if "全国" in str(c) and "同比" in str(c)), next((c for c in df_cpi.columns if "同比" in str(c)), None))
-        if col_yoy:
-            res = get_latest_two(df_cpi, col_dt, col_yoy)
-            if res:
-                series_obs["CN_CPI_YOY"] = [res[1], res[2]]
-                series_dates["CN_CPI_YOY"] = res[0]
-    except Exception:
-        pass
-
-    try:
-        df_ppi = ak.macro_china_ppi()
-        col_dt = next((c for c in df_ppi.columns if "月份" in str(c) or "日期" in str(c)), df_ppi.columns[0])
-        col_yoy = next((c for c in df_ppi.columns if "同比" in str(c) or "今值" in str(c)), None)
-        if col_yoy:
-            res = get_latest_two(df_ppi, col_dt, col_yoy)
-            if res:
-                series_obs["CN_PPI_YOY"] = [res[1], res[2]]
-                series_dates["CN_PPI_YOY"] = res[0]
+            cn_ok += 1
     except Exception:
         pass
 
@@ -704,10 +773,13 @@ def fetch_china_macro_akshare(series_obs, series_dates, lt_hist_dates):
                 series_obs["CN_DGS10"] = [float(latest_row[col_10y]), float(prev_row[col_10y])]
                 series_dates["CN_DGS10"] = dt_str
                 lt_hist_dates["CN_DGS10"] = {
-                    str(r[col_dt])[:10]: float(r[col_10y]) for _, r in df_clean.tail(800).iterrows()
+                    str(r[col_dt])[:10]: float(r[col_10y]) for _, r in df_clean.tail(900).iterrows()
                 }
+                cn_ok += 1
     except Exception:
         pass
+
+    return cn_ok
 
 
 def fetch_external_apis():
@@ -774,7 +846,7 @@ def fetch_external_apis():
     return wb_metrics, imf_metrics, extra_vals
 
 
-# ================= 6. 底层时序对齐 + 16张多元化金字塔图表规范 =================
+# ================= 6. 底层时序对齐 + 8大核心金字塔图表规范（左图右文无重叠） =================
 CHART_SERIES_COLUMNS = [
     ("日期", "Date"),                                         # 0 (A)
     ("美元净流动性（十亿美元）", "NET_LIQUIDITY"),            # 1 (B)
@@ -810,12 +882,12 @@ CHART_SERIES_COLUMNS = [
     ("美国商业库存销售比（倍）", "ISRATIO"),                  # 31 (AF)
 ]
 
-# 单一事实源：16 张多元化结构图（覆盖 L1->L6 全部 8 个金字塔阶梯，含组合图/面积图/双轴折线/四象限散点/横向条形图）
-CHART_SPECS_MASTER = [
-    # 第1排（tier 0）：L1 信用引擎与货币活化
+# 精简聚合为 8 张核心金字塔枢纽图（每张对应一个金字塔阶梯，左侧放图、右侧同排紧跟AI四维解说）
+CHART_SPECS_CORE = [
     {
-        "key": "c1", "tier": 0, "side": "left",
-        "title": "图1【L1信用引擎·组合图】美国商业银行总信贷规模（左轴柱）与高收益垃圾债利差（右轴线）",
+        "key": "c1", "tier": 0,
+        "tier_banner": "【金字塔第1阶 L1·信用引擎】商业银行总信贷扩张与垃圾债违约定价",
+        "title": "图1【L1信用引擎·组合图】美国商业银行总信贷规模（左轴柱）与高收益垃圾债信用利差（右轴线）",
         "type": "COMBO", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
         "y_left_title": "商业银行总信贷（十亿美元）", "y_right_title": "高收益债信用利差（%）",
         "series": [
@@ -824,63 +896,32 @@ CHART_SPECS_MASTER = [
         ],
     },
     {
-        "key": "c2", "tier": 0, "side": "right",
-        "title": "图2【L1货币活化·组合图】美国广义货币M2同比增速（左轴柱）与M1-M2活化剪刀差（右轴线）",
-        "type": "COMBO", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "美国M2同比增速（%）", "y_right_title": "M1-M2活化剪刀差（%）",
-        "series": [
-            {"col": 26, "label": "美国M2同比增速", "unit": "%", "axis": "LEFT_AXIS", "stype": "COLUMN"},
-            {"col": 27, "label": "美国M1-M2活化剪刀差", "unit": "%", "axis": "RIGHT_AXIS", "stype": "LINE"},
-        ],
-    },
-    # 第2排（tier 1）：L1-L2 实体信贷派生与美元三蓄水池
-    {
-        "key": "c3", "tier": 1, "side": "left",
-        "title": "图3【L1信贷派生·双轴折线】美国工商业贷款余额（左轴）与商业银行准备金规模（右轴）",
+        "key": "c2", "tier": 1,
+        "tier_banner": "【金字塔第2阶 L1-L2·美元水管】美联储净流动性总阀门与M1-M2货币活化剪刀差",
+        "title": "图2【L2美元水管·双轴折线】美元净流动性总阀门（左轴）与美国M1-M2货币活化剪刀差（右轴）",
         "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "工商业贷款余额（十亿美元）", "y_right_title": "商业银行准备金（十亿美元）",
-        "series": [
-            {"col": 21, "label": "美国工商业贷款余额", "unit": "十亿美元", "axis": "LEFT_AXIS"},
-            {"col": 20, "label": "商业银行准备金余额", "unit": "十亿美元", "axis": "RIGHT_AXIS"},
-        ],
-    },
-    {
-        "key": "c4", "tier": 1, "side": "right",
-        "title": "图4【L2美元水管·阶梯面积图】美元净流动性总阀门（左轴）与TGA账户、隔夜逆回购（右轴）",
-        "type": "AREA", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "美元净流动性（十亿美元）", "y_right_title": "TGA与逆回购余额（十亿美元）",
+        "y_left_title": "美元净流动性（十亿美元）", "y_right_title": "M1-M2活化剪刀差（%）",
         "series": [
             {"col": 1, "label": "美元净流动性", "unit": "十亿美元", "axis": "LEFT_AXIS"},
-            {"col": 18, "label": "财政部TGA账户", "unit": "十亿美元", "axis": "RIGHT_AXIS"},
-            {"col": 19, "label": "美联储隔夜逆回购", "unit": "十亿美元", "axis": "RIGHT_AXIS"},
+            {"col": 27, "label": "美国M1-M2活化剪刀差", "unit": "%", "axis": "RIGHT_AXIS"},
         ],
     },
-    # 第3排（tier 2）：L2 全球定价之锚
     {
-        "key": "c5", "tier": 2, "side": "left",
-        "title": "图5【L2利率之锚·双轴折线】美债2年期与10年期收益率对比（左轴）及10Y-2Y期限利差（右轴）",
+        "key": "c3", "tier": 2,
+        "tier_banner": "【金字塔第3阶 L2·定价之锚】美债10Y名义利率、TIPS实际利率与10Y-2Y期限利差",
+        "title": "图3【L2利率之锚·双轴折线】美债10Y名义与TIPS实际利率（左轴）及10Y-2Y期限利差（右轴）",
         "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "2Y 与 10Y 名义收益率（%）", "y_right_title": "10Y-2Y 期限利差（%）",
+        "y_left_title": "10Y名义与实际利率（%）", "y_right_title": "10Y-2Y期限利差（%）",
         "series": [
-            {"col": 3, "label": "美国2年期国债收益率", "unit": "%", "axis": "LEFT_AXIS"},
             {"col": 4, "label": "美国10年期国债收益率", "unit": "%", "axis": "LEFT_AXIS"},
+            {"col": 6, "label": "美国10年期TIPS实际利率", "unit": "%", "axis": "LEFT_AXIS"},
             {"col": 5, "label": "美债10Y-2Y期限利差", "unit": "%", "axis": "RIGHT_AXIS"},
         ],
     },
     {
-        "key": "c6", "tier": 2, "side": "right",
-        "title": "图6【L2真实成本·双轴折线】美国10年期TIPS实际利率（左轴）与10年期盈亏平衡通胀预期（右轴）",
-        "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "10年期TIPS实际利率（%）", "y_right_title": "10年期盈亏平衡通胀预期（%）",
-        "series": [
-            {"col": 6, "label": "美国10年期TIPS实际利率", "unit": "%", "axis": "LEFT_AXIS"},
-            {"col": 7, "label": "美国10年期盈亏平衡通胀预期", "unit": "%", "axis": "RIGHT_AXIS"},
-        ],
-    },
-    # 第4排（tier 3）：L3 宏观周期四象限与非农就业引擎
-    {
-        "key": "c7", "tier": 3, "side": "left",
-        "title": "图7【L3周期四象限·散点图】宏观增长—通胀四象限动态定位（右下复苏/右上过热/左上滞胀/左下衰退）",
+        "key": "c4", "tier": 3,
+        "tier_banner": "【金字塔第4阶 L3·周期四象限】经济增长—通胀压力三因子统一坐标轨迹图",
+        "title": "图4【L3周期四象限·散点图】宏观增长—通胀四象限动态定位（右下复苏/右上过热/左上滞胀/左下衰退）",
         "type": "SCATTER", "source_table": "quad", "x_col": 33, "x_title": "经济增长景气得分（>0扩张 / <0放缓）",
         "y_left_title": "通胀压力得分（>0高通胀 / <0低通胀）", "y_right_title": "",
         "series": [
@@ -889,62 +930,31 @@ CHART_SPECS_MASTER = [
         ],
     },
     {
-        "key": "c8", "tier": 3, "side": "right",
-        "title": "图8【L3就业硬数据·组合图】美国单月新增非农就业（右轴柱·万人）与萨姆规则衰退指标（左轴线）",
+        "key": "c5", "tier": 4,
+        "tier_banner": "【金字塔第5阶 L3·财政与衰退双红线】联邦利息吞噬率（20%红线）与萨姆规则（0.50%红线）",
+        "title": "图5【L3财政与就业红线·组合图】联邦利息占财政收入比（左轴柱·20%红线）与萨姆规则指标（右轴线）",
         "type": "COMBO", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "萨姆规则衰退指标（%·0.50红线）", "y_right_title": "单月新增非农就业（万人）",
-        "series": [
-            {"col": 28, "label": "美国单月新增非农就业", "unit": "万人", "axis": "RIGHT_AXIS", "stype": "COLUMN"},
-            {"col": 29, "label": "萨姆规则衰退指标", "unit": "%", "axis": "LEFT_AXIS", "stype": "LINE"},
-        ],
-    },
-    # 第5排（tier 4）：L3 工业补库周期与美国财政生死线
-    {
-        "key": "c9", "tier": 4, "side": "left",
-        "title": "图9【L3补库周期·双轴折线】美国耐用品新订单同比增速（左轴）与商业库存销售比（右轴）",
-        "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "耐用品新订单同比（%）", "y_right_title": "商业库存销售比（倍）",
-        "series": [
-            {"col": 30, "label": "耐用品新订单同比增速", "unit": "%", "axis": "LEFT_AXIS"},
-            {"col": 31, "label": "美国商业库存销售比", "unit": "倍", "axis": "RIGHT_AXIS"},
-        ],
-    },
-    {
-        "key": "c10", "tier": 4, "side": "right",
-        "title": "图10【L3财政生死线·组合图】联邦利息占财政收入比（左轴柱·20%红线）与主权债务雪球r-g（右轴线）",
-        "type": "COMBO", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "利息支出占财政收入比（%）", "y_right_title": "主权债务雪球 r-g（%）",
+        "y_left_title": "利息支出占财政收入比（%）", "y_right_title": "萨姆规则衰退指标（%·0.50红线）",
         "series": [
             {"col": 24, "label": "联邦利息占财政收入比", "unit": "%", "axis": "LEFT_AXIS", "stype": "COLUMN"},
-            {"col": 25, "label": "主权债务雪球差值r-g", "unit": "%", "axis": "RIGHT_AXIS", "stype": "LINE"},
-        ],
-    },
-    # 第6排（tier 5）：L4 跨境资本流动与全球汇率阀门
-    {
-        "key": "c11", "tier": 5, "side": "left",
-        "title": "图11【L4跨境利率锚·双轴折线】中美10年期国债收益率对比（左轴）与中美10Y利差倒挂深度（右轴）",
-        "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "中美10年期国债收益率（%）", "y_right_title": "中美10Y利差（%）",
-        "series": [
-            {"col": 4, "label": "美国10年期国债收益率", "unit": "%", "axis": "LEFT_AXIS"},
-            {"col": 9, "label": "中国10年期国债收益率", "unit": "%", "axis": "LEFT_AXIS"},
-            {"col": 10, "label": "中美10年期利差", "unit": "%", "axis": "RIGHT_AXIS"},
+            {"col": 29, "label": "萨姆规则衰退指标", "unit": "%", "axis": "RIGHT_AXIS", "stype": "LINE"},
         ],
     },
     {
-        "key": "c12", "tier": 5, "side": "right",
-        "title": "图12【L4汇率总阀门·双轴折线】美元指数DXY（左轴）与全球套息总阀门美元兑日元汇率（右轴）",
+        "key": "c6", "tier": 5,
+        "tier_banner": "【金字塔第6阶 L4·跨境汇率与套息总阀门】中美10年期利差倒挂与美元兑日元汇率",
+        "title": "图6【L4跨境汇率阀门·双轴折线】中美10年期国债利差（左轴）与全球套息阀门美元兑日元（右轴）",
         "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "美元指数（DXY）", "y_right_title": "美元兑日元汇率",
+        "y_left_title": "中美10年期利差（%）", "y_right_title": "美元兑日元汇率",
         "series": [
-            {"col": 22, "label": "美元指数", "unit": "", "axis": "LEFT_AXIS"},
+            {"col": 10, "label": "中美10年期利差", "unit": "%", "axis": "LEFT_AXIS"},
             {"col": 23, "label": "美元兑日元汇率", "unit": "", "axis": "RIGHT_AXIS"},
         ],
     },
-    # 第7排（tier 6）：L5 全球资产流动性全景与美股恐慌锚
     {
-        "key": "c13", "tier": 6, "side": "left",
-        "title": "图13【L5全球资产流动性全景·横向条形图】16大核心资产资金净流入与净流出对比（20日与5日动量%）",
+        "key": "c7", "tier": 6,
+        "tier_banner": "【金字塔第7阶 L5·全球资产流动性全景】16大核心资产20日与5日资金净流向动量对比",
+        "title": "图7【L5全球资产资金流向·横向条形图】16大核心资产资金净流入与净流出对比（20日与5日动量%）",
         "type": "BAR", "source_table": "flow", "x_col": 37, "x_title": "全球大类资产（>0净流入 / <0净流出）",
         "y_left_title": "资金净流向动量（%）", "y_right_title": "",
         "series": [
@@ -953,29 +963,9 @@ CHART_SPECS_MASTER = [
         ],
     },
     {
-        "key": "c14", "tier": 6, "side": "right",
-        "title": "图14【L5美股与恐慌锚·组合图】美国标普500指数（左轴柱）与美股VIX恐慌波动率指数（右轴线）",
-        "type": "COMBO", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "标普500指数（点）", "y_right_title": "美股VIX恐慌指数（30警戒）",
-        "series": [
-            {"col": 2, "label": "标普500指数", "unit": "点", "axis": "LEFT_AXIS", "stype": "COLUMN"},
-            {"col": 14, "label": "美股VIX恐慌指数", "unit": "", "axis": "RIGHT_AXIS", "stype": "LINE"},
-        ],
-    },
-    # 第8排（tier 7）：L5-L6 跨资产背离验证与系统性风险塔尖
-    {
-        "key": "c15", "tier": 7, "side": "left",
-        "title": "图15【L5跨资产背离·双轴折线】铜金比实体周期系数（左轴）与COMEX黄金价格（右轴）",
-        "type": "LINE", "source_table": "ts", "x_col": 0, "x_title": "近三年周频日期",
-        "y_left_title": "铜金比（实体周期系数）", "y_right_title": "COMEX黄金价格（美元/盎司）",
-        "series": [
-            {"col": 11, "label": "铜金比", "unit": "", "axis": "LEFT_AXIS"},
-            {"col": 8, "label": "国际黄金价格", "unit": "美元/盎司", "axis": "RIGHT_AXIS"},
-        ],
-    },
-    {
-        "key": "c16", "tier": 7, "side": "right",
-        "title": "图16【L6风险雷达塔尖·横向条形图】36维黑天鹅与灰犀牛危急度排行（距100%红灯线进度 vs 65%警戒）",
+        "key": "c8", "tier": 7,
+        "tier_banner": "【金字塔第8阶 L6·风险雷达塔尖】36维黑天鹅与灰犀牛危急度Top12排行（距100%红灯线进度）",
+        "title": "图8【L6风险雷达塔尖·横向条形图】36维黑天鹅与灰犀牛危急度排行（距100%红灯线进度 vs 65%警戒）",
         "type": "BAR", "source_table": "risk", "x_col": 41, "x_title": "高危系统性风险因子（按危急度降序）",
         "y_left_title": "距红灯熔断线进度（%）", "y_right_title": "",
         "series": [
@@ -987,7 +977,6 @@ CHART_SPECS_MASTER = [
 
 
 def build_monthly_derived_dmap(dmap, mode="yoy"):
-    """将月频存量序列（如 M2SL, M1SL, PAYEMS, DGORDER）精确转换为同比增速(%)或单月增量(万人)日期映射"""
     if not dmap or len(dmap) < 2:
         return {}
     sorted_dts = sorted(dmap.keys())
@@ -1003,13 +992,12 @@ def build_monthly_derived_dmap(dmap, mode="yoy"):
 
 
 def build_clean_chart_timeseries(lt_hist_dates):
-    """生成 156 周（近 3 年）连续无缺失值的底层运算宽表"""
+    """生成 156 周（近 3 年）底层运算宽表；缺失序列保留空字符串，防止断崖归零假信号"""
     spx_weekly = sorted(lt_hist_dates.get("SPX", {}).keys())
     if not spx_weekly:
         return []
     weekly_dates = spx_weekly[-156:]
 
-    # 预计算月度同比与单月非农增量时序
     enriched_hist = dict(lt_hist_dates)
     m2_yoy_map = build_monthly_derived_dmap(lt_hist_dates.get("M2SL", {}), mode="yoy")
     m1_yoy_map = build_monthly_derived_dmap(lt_hist_dates.get("M1SL", {}), mode="yoy")
@@ -1058,6 +1046,8 @@ def build_clean_chart_timeseries(lt_hist_dates):
     for dt in weekly_dates:
         r = {"Date": dt}
         for sid, dmap in enriched_hist.items():
+            if not dmap:
+                continue
             valid_dts = [d for d in dmap.keys() if d <= dt]
             if valid_dts:
                 val = round(dmap[max(valid_dts)], 4)
@@ -1093,29 +1083,29 @@ def build_clean_chart_timeseries(lt_hist_dates):
     headers = [zh_name for zh_name, _ in CHART_SERIES_COLUMNS]
     matrix = [headers]
     for r in raw_rows:
-        row_vals = []
-        for _, code in CHART_SERIES_COLUMNS:
-            val = r.get(code, 0.0 if code != "Date" else "")
-            row_vals.append(val)
+        row_vals = [r.get(code, "") for _, code in CHART_SERIES_COLUMNS]
         matrix.append(row_vals)
     return matrix
 
 
 def build_four_quadrant_series(series_obs, current_growth_score, current_infl_score):
+    """历史12个月轨迹与当月最新站位采用完全一致的三因子增长+双因子通胀坐标系"""
     ind_arr = series_obs.get("INDPRO", [])
     nfp_arr = series_obs.get("PAYEMS", [])
+    rs_arr = series_obs.get("RSAFS", [])
     cpi_arr = series_obs.get("CPIAUCSL", [])
     pce_arr = series_obs.get("PCEPILFE", [])
 
     pts = []
-    max_steps = min(11, len(ind_arr) - 13, len(nfp_arr) - 13, len(cpi_arr) - 13, len(pce_arr) - 4)
+    max_steps = min(11, len(ind_arr) - 13, len(nfp_arr) - 13, len(rs_arr) - 13, len(cpi_arr) - 13, len(pce_arr) - 4)
     if max_steps >= 3:
         for lag in range(max_steps, 0, -1):
             ind_yoy = (ind_arr[lag] / ind_arr[lag + 12] - 1) * 100.0
             nfp_yoy = (nfp_arr[lag] / nfp_arr[lag + 12] - 1) * 100.0
+            rs_yoy = (rs_arr[lag] / rs_arr[lag + 12] - 1) * 100.0
             cpi_yoy = (cpi_arr[lag] / cpi_arr[lag + 12] - 1) * 100.0
             pce_3m = ((pce_arr[lag] / pce_arr[lag + 3]) ** 4 - 1) * 100.0
-            gx = round(0.5 * (ind_yoy - 1.2) + 0.5 * (nfp_yoy - 1.2), 2)
+            gx = round(0.35 * (ind_yoy - 1.2) + 0.35 * (nfp_yoy - 1.2) + 0.30 * (rs_yoy - 3.0), 2)
             iy = round(0.55 * (pce_3m - 2.3) + 0.45 * (cpi_yoy - 2.5), 2)
             pts.append((gx, iy, ""))
 
@@ -1128,7 +1118,7 @@ def extract_plotted_chart_facts(ts_matrix, quad_matrix, flow_matrix, risk_chart_
     plotted_facts = {}
     ts_rows = ts_matrix[1:] if len(ts_matrix) > 1 else []
 
-    for spec in CHART_SPECS_MASTER:
+    for spec in CHART_SPECS_CORE:
         ckey = spec["key"]
         st = spec["source_table"]
         series_summaries = []
@@ -1178,13 +1168,14 @@ def extract_plotted_chart_facts(ts_matrix, quad_matrix, flow_matrix, risk_chart_
         plotted_facts[ckey] = {
             "title": spec["title"],
             "fact_text": "；".join(series_summaries),
-            "verify_stamp": " ✅ 读图实测核验：" + " ｜ ".join(verification_tokens),
+            "verify_stamp": "✅ 读图实测核验：" + " ｜ ".join(verification_tokens),
         }
     return plotted_facts
 
 
-# ================= 7. 全因子精确计算 + 四维关联式 AI 读图解说生成 =================
+# ================= 7. 多视角战略结论矩阵 + AI 深度研判生成 =================
 def calc_risk_ratio(val, safe_base, warn_line, red_line):
+    """连续比例风险评分（移除 1.5 硬上限，保留超红线后的真实危急度排序区分度）"""
     if red_line > safe_base:
         if val <= safe_base:
             return 0.0
@@ -1192,7 +1183,7 @@ def calc_risk_ratio(val, safe_base, warn_line, red_line):
             return 0.65 * (val - safe_base) / max(1e-6, (warn_line - safe_base))
         if val <= red_line:
             return 0.65 + 0.35 * (val - warn_line) / max(1e-6, (red_line - warn_line))
-        return min(1.5, 1.0 + 0.5 * (val - red_line) / max(1e-6, (red_line - warn_line)))
+        return min(2.5, 1.0 + 0.5 * (val - red_line) / max(1e-6, (red_line - warn_line)))
     else:
         if val >= safe_base:
             return 0.0
@@ -1200,89 +1191,84 @@ def calc_risk_ratio(val, safe_base, warn_line, red_line):
             return 0.65 * (safe_base - val) / max(1e-6, (safe_base - warn_line))
         if val >= red_line:
             return 0.65 + 0.35 * (warn_line - val) / max(1e-6, (warn_line - red_line))
-        return min(1.5, 1.0 + 0.5 * (red_line - val) / max(1e-6, (warn_line - red_line)))
+        return min(2.5, 1.0 + 0.5 * (red_line - val) / max(1e-6, (warn_line - red_line)))
 
 
-def generate_ai_full_and_chart_commentary(llm_ctx, plotted_facts, fallback_report, fallback_chart_notes):
-    """生成四维关联式全因子总研判 + 16张结构图逐图深度读图解说"""
+def generate_ai_multi_perspective_and_charts(llm_ctx, plotted_facts, fallback_perspectives, fallback_report, fallback_chart_notes):
+    """生成【六大维度多视角战略结论】+【全因子总研判】+【8张核心图四维读图解说】"""
     prompt = (
-        "你是严格遵循《宏观经济｜六层第一性原理实战通关总纲》的首席宏观策略师与交易教练。\n"
-        "用户要求解说必须**通俗易懂、层层关联、具备实战指导性**。请基于传入的六层全量因子、衍生公式、36维风险雷达、六大板块新闻以及【16张结构图的实测坐标轴数据】，"
-        "输出一个合法的 JSON 对象（不要输出任何 Markdown 代码块标记以外的废话），包含以下两个字段：\n"
-        "1. `master_report`（字符串，1300~1700字）：严格按六层金字塔顺序进行通俗且深度的全因子中文解说，包含：\n"
-        "   - 【一、宏观周期四象限定位与新闻催化主线】（说明当前处于哪一象限、核心逻辑是什么）\n"
-        "   - 【二、第一至二层：信用引擎、货币活化与美元净流动性水管】（说明钱有没有流入实体、水龙头在放水还是抽水）\n"
-        "   - 【三、第三至四层：美欧日中硬数据、财政付息生死线与跨境汇率博弈】（说明就业通胀强弱、美债利息压力与汇率传导）\n"
-        "   - 【四、第五层：全球跨资产资金流向与背离因子穿透】（说明资金正流向哪里、是否存在反常背离）\n"
-        "   - 【五、第六层：36维黑天鹅与灰犀牛高危预警排雷】（带 🔴/🟡/🟢 状态图标）\n"
-        "   - 【六、三情景概率分布与未来十日量化证伪红线】\n"
-        "2. `chart_notes`（对象，必须完整包含键 `c1` 到 `c16` 共 16 个字符串，一个都不能缺！每个 170~230 字）：分别为驾驶舱的 16 张结构图撰写专属深度读图解说。\n"
-        "【每张图解说必须严格包含以下 4 个部分（用换行分隔）】：\n"
-        "📌【看图结论】用大白话直接报出左轴和右轴最新实测数值及近3月方向，说明这张图告诉了我们什么底层真相；\n"
-        "🔄【横向对比】对比三年历史区间、警戒红线或另一条曲线的剪刀差，说明当前处于什么水位；\n"
-        "🧭【方向推演】给出2条清晰的实战情景分支判断（若指标突破/回落至某位置，对股市、债市、黄金或汇率有何具体影响）；\n"
-        "🔗【交叉验证】明确指出需要结合本看板的哪几张图（写明图号和指标名）一起看，才能彻底看清全貌。\n\n"
-        "【强制校验铁律】：\n"
-        "- 16 个键 `c1`..`c16` 必须全部输出且不能为空；\n"
-        "- 每一张图必须严格对齐 `plotted_charts_ground_truth` 中对应键的左右轴实测数据，严禁张冠李戴；\n"
-        "- 全文 100% 使用规范简体中文，严禁夹杂任何英文缩写或英文单词；\n"
-        "- 预警与趋势醒目使用 `🔴`、`🟡`、`🟢`、`🔺`、`🔻`、`⚠️` 图标。\n\n"
-        f"今日全量宏观数据与16张图实测基准：\n{json.dumps(llm_ctx, ensure_ascii=False)}"
+        "你是严格遵循《宏观经济｜六层第一性原理实战通关总纲》的首席宏观策略师。\n"
+        "用户的核心诉求是：**给出多个角度的清晰结论，环环相扣、通俗易懂、具备实战资产配置指导性**。\n"
+        "请基于传入的六层全量数据、36维风险雷达、精选财经新闻以及【8张核心图的实测绘图数据】，"
+        "输出一个合法的 JSON 对象（不要输出 Markdown 代码块标记以外的多余文字），包含以下三个字段：\n"
+        "1. `perspectives`（数组，必须包含 6 个对象，对应 6 个独立观察视角，每个对象含 `angle`、`stance`、`conclusion`、`action` 四个字段）：\n"
+        "   - 第1个：`angle`=\"① 宏观周期与四象限视角\"（结合增长与通胀坐标给出机制定调）\n"
+        "   - 第2个：`angle`=\"② 美元流动性与央行水管视角\"（结合净流动性、逆回购、美债曲线形态给出结论）\n"
+        "   - 第3个：`angle`=\"③ 实体信用与财政付息生死线视角\"（结合信贷增速、垃圾债利差、利息占财政收入比给出结论）\n"
+        "   - 第4个：`angle`=\"④ 跨境利差、汇率与跨资产背离视角\"（结合中美利差、日元套息、实际利率与黄金背离给出结论）\n"
+        "   - 第5个：`angle`=\"⑤ 36维系统性风险排雷视角\"（点明当前触发红/黄灯的最高危黑天鹅或灰犀牛及其传染链）\n"
+        "   - 第6个：`angle`=\"⑥ 大类资产配置与交易证伪视角\"（给出美股、中港股、美债、黄金、商品的多空优先级及未来10日证伪红线）\n"
+        "   *要求*：每个对象的 `stance` 为带图标的简短定调（如 `🟡 紧缩拉锯`、`🔴 高度警戒`、`🟢 顺周期占优`）；`conclusion` 为 45~75 字核心数据结论；`action` 为 35~55 字实战应对动作。\n"
+        "2. `master_report`（字符串，900~1200字）：将上述 6 个视角串联成一篇逻辑严密的《六层第一性原理全景推演综述》与三情景概率分布。\n"
+        "3. `chart_notes`（对象，必须完整包含 `c1` 到 `c8` 共 8 个字符串，每个 180~240 字）：分别为驾驶舱的 8 张核心金字塔图表撰写深度读图解说，每张严格包含 4 行：\n"
+        "   📌【看图结论】用大白话报出左轴和右轴最新实测数值及近3月方向，揭示底层真相；\n"
+        "   🔄【横向对比】对比三年历史区间、警戒红线或剪刀差水位；\n"
+        "   🧭【方向推演】给出2条清晰的实战情景分支判断（突破/回落对股债金汇的具体影响）；\n"
+        "   🔗【交叉验证】明确指出需结合本看板的哪几张图（写明图号和指标名）联动验证。\n\n"
+        "【强制铁律】：全文 100% 使用规范简体中文；`c1`..`c8` 必须严格对齐 `plotted_charts_ground_truth` 的左右轴实测数据。\n\n"
+        f"今日全量宏观数据与8张图实测基准：\n{json.dumps(llm_ctx, ensure_ascii=False)}"
     )
 
+    final_perspectives = list(fallback_perspectives)
     final_report = fallback_report
     raw_notes = dict(fallback_chart_notes)
+    engine_tag = "本地定量规则引擎"
 
-    if OPENAI_API_KEY:
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-        effort_candidates = [OPENAI_REASONING_EFFORT]
-        if OPENAI_REASONING_EFFORT.lower() == "max" and "high" not in effort_candidates:
-            effort_candidates.append("high")
+    raw_txt, used_engine = call_llm_with_fallback(prompt, max_tokens=14000, reasoning_effort=OPENAI_REASONING_EFFORT)
+    if raw_txt:
+        try:
+            jm = re.search(r"\{.*\}", raw_txt, re.DOTALL)
+            if jm:
+                parsed = json.loads(jm.group(0))
+                engine_tag = used_engine
 
-        for effort in effort_candidates:
-            try:
-                chat_url = f"{OPENAI_BASE_URL}/chat/completions"
-                body_chat = {
-                    "model": OPENAI_MODEL,
-                    "reasoning_effort": effort,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 16000,
-                }
-                resp = HTTP.post(chat_url, headers=headers, json=body_chat, timeout=(15, 240))
-                if resp.status_code == 200:
-                    raw_txt = resp.json()["choices"][0]["message"]["content"].strip()
-                    jm = re.search(r"\{.*\}", raw_txt, re.DOTALL)
-                    if jm:
-                        parsed = json.loads(jm.group(0))
-                        m_rep = str(parsed.get("master_report", "")).strip()
-                        c_notes = parsed.get("chart_notes", {})
-                        if m_rep and len(m_rep) > 200:
-                            header_banner = f"【首席宏观策略师智能全因子总研判 | 模型：GPT-6.2 深度思考（{effort}） | 更新：{NOW_STR}】\n\n"
-                            final_report = header_banner + m_rep
-                        if isinstance(c_notes, dict):
-                            for k, v in c_notes.items():
-                                v_clean = str(v).strip()
-                                # 只有长度 >= 50 的有效解说才覆盖兜底解说，防止空白或被截断
-                                if k in raw_notes and len(v_clean) >= 50:
-                                    raw_notes[k] = v_clean
-                        break
-                elif resp.status_code == 400 and effort == "max":
-                    continue
-            except Exception as e:
-                print(f"[INFO] AI 全因子与读图解说尝试 ({effort}): {e}")
+                p_list = parsed.get("perspectives", [])
+                if isinstance(p_list, list) and len(p_list) == 6:
+                    cleaned_p = []
+                    for idx_p, item in enumerate(p_list):
+                        fb_item = fallback_perspectives[idx_p]
+                        cleaned_p.append([
+                            str(item.get("angle") or fb_item[0]).strip(),
+                            str(item.get("stance") or fb_item[1]).strip(),
+                            str(item.get("conclusion") or fb_item[2]).strip(),
+                            str(item.get("action") or fb_item[3]).strip(),
+                        ])
+                    final_perspectives = cleaned_p
 
-    # 逐图封装显式编号标签 + 实测核验印章（绝不进行会误删正文的全局正则替换）
+                m_rep = str(parsed.get("master_report", "")).strip()
+                if m_rep and len(m_rep) > 200:
+                    final_report = f"【首席宏观策略师·全景推演综述 | 引擎：{engine_tag} | 更新：{NOW_STR}】\n\n{m_rep}"
+
+                c_notes = parsed.get("chart_notes", {})
+                if isinstance(c_notes, dict):
+                    for k, v in c_notes.items():
+                        v_clean = str(v).strip()
+                        if k in raw_notes and len(v_clean) >= 60:
+                            raw_notes[k] = v_clean
+        except Exception as e:
+            print(f"[INFO] AI JSON 解析回退至定量规则引擎: {e}")
+
     verified_notes = {}
-    for spec in CHART_SPECS_MASTER:
+    for spec in CHART_SPECS_CORE:
         ckey = spec["key"]
         short_badge = spec["title"].split("（")[0]
         body_txt = raw_notes.get(ckey, "").strip()
-        if len(body_txt) < 40:
+        if len(body_txt) < 50:
             body_txt = fallback_chart_notes.get(ckey, "")
         stamp = plotted_facts.get(ckey, {}).get("verify_stamp", "")
         verified_notes[ckey] = f"🤖【{short_badge}·AI四维读图解说】\n{body_txt}\n{stamp}"
 
-    return final_report, verified_notes
+    return final_perspectives, final_report, verified_notes, engine_tag
 
 
 def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_vals, market_stats, news_list):
@@ -1301,7 +1287,7 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
 
     sahm = get("SAHMREALTIME") or 0.0
 
-    # A. 日历精确对齐的美元净流动性计算
+    # A. 美元净流动性计算
     r0 = get_val_by_days_ago(s_dmaps, "RRPONTSYD", 0)
 
     def calc_net_liq_at(days_ago):
@@ -1320,7 +1306,7 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
     net_liq_4w_chg = round(net_liq - net_liq_4w, 2) if (net_liq is not None and net_liq_4w is not None) else 0.0
     net_liq_13w_chg = round(net_liq - net_liq_13w, 2) if (net_liq is not None and net_liq_13w is not None) else 0.0
 
-    # B. 六层核心经济硬数据与衍生公式直观快照
+    # B. 六层核心经济硬数据快照
     totll_val = get("TOTLL")
     us_credit_yoy = calc_yoy("TOTLL", lag=52)
     if us_credit_yoy is not None:
@@ -1359,7 +1345,6 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
         sig = "🔴 高实际利率压制估值" if tips_0 >= 2.25 else ("🟡 实际利率偏高" if tips_0 >= 1.80 else "🟢 实际资金成本温和")
         macro_snapshot_rows.append(["美国", "L2·真实成本", "10年期TIPS实际利率与通胀预期", f"实际 {tips_0:.2f}%", f"盈亏平衡通胀 {t10yie:.2f}%" if t10yie else "-", s_dates.get("DFII10", "-"), sig])
 
-    # 严格按日期排序计算单月新增非农就业（第4点彻底修复）
     nfp_add_10k, nfp_diff_k, prev_nfp_add_10k = None, None, None
     payems_dmap = s_dmaps.get("PAYEMS", {})
     if len(payems_dmap) >= 2:
@@ -1424,19 +1409,19 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
 
     if curr_growth_x >= 0 and curr_infl_y < 0:
         quadrant = "🟢 第一象限（右下）：温和复苏与金发姑娘周期（增长稳健 + 通胀回落）"
-        quad_short = "第一象限·温和复苏"
+        quad_short = "🟢 第一象限·温和复苏"
         regime_logic = "当前处于【增长主导机制】，市场重点交易分子端企业盈利修复，占优资产为成长与周期股票及企业债券。"
     elif curr_growth_x >= 0 and curr_infl_y >= 0:
         quadrant = "🟡 第二象限（右上）：经济过热与紧缩周期（增长具备韧性 + 通胀黏性）"
-        quad_short = "第二象限·过热紧缩"
+        quad_short = "🟡 第二象限·过热紧缩"
         regime_logic = "当前切换至【利率与通胀主导机制】，超预期经济数据易强化央行紧缩预期并抬高分母端贴现率，占优资产为大宗商品与价值股，规避长久期国债。"
     elif curr_growth_x < 0 and curr_infl_y >= 0:
         quadrant = "🔴 第三象限（左上）：滞胀困境周期（经济增长放缓 + 通胀高企）"
-        quad_short = "第三象限·滞胀困境"
+        quad_short = "🔴 第三象限·滞胀困境"
         regime_logic = "警惕【薪资-物价螺旋与政策两难】，央行陷入保增长与抗通胀矛盾，占优资产为现金、短债与实物黄金，严格规避高估值科技股与长债。"
     else:
         quadrant = "🟡 第四象限（左下）：衰退防御周期（经济增长走弱 + 通胀回落）"
-        quad_short = "第四象限·衰退防御"
+        quad_short = "🟡 第四象限·衰退防御"
         regime_logic = "总需求收缩主导市场定价，央行进入被动降息通道，占优资产为长久期国债，警惕信用利差走阔引发的信用紧缩。"
 
     curve_regime = "曲线温和震荡"
@@ -1472,11 +1457,11 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
     if spx_5d <= -3.0:
         divergence_flags.append("⚠️ 高频风险抢跑：股指急跌抢跑低频月度硬数据，谨防拿上月滞后数据误判")
 
-    # D. 36维系统性风险雷达
+    # D. 36维系统性风险雷达（修复黑天鹅-04联合触发条件）
     red_alerts, yellow_alerts = [], []
 
     def add_risk(code, r_type, dim, metric, curr_val, warn_lbl, red_lbl, ratio_raw, mech):
-        ratio_pct = round(max(0.0, min(1.5, ratio_raw)), 3)
+        ratio_pct = round(max(0.0, ratio_raw), 3)
         if ratio_raw >= 1.0:
             st = "🔴 红灯熔断"
             red_alerts.append(f"🔴【{code}·{r_type}】{dim}（当前值：{curr_val}）")
@@ -1500,13 +1485,15 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
     if fsi is not None:
         add_risk("黑天鹅-03", "急性黑天鹅", "综合金融系统压力", "圣路易斯联储金融压力指数", round(fsi, 2), "0.50", "2.00", calc_risk_ratio(fsi, -0.50, 0.50, 2.00), "跨市场流动性、利差与波动率系统性共振恶化")
 
+    # 必须“股跌 + 金跌 + 美债收益率跳升”三者共振才计入三杀挤兑压力
     if y10 is not None and y10_5 is not None:
         y10_5d_bps = round((y10 - y10_5) * 100, 1)
         summary_str = f"标普:{spx_5d:+.1f}% | 黄金:{gold_5d:+.1f}% | 美债:{y10_5d_bps:+.0f}基点"
-        stress_score = max(0.0, (-spx_5d / 4.0) * 0.5 + (-gold_5d / 2.0) * 0.5)
-        if spx_5d <= -4.0 and gold_5d <= -2.0 and y10_5d_bps >= 20 and dxy_5d >= 1.5:
-            stress_score = 1.15
-        add_risk("黑天鹅-04", "急性黑天鹅", "现金为王三杀挤兑", "5日股金债联动状态", summary_str, "股金同跌", "股金暴跌且债率飙升", stress_score, "保证金追缴下机构无差别抛售黄金美债换取美元现金")
+        if spx_5d < -1.5 and gold_5d < -1.0 and y10_5d_bps > 8.0:
+            stress_score = round(min(2.0, (-spx_5d / 4.0) * 0.4 + (-gold_5d / 2.5) * 0.3 + (y10_5d_bps / 25.0) * 0.3), 2)
+        else:
+            stress_score = 0.15 if (spx_5d < -2.0 and gold_5d < -1.5) else 0.0
+        add_risk("黑天鹅-04", "急性黑天鹅", "现金为王三杀挤兑", "5日股金债联动状态", summary_str, "股金债同步恶化", "股金暴跌且债率飙升", stress_score, "保证金追缴下机构无差别抛售黄金美债换取美元现金")
 
     jpy_5d = market_stats.get("USDJPY", {}).get("pct_5d")
     if jpy_5d is not None:
@@ -1649,166 +1636,144 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
     if spx_pe_val is not None:
         add_risk("灰犀牛-18", "慢性灰犀牛", "美股估值泡沫与负风险溢价", "标普500市盈率（倍）", spx_pe_val, "24.0 倍", "28.0 倍", calc_risk_ratio(spx_pe_val, 18.0, 24.0, 28.0), "美股盈利收益率低于10年期美债无风险利率，估值安全边际极度脆弱")
 
-    # E. 多国横向对比表
+    # E. 多国横向对比表 & 资金流向表
     bond_10y_map = {
         "USA": get("DGS10"), "CHN": get("CN_DGS10"),
         "JPN": get("IRLTLT01JPM156N"), "DEU": get("IRLTLT01DEM156N")
     }
     country_rows = []
     for iso3 in COUNTRIES_LIST:
-        gdp = imf_metrics.get((iso3, "NGDP_RPCH"), "暂无")
-        cpi = imf_metrics.get((iso3, "PCPIPCH"), "暂无")
-        ca = imf_metrics.get((iso3, "BCA_NGDPD"), "暂无")
-        fiscal = imf_metrics.get((iso3, "GGXCNL_NGDP"), "暂无")
-        b10 = bond_10y_map.get(iso3, "暂无")
-        debt_ratio = em_ratios.get(iso3, "暂无")
-        country_rows.append([country_zh_map.get(iso3, iso3), gdp, cpi, b10, ca, fiscal, debt_ratio])
+        country_rows.append([
+            country_zh_map.get(iso3, iso3),
+            imf_metrics.get((iso3, "NGDP_RPCH"), "暂无"),
+            imf_metrics.get((iso3, "PCPIPCH"), "暂无"),
+            bond_10y_map.get(iso3, "暂无"),
+            imf_metrics.get((iso3, "BCA_NGDPD"), "暂无"),
+            imf_metrics.get((iso3, "GGXCNL_NGDP"), "暂无"),
+            em_ratios.get(iso3, "暂无"),
+        ])
 
-    # F. 全球大类资产资金流向对比表
     flow_rows = [["全球大类资产", "20日资金净流向动量（%）", "5日边际资金流向（%）"]]
     for code, st in market_stats.items():
         if st.get("flow_chart"):
             flow_rows.append([st["short_name"], st["pct_20d"], st["pct_5d"]])
 
-    # G. 16张图表四维关联式兜底深度解说（确保无论任何情况都 100% 饱满、通俗、有联动）
+    # F. 构建【六大维度多视角战略结论】兜底矩阵
     tips10 = tips_0 or 0.0
-    spx_p = market_stats.get("SPX", {}).get("price")
     au_p = market_stats.get("GOLD", {}).get("price")
-    br_p = market_stats.get("BRENT", {}).get("price")
     dxy_p = market_stats.get("DXY", {}).get("price")
     jpy_p = market_stats.get("USDJPY", {}).get("price")
-    btc_p = market_stats.get("BTC", {}).get("price")
-    ndx_p = market_stats.get("NDX", {}).get("price")
-    cg_ratio = round((copper_stat.get("price", 0) * 1000) / au_p, 3) if isinstance(au_p, (int, float)) and au_p > 0 else None
     bus_bal = get("BUSLOANS")
-    res_bal = round(get("WRESBAL") / 1000.0, 1) if get("WRESBAL") is not None else None
-
     sorted_risks = sorted(risk_rows, key=lambda x: x[8], reverse=True)
     top1_r = sorted_risks[0] if sorted_risks else ["-", "-", "-", "-", "-", "-", "🟢 绿灯正常", "", 0]
+    top2_r = sorted_risks[1] if len(sorted_risks) > 1 else top1_r
 
+    if red_alerts:
+        probs = "🔴 基准情景（局部风险持续释放）：45% ｜ 🟢 乐观情景（央行紧急转向护盘）：15% ｜ 🟡 悲观情景（跨市场流动性传染）：40%"
+    elif yellow_alerts:
+        probs = "🟡 基准情景（高位震荡与结构轮动）：55% ｜ 🟢 乐观情景（经济软着陆延续）：20% ｜ 🔴 悲观情景（紧缩压制估值）：25%"
+    else:
+        probs = "🟢 基准情景（经济软着陆与结构轮动）：60% ｜ 🟢 乐观情景（全球宽信用共振）：25% ｜ 🟡 悲观情景（二次通胀冲击）：15%"
+
+    fallback_perspectives = [
+        [
+            "① 宏观周期与四象限视角",
+            quad_short,
+            f"增长X轴得分 {curr_growth_x:+}，通胀Y轴得分 {curr_infl_y:+}，新增非农 {fmt_num(nfp_add_10k, '{:+.2f}', '万人')}，CPI {fmt_num(us_cpi_yoy, '{:.2f}', '%')}。{regime_logic}",
+            "顺周期/商品与高估值长债强弱分化，紧盯下月核心PCE与非农是否推动红点跨象限漂移。"
+        ],
+        [
+            "② 美元流动性与央行水管视角",
+            "🟡 缓冲垫见底拉锯" if (r0 is not None and r0 < 150) else "🟢 流动性总量充裕",
+            f"美元净流动性 {fmt_num(net_liq, '{:,.1f}', '十亿美元')}（4周 {net_liq_4w_chg:+.1f}B），隔夜逆回购仅剩 {fmt_num(r0, '{:,.1f}', '十亿美元')}；10Y-2Y利差 {fmt_num(spread_10_2, '{:+.2f}', '%')}（{curve_regime.split('（')[0]}）。",
+            "逆回购免费缓冲垫已大幅消耗，若财政部TGA发债吸金而美联储未停缩表，纳指与比特币将承压。"
+        ],
+        [
+            "③ 实体信用与财政付息生死线视角",
+            "🔴 财政付息超20%红线" if (interest_rev_ratio and interest_rev_ratio >= 20.0) else "🟡 信用稳健但财政承压",
+            f"美国商业银行总信贷同比 {fmt_num(us_credit_yoy, '{:+.2f}', '%')}，垃圾债利差 {fmt_num(hy, '{:.2f}', '%')}（企业信用正常）；但联邦利息占财政收入比达 {fmt_num(interest_rev_ratio, '{:.2f}', '%')}，主权信用长期折价。",
+            "企业短端信用违约风险低，但主权财政赤字货币化趋势决定长线必须底仓配置黄金等实物抗通胀资产。"
+        ],
+        [
+            "④ 跨境利差、汇率与背离视角",
+            "⚠️ 关注跨资产背离" if divergence_flags else "🟢 跨境汇率稳态运行",
+            f"中美10Y利差倒挂 {fmt_num(us_cn_sp, '{:.2f}', '%')}，美元指数 {fmt_num(dxy_p, '{:.2f}')}，美元兑日元 {fmt_num(jpy_p, '{:.2f}')}。{'；'.join(divergence_flags[:1]) if divergence_flags else '实际利率（' + fmt_num(tips10, '{:.2f}', '%') + '）与资产价格暂未出现极端背离。'}",
+            "盯紧美元兑日元单周跌幅是否超2.5%（套息拆仓信号），以及美债收益率回落带来的非美资产喘息窗口。"
+        ],
+        [
+            "⑤ 36维系统性风险排雷视角",
+            f"🔴 {len(red_alerts)}红 / 🟡 {len(yellow_alerts)}黄" if (red_alerts or yellow_alerts) else "🟢 36维全绿灯安全",
+            f"当前风险榜首为【{top1_r[1]}】（读数 {top1_r[3]}，进度 {round(top1_r[8]*100,1)}%），其次为【{top2_r[1]}】（读数 {top2_r[3]}，进度 {round(top2_r[8]*100,1)}%）。",
+            "重点防范高压实际利率对高估值权益的慢性窒息，若VIX突破24或垃圾债利差破350bp则立即降杠杆。"
+        ],
+        [
+            "⑥ 大类资产配置与证伪视角",
+            "🧭 哑铃型防御+核心配置",
+            f"标普500股权风险溢价(ERP)为 {fmt_num(erp_val, '{:+.2f}', '%')}（PE {fmt_num(spx_pe_val, '{:.1f}', '倍')}），权益相对债券风险补偿偏窄；黄金（{fmt_num(au_p, '{:,.0f}', '美元')}）与短端美债具备高夏普防御价值。",
+            f"组合采取“短债/现金 + 黄金/能源 + 低估值现金流股”哑铃配置；证伪红线：实际利率破 {'1.80%' if tips10 > 2.0 else '2.25%'} 或 VIX 破 30。"
+        ],
+    ]
+
+    # G. 8张核心金字塔图表四维关联式解说兜底
     fallback_chart_notes = {
         "c1": (
             f"📌【看图结论】左轴柱子显示美国商业银行总信贷规模为 {fmt_num(totll_val, '{:,.0f}', '十亿美元')}（同比 {fmt_num(us_credit_yoy, '{:+.2f}', '%')}），右轴红线高收益垃圾债信用利差为 {fmt_num(hy, '{:.2f}', '%')}，说明企业信用渠道仍在平稳运转，市场尚未定价违约恐慌。\n"
-            f"🔄【横向对比】对比 3.50% 的黄灯警戒线和 5.00% 的红灯熔断线，当前垃圾债利差处于低位安全区，说明企业发债借钱的额外风险补偿很便宜。\n"
-            f"🧭【方向推演】① 若右轴红线突然向上突破 3.50%，意味着中小企业借新还旧受阻，应果断减持高杠杆股票；② 若左轴信贷柱子持续走高且红线压在 3.50% 下方，则利好美股盈利扩张。\n"
-            f"🔗【交叉验证】本图看的是“信贷总量与风险定价”，需结合【图2 货币活化剪刀差】看钱有没有真正花出去，并结合【图3 工商业贷款】看企业是否真在扩产。"
+            f"🔄【横向对比】对比 3.50% 的黄灯警戒线和 5.00% 的红灯熔断线，当前垃圾债利差处于低位安全区，企业发债借钱的额外风险补偿很便宜。\n"
+            f"🧭【方向推演】① 若右轴红线向上突破 3.50%，意味着中小企业借新还旧受阻，应果断减持高杠杆股票；② 若左轴信贷柱子持续走高且红线压在 3.50% 下方，则利好美股盈利扩张。\n"
+            f"🔗【交叉验证】本图看“信用总量与违约定价”，需结合【图2 美元净流动性与M1-M2剪刀差】看钱有没有真正流入实体经济。"
         ),
         "c2": (
-            f"📌【看图结论】左轴柱子美国广义货币M2同比增速为 {fmt_num(us_m2_yoy, '{:+.2f}', '%')}，右轴红线M1减M2活化剪刀差为 {fmt_num(us_scissors, '{:+.2f}', '%')}，反映当前货币供应已从收缩恢复温和增长，但部分资金仍沉淀在定期或货币基金里吃利息。\n"
-            f"🔄【横向对比】对比中国M1-M2剪刀差（{fmt_num(cn_scissors, '{:+.2f}', '%')}），中美均处于“降息初期货币活化待验证”的过渡阶段，剪刀差向上收敛越快代表资金越活跃。\n"
-            f"🧭【方向推演】① 若右轴剪刀差持续向上收窄甚至转正，说明企业和居民把定期存款转成活期去消费投资，顺周期股与大宗商品将迎来主升浪；② 若M2涨但剪刀差继续深跌，说明资金在金融系统空转。\n"
-            f"🔗【交叉验证】需结合【图4 美元净流动性】看央行基础水龙头，再结合【图9 耐用品新订单】验证活期资金是否转化成了实体订单。"
+            f"📌【看图结论】左轴美元净流动性总阀门为 {fmt_num(net_liq, '{:,.1f}', '十亿美元')}（近4周变动 {net_liq_4w_chg:+.1f}B），右轴美国M1-M2货币活化剪刀差为 {fmt_num(us_scissors, '{:+.2f}', '%')}，反映基础流动性微幅平衡，定期存款向活期转化正处于温和修复通道。\n"
+            f"🔄【横向对比】隔夜逆回购蓄水池已降至 {fmt_num(r0, '{:,.1f}', '十亿美元')} 低位，过去两年替美股吸收发债冲击的“免费缓冲垫”所剩无几。\n"
+            f"🧭【方向推演】① 若财政部发债吸金导致左轴净流动性单周跌超 100B，纳指与比特币将面临分母端抽血；② 若右轴剪刀差持续向上转正，顺周期股与商品将迎来主升浪。\n"
+            f"🔗【交叉验证】流动性是全球资产定价的总开关，必须结合【图3 10Y名义与实际利率】和【图7 全球资产资金流向】同步验证。"
         ),
         "c3": (
-            f"📌【看图结论】左轴美国工商业贷款余额为 {fmt_num(bus_bal, '{:,.1f}', '十亿美元')}，右轴商业银行准备金余额为 {fmt_num(res_bal, '{:,.1f}', '十亿美元')}，说明银行账上准备金依然充裕，但企业主动加杠杆贷款的节奏偏温和。\n"
-            f"🔄【横向对比】对比美联储银行收紧贷款标准比例（当前 {fmt_num(sloos_0, '{:.1f}', '%')}），银行放贷门槛尚未完全放松，导致“银行有水但企业借贷偏谨慎”。\n"
-            f"🧭【方向推演】① 若左轴工商业贷款曲线明显抬头向上，确认宽信用周期开启，金融股与工业制造股将显著受益；② 若右轴银行准备金跌破 3000 十亿美元大关，则预示银行间流动性趋紧。\n"
-            f"🔗【交叉验证】本图看商业银行信用派生，必须结合【图4 美元净流动性三蓄水池】观察准备金是否正被财政部发债抽走。"
+            f"📌【看图结论】左轴10年期美债名义利率为 {fmt_num(y10, '{:.2f}', '%')}、10年期TIPS实际利率为 {fmt_num(tips10, '{:.2f}', '%')}，右轴10Y-2Y期限利差为 {fmt_num(spread_10_2, '{:+.2f}', '%')}（{curve_regime.split('（')[0]}），表明扣除通胀后的真实资金成本仍处高位。\n"
+            f"🔄【横向对比】2.0% 是实际利率的估值分水岭，高于 2.0% 会持续压制远期现金流科技股；而期限利差修复正斜率标志着货币周期从紧缩向宽松过渡。\n"
+            f"🧭【方向推演】① 若左轴实际利率见顶回落破 2.0%，纳斯达克与黄金将迎来双双走强窗口；② 若实际利率继续冲高破 2.35%，高市盈率成长股将面临剧烈杀估值。\n"
+            f"🔗【交叉验证】需结合【图7 全球资产资金流向】观察黄金是否无视高实际利率逆势吸金（央行购金主导信号）。"
         ),
         "c4": (
-            f"📌【看图结论】左轴美元净流动性总阀门为 {fmt_num(net_liq, '{:,.1f}', '十亿美元')}（近4周变动 {net_liq_4w_chg:+.1f}B），右轴隔夜逆回购蓄水池剩余 {fmt_num(r0, '{:,.1f}', '十亿美元')}，揭示当前美元基础水龙头处于微幅平衡拉锯状态。\n"
-            f"🔄【横向对比】隔夜逆回购蓄水池已从高峰期大幅消耗至低位，意味着过去两年替美股吸收发债冲击的“免费缓冲垫”所剩无几。\n"
-            f"🧭【方向推演】① 若右轴财政部TGA账户大幅吸金而逆回购已无力对冲，左轴净流动性将直接下跌，压制纳斯达克与比特币估值；② 若美联储放缓缩表且财政部加大支出，净流动性走高将推升风险资产。\n"
-            f"🔗【交叉验证】净流动性是全球风险资产的分母总开关，必须结合【图14 标普500与VIX】和【图13 全球资产流向】验证高弹性资产反应。"
+            f"📌【看图结论】散点图采用统一的三因子增长得分（X轴当前 {curr_growth_x:+}）与双因子通胀得分（Y轴当前 {curr_infl_y:+}），红点定位本月处于【{quad_short}】，蓝点展示近12个月宏观轨迹漂移方向。\n"
+            f"🔄【横向对比】四象限分工明确：右下（增长正、通胀负）为温和复苏；右上（双正）为过热紧缩；左上（增长负、通胀正）为滞胀；左下（双负）为衰退防御。\n"
+            f"🧭【方向推演】① 若红点向右下象限漂移，放心配置成长与周期权益；② 若红点向左上滞胀区移动，必须削减股票久期并增配实物黄金与短债防御。\n"
+            f"🔗【交叉验证】四象限基于月度硬数据，需结合【图5 萨姆规则衰退指标】预判下月增长X轴会否失速下穿零轴。"
         ),
         "c5": (
-            f"📌【看图结论】左轴直接对比美债2年期（{fmt_num(y2, '{:.2f}', '%')}）与10年期（{fmt_num(y10, '{:.2f}', '%')}）收益率，右轴10Y-2Y期限利差为 {fmt_num(spread_10_2, '{:+.2f}', '%')}，当前曲线呈现【{curve_regime}】。\n"
-            f"🔄【横向对比】2年期是美联储降息预期的“诚实测谎仪”，10年期定价长期增长与财政供给；利差从深度倒挂向正值修复，标志着货币周期正从紧缩向宽松过渡。\n"
-            f"🧭【方向推演】① 若2年期快速下跌且10年期跌幅较小（牛市陡峭化），通常对应降息加速与衰退临近，利好短债与黄金；② 若10年期飙升带动利差走阔（熊市陡峭化），则说明市场担忧再通胀或美债供给过剩，利空高估值科技股。\n"
-            f"🔗【交叉验证】要分清利率波动是因为通胀还是实际资金成本，必须立刻对照【图6 10年期TIPS实际利率与通胀预期】。"
+            f"📌【看图结论】左轴柱子美国联邦利息占财政收入比已达 {fmt_num(interest_rev_ratio, '{:.2f}', '%')}（突破 20% 财政空间锁定红线），右轴红线萨姆规则衰退指标为 {fmt_num(sahm, '{:.2f}', '%')}，揭示“就业暂未触发衰退，但主权财政付息压力已逼近极限”。\n"
+            f"🔄【横向对比】萨姆规则 0.50% 是战后历史 100% 应验的衰退铁律，当前仍处安全区；但利息吞噬超五分之一税收，严重锁死财政扩张空间。\n"
+            f"🧭【方向推演】① 若左轴柱体维持 20% 上方，市场将长期计入“财政赤字货币化”与主权信用折价，长线利好黄金；② 若右轴萨姆指标逼近 0.50%，美联储将被迫大幅降息救市。\n"
+            f"🔗【交叉验证】财政付息压力会直接传导至长端美债供给，需结合【图3 10年期美债收益率】观察债市对财政赤字的定价反应。"
         ),
         "c6": (
-            f"📌【看图结论】左轴10年期TIPS实际利率为 {fmt_num(tips10, '{:.2f}', '%')}，右轴10年期盈亏平衡通胀预期为 {fmt_num(t10yie, '{:.2f}', '%')}，说明扣除通胀后的真实无风险资金成本仍处偏高位置。\n"
-            f"🔄【横向对比】历史经验表明，2.0% 是实际利率的分水岭：高于 2.0% 会持续抽血无息资产与远期现金流科技股；低于 1.8% 则打开估值扩张空间。\n"
-            f"🧭【方向推演】① 若左轴实际利率见顶回落，纳斯达克科技股与黄金将迎来双双走强的黄金窗口；② 若实际利率继续冲高突破 2.35% 警戒线，高市盈率资产将面临剧烈杀估值。\n"
-            f"🔗【交叉验证】需结合【图15 铜金比与黄金】观察：如果实际利率没跌但黄金却在暴涨，说明各国央行购金已接管黄金定价权。"
+            f"📌【看图结论】左轴中美10年期国债利差倒挂深度为 {fmt_num(us_cn_sp, '{:.2f}', '%')}，右轴全球套息交易总阀门美元兑日元汇率报 {fmt_num(jpy_p, '{:.2f}')}，表明中美利差倒挂仍阶段性掣肘跨境资金，同时全球低息日元套息盘规模庞大。\n"
+            f"🔄【横向对比】美元兑日元是高杠杆资金的“情绪总阀门”：日元平稳则套息资金继续做多风险资产；一旦日元单周急升超 2.5%，就会引爆全球去杠杆踩踏。\n"
+            f"🧭【方向推演】① 若右轴美元兑日元单周急跌超 2.5%，需立即警惕美股科技与半导体板块的流动性抛压；② 若美债下行带动左轴中美利差收窄，港股与A股核心资产将迎来外资回流。\n"
+            f"🔗【交叉验证】跨境汇率波动必须结合【图7 沪深300与恒生指数资金流向】同步验证外资真实买卖方向。"
         ),
         "c7": (
-            f"📌【看图结论】散点图根据经济增长得分（X轴当前 {curr_growth_x:+}）与通胀压力得分（Y轴当前 {curr_infl_y:+}）定位，红点标出本月处于【{quad_short}】，蓝点展示近12个月宏观轨迹漂移方向。\n"
-            f"🔄【横向对比】四象限分工明确：右下（增长正、通胀负）是股债双牛的“温和复苏”；右上（双正）是商品占优的“过热”；左上（增长负、通胀正）是央行最怕的“滞胀”；左下（双负）是长债占优的“衰退”。\n"
-            f"🧭【方向推演】① 若红点继续向右下象限移动，放心配置成长与周期权益资产；② 若红点向左上角滞胀区漂移，必须削减股票久期并增配实物黄金与短债防御。\n"
-            f"🔗【交叉验证】四象限定位依赖月度硬数据，必须结合【图8 新增非农与萨姆规则】与【图9 耐用品新订单】预判下个月红点往哪边移动。"
+            f"📌【看图结论】横向条形图将全球 16 大核心资产放在同一标尺下对比 20日（深色条）与 5日（浅色条）资金净流向动量，零轴右侧代表资金净流入扩张，零轴左侧代表资金净流出承压。\n"
+            f"🔄【横向对比】通过长短双条对比可一眼识别资金轮动：若 20日条在右但 5日条缩回左侧，说明高位获利盘正在兑现；若双条同时向右伸长，则是主升浪资金共振。\n"
+            f"🧭【方向推演】① 当黄金、长债条形向右伸长而半导体、股指向左收缩时，大资金正在切向防御避险；② 当半导体、标普、精炼铜同步向右扩张时，确认风险偏好全面进攻。\n"
+            f"🔗【交叉验证】资金流向是市场投票结果，原因需对照【图2 美元净流动性】和【图3 实际利率】验证基本面支撑。"
         ),
         "c8": (
-            f"📌【看图结论】右轴柱子显示美国单月新增非农就业为 {fmt_num(nfp_add_10k, '{:+.2f}', '万人')}（前值 {fmt_num(prev_nfp_add_10k, '{:+.2f}', '万人')}），左轴红线萨姆规则衰退指标为 {fmt_num(sahm, '{:.2f}', '%')}，表明美国劳动力市场正处于温和降温但尚未触发衰退的临界通道。\n"
-            f"🔄【横向对比】萨姆规则 0.50% 是战后历史 100% 应验的衰退铁律，当前距离 0.50% 红线仍有缓冲空间，而单月新增就业 10~18 万人恰好处于“不冷不热”的软着陆区间。\n"
-            f"🧭【方向推演】① 若单月非农跌破 8 万人且左轴红线逼近 0.50%，市场将交易“衰退降息”，长债大涨、美股承压；② 若非农反弹超 22 万人，市场会削减降息预期，推升美债收益率与美元。\n"
-            f"🔗【交叉验证】就业数据好坏对美股是利好还是利空，取决于当前市场在交易通胀还是衰退，需结合【图7 四象限】与【图5 美债利率】联动判断。"
-        ),
-        "c9": (
-            f"📌【看图结论】左轴耐用品新订单同比增速为 {fmt_num(dg_yoy, '{:+.2f}', '%')}，右轴商业库存销售比为 {fmt_num(isratio_0, '{:.2f}', '倍')}，反映美国制造业正处于库存去化尾声与新订单温和回暖的拉锯期。\n"
-            f"🔄【横向对比】库存周期的核心秘密在于“新订单向上 + 库销比低位”：只要客户库存见底且新订单持续增长，企业就不得不开足马力补库存。\n"
-            f"🧭【方向推演】① 若左轴新订单同比稳步上行且右轴库销比回落至 1.35 以下，标志着主动补库周期启动，利好工业股、半导体与精炼铜；② 若新订单转负而库销比被动冲高，则预警需求萎缩。\n"
-            f"🔗【交叉验证】工业补库动能必须结合【图15 铜金比】交叉验证，铜价走势是全球制造业补库最灵敏的现货温度计。"
-        ),
-        "c10": (
-            f"📌【看图结论】左轴柱子美国联邦利息支出占财政收入比已达 {fmt_num(interest_rev_ratio, '{:.2f}', '%')}，右轴红线主权债务雪球差值（r-g）为 {fmt_num(r_minus_g, '{:+.2f}', '%')}，揭示美国财政付息压力正处于历史罕见高位。\n"
-            f"🔄【横向对比】20% 是主权财政空间的生死警戒线，一旦利息吞噬超过五分之一税收，常规财政政策将被严重锁死；同时 r > g 意味着债务利息增速跑赢经济增速。\n"
-            f"🧭【方向推演】① 若柱体继续突破 20% 且 r-g 扩大，市场将长期计入“财政赤字货币化”与主权信用折价，长线利好黄金与抗通胀实物资产；② 唯有美联储大幅降息压低利率 r，才能缓解债务雪球。\n"
-            f"🔗【交叉验证】财政供给压力会直接反映在国债定价上，需结合【图5 10年期美债收益率】与【图15 黄金】观察主权信用溢价。"
-        ),
-        "c11": (
-            f"📌【看图结论】左轴对比美国10年期国债（{fmt_num(y10, '{:.2f}', '%')}）与中国10年期国债（{fmt_num(cn10, '{:.2f}', '%')}）收益率，右轴中美10Y利差为 {fmt_num(us_cn_sp, '{:.2f}', '%')}，显示中美长端利差仍处于深度倒挂区间。\n"
-            f"🔄【横向对比】短期跨境资金高度敏感于“风险调整后利差”，当美债收益率显著高于中债时，外贸企业结汇意愿与境外债券资金流向均会受到阶段性掣肘。\n"
-            f"🧭【方向推演】① 若美债收益率下行带动右轴利差收窄，人民币汇率贬值压力将显著释放，港股与A股核心资产将迎来外资回流窗口；② 若利差进一步走阔超 2.8%，需警惕汇率波动加大。\n"
-            f"🔗【交叉验证】中美利差必须结合【图12 美元指数DXY】与【图13 沪深300/恒生指数资金流向】同步验证跨境资金真实动作。"
-        ),
-        "c12": (
-            f"📌【看图结论】左轴美元指数报 {fmt_num(dxy_p, '{:.2f}')}，右轴全球套息交易总阀门美元兑日元汇率报 {fmt_num(jpy_p, '{:.2f}')}，表明美元维持相对强势格局，全球低息日元套息交易规模依然庞大。\n"
-            f"🔄【横向对比】美元兑日元是全球高杠杆资金的“总阀门”：只要日元维持弱势或温和波动，全球套息资金就继续加杠杆买入美股科技股；一旦日元急速升值，就会引爆全局平仓踩踏。\n"
-            f"🧭【方向推演】① 若右轴美元兑日元在单周内急跌超 2.5%（日元暴涨），需立刻警惕美股与半导体板块的去杠杆抛压；② 若美元指数回落且日元平稳，新兴市场与大宗商品将迎来喘息反弹。\n"
-            f"🔗【交叉验证】汇率波动是跨境流动性的晴雨表，需结合【图14 美股VIX恐慌指数】判断套息平仓是否已演变为全局波动率冲击。"
-        ),
-        "c13": (
-            f"📌【看图结论】横向条形图将全球 16 大核心资产放在同一标尺下对比 20日（深色条）与 5日（浅色条）资金净流向动量，零轴右侧代表资金净流入扩张，零轴左侧代表资金净流出承压。\n"
-            f"🔄【横向对比】通过长短两条杠的对比可一眼识别资金轮动：如果 20日条在右侧（中期强势）但 5日条缩回左侧，说明高位获利盘正在兑现；如果双条同时向右伸长，则是主升浪资金共振。\n"
-            f"🧭【方向推演】① 当黄金、长债条形向右伸长而科技股、半导体向左收缩时，说明大资金正在切向防御避险；② 当半导体、标普、精炼铜同步向右扩张时，确认全球风险偏好全面进攻。\n"
-            f"🔗【交叉验证】资金流向是结果，原因要结合【图4 美元净流动性】和【图6 实际利率】验证资金流向是否具备宏观基本面支撑。"
-        ),
-        "c14": (
-            f"📌【看图结论】左轴柱子标普500指数报 {fmt_num(spx_p, '{:,.1f}', '点')}，右轴红线美股VIX恐慌指数报 {fmt_num(vix, '{:.2f}')}，反映当前美股市场情绪整体平稳，期权市场对短期尾部崩盘的对冲溢价处于可控水平。\n"
-            f"🔄【横向对比】VIX 15 以下代表市场极度乐观甚至自满，24 附近为黄灯警戒区，突破 30 则对应机构恐慌性情绪出清与阶段性黄金坑。\n"
-            f"🧭【方向推演】① 若标普创新高但右轴 VIX 同步悄悄抬升（股涨波动率升），说明聪明资金正在买入看跌期权对冲，谨防回调；② 若 VIX 脉冲冲破 30 后回落，往往是分批抄底优质资产的左侧信号。\n"
-            f"🔗【交叉验证】美股估值安全边际需结合【图6 10年期实际利率】与【图1 高收益债信用利差】共同确认。"
-        ),
-        "c15": (
-            f"📌【看图结论】左轴铜金比实体周期系数报 {fmt_num(cg_ratio, '{:.3f}')}，右轴COMEX黄金价格报 {fmt_num(au_p, '{:,.1f}', '美元/盎司')}，铜金比衡量“实体经济需求 vs 金融避险情绪”的相对强弱。\n"
-            f"🔄【横向对比】正常周期下铜金比与10年期美债收益率同向波动；当金价不断创高而铜金比走弱时，说明主权债务风险与央行去美元化购金力量强于实体工业复苏。\n"
-            f"🧭【方向推演】① 若左轴铜金比止跌回升，说明全球制造业补库与电力算力基建需求接力，顺周期大宗商品占优；② 若铜金比跌破三年低位而黄金继续飙升，市场正在定价硬着陆衰退。\n"
-            f"🔗【交叉验证】黄金走势必须结合【图6 10年期TIPS实际利率】与【图10 美国财政利息吞噬率】交叉验证，看清涨价背后的主驱动力。"
-        ),
-        "c16": (
-            f"📌【看图结论】横向条形图按危急度从高到低展示距离 100% 红灯熔断线最近的 12 项系统性风险因子，竖线为 65% 黄灯警戒线，当前排在首位的是【{top1_r[1]}】（进度 {round(top1_r[8]*100, 1)}%，状态 {top1_r[6]}）。\n"
-            f"🔄【横向对比】65% 以下为绿灯安全区，65%~100% 为黄灯预警区（需收紧风险敞口），一旦任何条形冲破 100% 红灯线，就意味着局部脆弱点已演化为系统性危机扳机。\n"
-            f"🧭【方向推演】① 重点盯防排名前三的条形是否继续向右逼近 100%，尤其是“现金为王三杀挤兑”与“垃圾债信用踩踏”；② 若所有条形均回落至 65% 左侧，则可安心维持正常资产配置仓位。\n"
-            f"🔗【交叉验证】风险雷达是整个金字塔的塔尖警报器，一旦出现黄红灯，需顺藤摸瓜回到【图1~图15】查找对应的底层传导源头。"
+            f"📌【看图结论】横向条形图按危急度从高到低展示距离 100% 红灯熔断线最近的 12 项系统性风险因子，竖线为 65% 黄灯警戒线，当前榜首为【{top1_r[1]}】（进度 {round(top1_r[8]*100, 1)}%，状态 {top1_r[6]}）。\n"
+            f"🔄【横向对比】65% 以下为绿灯安全区，65%~100% 为黄灯预警区（需收紧风险敞口），冲破 100% 红灯线意味着局部脆弱点已演化为系统性危机扳机。\n"
+            f"🧭【方向推演】① 重点盯防排名前三的条形是否继续向右冲破 100%，尤其是信用利差与现金挤兑指标；② 若多数条形回落至 65% 左侧，则可安心维持正常权益仓位。\n"
+            f"🔗【交叉验证】风险雷达是金字塔塔尖警报器，一旦出现红灯，需顺藤摸瓜回到【图1~图7】查找对应的底层传导源头。"
         ),
     }
 
-    if red_alerts:
-        probs = "🔴 基准情景（风险加速释放）：45% ｜ 🟢 乐观情景（央行紧急转向救市）：15% ｜ 🟡 悲观情景（尾部危机跨市场扩散）：40%"
-    elif yellow_alerts:
-        probs = "🟡 基准情景（高位震荡消化）：55% ｜ 🟢 乐观情景（经济软着陆延续）：20% ｜ 🔴 悲观情景（流动性紧缩与波动升级）：25%"
-    else:
-        probs = "🟢 基准情景（经济软着陆与板块轮动）：60% ｜ 🟢 乐观情景（全球宽信用共振）：25% ｜ 🟡 悲观情景（二次通胀或地缘冲击）：15%"
-
     fallback_report = (
-        f"【首席宏观策略师·六层第一性原理全因子深度总研判 | 更新时间：{NOW_STR}】\n\n"
-        f"一、【宏观周期四象限定位与新闻催化主线】\n"
-        f"当前全球宏观定位于【{quadrant}】（增长坐标 {curr_growth_x:+}，通胀坐标 {curr_infl_y:+}）。{regime_logic}"
-        f"{' 跨资产监测发出背离信号：' + '；'.join(divergence_flags) + '。' if divergence_flags else ' 当前高频资产价格与低频经济硬数据整体保持同向共振。'}\n\n"
-        f"二、【第一至二层：信用引擎、货币活化与美元净流动性水管】\n"
-        f"1. 信用与货币：美国商业银行总信贷同比 {fmt_num(us_credit_yoy, '{:+.2f}', '%')}，工商业贷款余额 {fmt_num(bus_bal, '{:,.1f}', ' 十亿美元')}，银行收紧贷款标准比例 {fmt_num(sloos_0, '{:.1f}', '%')}；美国M1-M2活化剪刀差 {fmt_num(us_scissors, '{:+.2f}', '%')}，中国M1-M2剪刀差 {fmt_num(cn_scissors, '{:+.2f}', '%')}。\n"
-        f"2. 美元水管：美元净流动性总阀门水位 {fmt_num(net_liq, '{:,.1f}', ' 十亿美元')}（1周 {net_liq_chg:+}B，4周 {net_liq_4w_chg:+}B，13周 {net_liq_13w_chg:+}B），隔夜逆回购蓄水池剩余 {fmt_num(r0, '{:,.1f}', ' 十亿美元')}。美债 2年期（{fmt_num(y2, '{:.2f}', '%')}）与 10年期（{fmt_num(y10, '{:.2f}', '%')}）利差为 {fmt_num(spread_10_2, '{:+.2f}', '%')}，曲线呈现【{curve_regime}】，市场隐含未来降息预期 {fmt_num(implied_rate_cut_bps, '{:+.0f}', ' 个基点')}。\n\n"
-        f"三、【第三至四层：美欧日中硬数据、财政生死线与跨境汇率博弈】\n"
-        f"美国单月新增非农 {fmt_num(nfp_add_10k, '{:+.2f}', ' 万人')}（{fmt_num(nfp_diff_k, '{:+.0f}', ' 千人')}），失业率 {fmt_num(get('UNRATE'), '{:.1f}', '%')}，萨姆规则衰退指标 {sahm:.2f}%；总体消费物价同比 {fmt_num(us_cpi_yoy, '{:.2f}', '%')}，核心个人消费支出 3个月折年率 {fmt_num(pce_3m_ann, '{:.2f}', '%')}。联邦利息支出占财政收入比重达 {fmt_num(interest_rev_ratio, '{:.2f}', '%')}，主权债务雪球差值（r-g）为 {fmt_num(r_minus_g, '{:+.2f}', '%')}。中国官方制造业采购经理指数报 {fmt_num(cn_pmi, '{:.1f}')}，中美 10年期利差倒挂 {fmt_num(us_cn_sp, '{:.2f}', '%')}。\n\n"
-        f"四、【第五层：全球跨资产定价与股权风险溢价穿透】\n"
-        f"10年期实际利率报 {tips10:.2f}%，标普500市盈率 {fmt_num(spx_pe_val, '{:.1f}', ' 倍')}，股权风险溢价（ERP）为 {fmt_num(erp_val, '{:+.2f}', '%')}。标普500报 {fmt_num(spx_p, '{:,.1f}', ' 点')}，纳斯达克100报 {fmt_num(ndx_p, '{:,.1f}', ' 点')}，美元指数报 {fmt_num(dxy_p, '{:.2f}')}，美元兑日元报 {fmt_num(jpy_p, '{:.2f}')}，国际黄金报 {fmt_num(au_p, '{:,.1f}', ' 美元/盎司')}，布伦特原油报 {fmt_num(br_p, '{:.2f}', ' 美元/桶')}，比特币报 {fmt_num(btc_p, '{:,.0f}', ' 美元')}。\n\n"
-        f"五、【第六层：36维黑天鹅与灰犀牛高危预警排雷】\n"
-        f"{'当前触发预警因子：' + '；'.join(red_alerts + yellow_alerts) + '。需高度防范局部流动性收紧通过保证金追缴向全局传染。' if (red_alerts or yellow_alerts) else '🟢 当前 36 个急性黑天鹅与慢性灰犀牛维度全部处于绿灯常态区间，系统性熔断风险可控。'}\n\n"
-        f"六、【三情景概率分布与未来十日量化证伪红线】\n"
-        f"{probs}\n"
-        f"强制证伪条件：① 美国 10年期实际利率有效突破 {'1.80%' if tips10 > 2.0 else '2.25%'}；② 高收益垃圾债利差突破 500 基点或美股恐慌指数突破 30；③ 美元净流动性连续两周单向收缩超 150 十亿美元。"
+        f"【首席宏观策略师·六层第一性原理全景推演综述 | 更新时间：{NOW_STR}】\n\n"
+        f"1. 周期与流动性主线：当前全球宏观定位于【{quadrant}】（增长坐标 {curr_growth_x:+}，通胀坐标 {curr_infl_y:+}）。"
+        f"美元净流动性总阀门水位 {fmt_num(net_liq, '{:,.1f}', '十亿美元')}（4周变动 {net_liq_4w_chg:+}B），隔夜逆回购缓冲垫剩余 {fmt_num(r0, '{:,.1f}', '十亿美元')}。"
+        f"美债 2Y（{fmt_num(y2, '{:.2f}', '%')}）与 10Y（{fmt_num(y10, '{:.2f}', '%')}）利差 {fmt_num(spread_10_2, '{:+.2f}', '%')}，曲线呈现【{curve_regime}】，10年期TIPS实际利率报 {tips10:.2f}%。\n"
+        f"2. 实体、财政与资产定价：单月新增非农 {fmt_num(nfp_add_10k, '{:+.2f}', '万人')}，萨姆规则指标 {sahm:.2f}%，CPI同比 {fmt_num(us_cpi_yoy, '{:.2f}', '%')}。"
+        f"联邦利息支出占财政收入比达 {fmt_num(interest_rev_ratio, '{:.2f}', '%')}，债务雪球（r-g）为 {fmt_num(r_minus_g, '{:+.2f}', '%')}。标普500市盈率 {fmt_num(spx_pe_val, '{:.1f}', '倍')}，股权风险溢价（ERP）为 {fmt_num(erp_val, '{:+.2f}', '%')}。\n"
+        f"3. 三情景概率与十日证伪红线：{probs}。强制证伪条件：① 10年期实际利率有效突破 {'1.80%' if tips10 > 2.0 else '2.25%'}；② 高收益垃圾债利差破 350 基点或 VIX 破 24；③ 美元净流动性连续两周单向收缩超 120 十亿美元。"
     )
 
     llm_ctx = {
@@ -1844,14 +1809,14 @@ def analyze_all_factors(s_obs, s_dates, s_dmaps, wb_metrics, imf_metrics, extra_
             {"编号": r[0], "维度": r[1], "当前值": r[3], "状态": r[6], "危急度百分比": round(r[8] * 100, 1), "机制": r[7]}
             for r in sorted_risks[:10]
         ],
-        "今日六大板块新闻与摘要": [f"【{n['sector']}】{n['title']}：{n['summary']}" for n in news_list[:12]],
+        "今日精选财经新闻与摘要": [f"【{n['sector']}】{n['title']}：{n['summary']}" for n in news_list[:10]],
     }
 
-    return risk_rows, country_rows, macro_snapshot_rows, flow_rows, (curr_growth_x, curr_infl_y), llm_ctx, fallback_report, fallback_chart_notes
+    return risk_rows, country_rows, macro_snapshot_rows, flow_rows, (curr_growth_x, curr_infl_y), llm_ctx, fallback_perspectives, fallback_report, fallback_chart_notes
 
 
-# ================= 8. 工作表自动扩容 + 16张零重叠独立卡片布局 + 逐图实测核验 =================
-def get_or_create_ws(sh, title, rows=320, cols=48):
+# ================= 8. 工作表写入 + 8张核心金字塔“左图右文”零重叠布局 =================
+def get_or_create_ws(sh, title, rows=260, cols=48):
     try:
         ws = sh.worksheet(title)
         if ws.row_count < rows or ws.col_count < cols:
@@ -1861,8 +1826,8 @@ def get_or_create_ws(sh, title, rows=320, cols=48):
         return sh.add_worksheet(title=title, rows=rows, cols=cols)
 
 
-def build_16_pyramid_charts_requests(dash_sheet_id, ts_sheet_id, num_ts_rows, num_quad_rows, num_flow_rows, num_risk_rows):
-    """基于 CHART_SPECS_MASTER 精确生成 16 张不重叠多元图表（兼容 BAR 横向条形图坐标轴方向）"""
+def build_8_pyramid_charts_requests(dash_sheet_id, ts_sheet_id, num_ts_rows, num_quad_rows, num_flow_rows, num_risk_rows):
+    """生成 8 张大尺寸金字塔核心图，全部锚定在左栏 A:G（宽865px / 高365px），右侧 I:O 同排展示AI读图解说"""
     row_count_map = {
         "ts": num_ts_rows,
         "quad": num_quad_rows,
@@ -1871,10 +1836,10 @@ def build_16_pyramid_charts_requests(dash_sheet_id, ts_sheet_id, num_ts_rows, nu
     }
 
     reqs = []
-    for spec in CHART_SPECS_MASTER:
-        t_row = 63 + spec["tier"] * 30
-        anchor_row = t_row + 2
-        anchor_col = 0 if spec["side"] == "left" else 8
+    for spec in CHART_SPECS_CORE:
+        t_row = 62 + spec["tier"] * 17
+        anchor_row = t_row + 1
+        anchor_col = 0
         n_rows = row_count_map[spec["source_table"]]
         is_bar = spec["type"] == "BAR"
 
@@ -1944,10 +1909,10 @@ def build_16_pyramid_charts_requests(dash_sheet_id, ts_sheet_id, num_ts_rows, nu
                                 "rowIndex": anchor_row,
                                 "columnIndex": anchor_col,
                             },
-                            "offsetXPixels": 8,
-                            "offsetYPixels": 6,
-                            "widthPixels": 820,
-                            "heightPixels": 350,
+                            "offsetXPixels": 14,
+                            "offsetYPixels": 10,
+                            "widthPixels": 865,
+                            "heightPixels": 365,
                         }
                     },
                 }
@@ -1956,47 +1921,50 @@ def build_16_pyramid_charts_requests(dash_sheet_id, ts_sheet_id, num_ts_rows, nu
     return reqs
 
 
-def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_matrix, quad_matrix, flow_matrix, news_list, llm_ctx, fallback_report, fallback_chart_notes):
+def sync_all_sheets(
+    cross_asset_items, risk_rows, country_rows, macro_rows,
+    ts_matrix, quad_matrix, flow_matrix, news_list, llm_ctx,
+    fb_perspectives, fb_report, fb_chart_notes, health_banner
+):
     scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
     creds = Credentials.from_service_account_info(GCP_SA_JSON, scopes=scopes)
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    ws_dash = get_or_create_ws(sh, TAB_DASH, rows=320, cols=16)
+    ws_dash = get_or_create_ws(sh, TAB_DASH, rows=220, cols=16)
     ws_risk_news = get_or_create_ws(sh, TAB_RISK_NEWS, rows=1000, cols=12)
-    ws_ts_calc = get_or_create_ws(sh, TAB_TS_CALC, rows=300, cols=48)
+    ws_ts_calc = get_or_create_ws(sh, TAB_TS_CALC, rows=250, cols=48)
 
+    # 彻底清理僵尸表（含 01_原始指标库_Raw）
     for old_name in OLD_TABS_TO_REMOVE:
         try:
             sh.del_worksheet(sh.worksheet(old_name))
+            print(f"[INFO] 已清理冗余工作表: {old_name}")
         except Exception:
             pass
 
-    # ================= 1. 写入 02_底层时序与衍生运算库（主时序 A:AF + 3张辅助宽表 AH:AR） =================
+    # ================= 1. 写入 02_底层时序与衍生运算库 =================
     ws_ts_calc.clear()
     if ts_matrix and len(ts_matrix) > 1:
-        ws_ts_calc.update(range_name="A1", values=ts_matrix, value_input_option="USER_ENTERED")
+        ws_ts_calc.update(range_name="A1", values=sanitize_matrix_for_sheets(ts_matrix), value_input_option="USER_ENTERED")
     if quad_matrix and len(quad_matrix) > 1:
-        # AH1:AJ13 (列索引 33, 34, 35)
-        ws_ts_calc.update(range_name="AH1", values=quad_matrix, value_input_option="USER_ENTERED")
+        ws_ts_calc.update(range_name="AH1", values=sanitize_matrix_for_sheets(quad_matrix), value_input_option="USER_ENTERED")
     if flow_matrix and len(flow_matrix) > 1:
-        # AL1:AN18 (列索引 37, 38, 39)
-        ws_ts_calc.update(range_name="AL1", values=flow_matrix, value_input_option="USER_ENTERED")
+        ws_ts_calc.update(range_name="AL1", values=sanitize_matrix_for_sheets(flow_matrix), value_input_option="USER_ENTERED")
 
     sorted_risks = sorted(risk_rows, key=lambda x: x[8], reverse=True)
     risk_chart_matrix = [["系统性风险因子", "距红灯熔断线进度（%）", "黄灯警戒线（65%）"]]
     for r in sorted_risks[:12]:
         risk_chart_matrix.append([r[1].split("·")[-1], round(r[8] * 100.0, 1), 65.0])
-    # AP1:AR13 (列索引 41, 42, 43)
-    ws_ts_calc.update(range_name="AP1", values=risk_chart_matrix, value_input_option="USER_ENTERED")
+    ws_ts_calc.update(range_name="AP1", values=sanitize_matrix_for_sheets(risk_chart_matrix), value_input_option="USER_ENTERED")
 
-    # ================= 2. 抽取16张图实测基准数据 -> 调用 AI 四维读图 -> 自动核验 =================
+    # ================= 2. 抽取8张核心图实测基准 -> 调用三级 AI 生成多视角结论与读图解说 =================
     plotted_facts = extract_plotted_chart_facts(ts_matrix, quad_matrix, flow_matrix, risk_chart_matrix)
     llm_ctx["plotted_charts_ground_truth"] = {
         k: {"图表标题": v["title"], "实测绘图数据": v["fact_text"]} for k, v in plotted_facts.items()
     }
-    report_text, chart_notes = generate_ai_full_and_chart_commentary(
-        llm_ctx, plotted_facts, fallback_report, fallback_chart_notes
+    perspectives, report_text, chart_notes, engine_tag = generate_ai_multi_perspective_and_charts(
+        llm_ctx, plotted_facts, fb_perspectives, fb_report, fb_chart_notes
     )
 
     # ================= 3. 写入 01_风险雷达与多板块新闻库 =================
@@ -2047,40 +2015,62 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
         rn_matrix.append([n["date"], n["sector"], n["source"], n["title"], n.get("summary", "")])
 
     ws_risk_news.clear()
-    ws_risk_news.update(range_name="A1", values=rn_matrix, value_input_option="USER_ENTERED")
+    ws_risk_news.update(range_name="A1", values=sanitize_matrix_for_sheets(rn_matrix), value_input_option="USER_ENTERED")
 
-    # ================= 4. 彻底清空驾驶舱旧图表 =================
+    # ================= 4. 彻底清空驾驶舱所有旧图表（无字段过滤全量扫描） =================
     try:
-        meta_info = sh.fetch_sheet_metadata(params={"fields": "sheets(properties.sheetId,charts.chartId)"})
+        meta_info = sh.fetch_sheet_metadata()
         del_chart_reqs = []
         for s in meta_info.get("sheets", []):
-            if s["properties"]["sheetId"] == ws_dash.id:
+            if s.get("properties", {}).get("sheetId") == ws_dash.id:
                 for ch in s.get("charts", []):
                     del_chart_reqs.append({"deleteChart": {"chartId": ch["chartId"]}})
         if del_chart_reqs:
             sh.batch_update({"requests": del_chart_reqs})
+            print(f"[INFO] 已彻底清除旧图表 {len(del_chart_reqs)} 张")
     except Exception as e:
         print(f"[INFO] 清理旧图表日志: {e}")
 
-    # ================= 5. 构建 00_宏观驾驶舱_总览（8阶金字塔 16张独立卡片布局） =================
-    dash_grid = [["" for _ in range(16)] for _ in range(308)]
+    # ================= 5. 构建 00_宏观驾驶舱_总览（多视角战略结论矩阵 + 左图右文金字塔） =================
+    dash_grid = [["" for _ in range(16)] for _ in range(205)]
 
-    dash_grid[0][0] = "🌍 全球宏观第一性原理自动驾驶舱（六层金字塔全因子决策版）"
-    dash_grid[0][11] = f"数据同步时间：{NOW_STR}"
-    dash_grid[1][0] = "一、首席宏观策略师·六层第一性原理全因子深度总研判"
-    dash_grid[2][0] = report_text
+    # 顶部标题与数据源健康监控条（含跨表动态 COUNTIF 公式联动）
+    dash_grid[0][0] = "🌍 全球宏观第一性原理自动驾驶舱（多视角战略决策版）"
+    dash_grid[0][7] = f'="动态雷达统计：红灯 "&COUNTIF(\'{TAB_RISK_NEWS}\'!G3:G38,"*红灯*")&" 项 ｜ 黄灯 "&COUNTIF(\'{TAB_RISK_NEWS}\'!G3:G38,"*黄灯*")&" 项"'
+    dash_grid[0][11] = f"{health_banner} | {NOW_STR}"
 
-    dash_grid[19][0] = "二、全球核心经济硬数据与底层公式快照"
+    # 第一模块：六大维度多视角战略结论矩阵（Rows 1..8）
+    dash_grid[1][0] = f"一、六大维度多视角战略结论矩阵（AI引擎：{engine_tag}）"
+    dash_grid[2][0] = "观察视角与分析维度"
+    dash_grid[2][2] = "核心定调"
+    dash_grid[2][4] = "多维度量化研判结论"
+    dash_grid[2][10] = "实战应对与资产配置指引"
+
+    for idx_p, p_row in enumerate(perspectives[:6]):
+        r_idx = 3 + idx_p
+        dash_grid[r_idx][0] = p_row[0]
+        dash_grid[r_idx][2] = p_row[1]
+        dash_grid[r_idx][4] = p_row[2]
+        dash_grid[r_idx][10] = p_row[3]
+
+    # 第二模块：首席宏观策略师全景推演综述（Rows 10..17）
+    dash_grid[10][0] = "二、首席宏观策略师·六层第一性原理全景推演综述与三情景概率"
+    dash_grid[11][0] = report_text
+
+    # 第三模块（左）：全球核心经济硬数据快照（Rows 19..37, Cols A:G）
+    dash_grid[19][0] = "三、全球核心经济硬数据与底层公式快照"
     dash_grid[20][0:7] = ["国家/地区", "宏观层级", "核心指标与公式", "最新读数", "对比基准", "数据日期", "预警与周期信号"]
     for idx_m, m_row in enumerate(macro_rows[:17]):
         dash_grid[21 + idx_m][0:7] = m_row
 
-    dash_grid[19][8] = "三、36维黑天鹅与灰犀牛高危预警雷达（Top 17 危急度排行）"
+    # 第四模块（右）：36维黑天鹅与灰犀牛高危预警雷达（Rows 19..37, Cols I:O）
+    dash_grid[19][8] = "四、36维黑天鹅与灰犀牛高危预警雷达（Top 17 危急度排行）"
     dash_grid[20][8:15] = ["风险编号", "风险维度", "当前读数", "红灯熔断线", "预警状态", "距红线进度", "核心传导机制"]
     for idx_r, r in enumerate(sorted_risks[:17]):
         dash_grid[21 + idx_r][8:15] = [r[0], r[1], r[3], r[5], r[6], f"{round(r[8]*100, 1)}%", r[7]]
 
-    dash_grid[39][0] = "四、全球跨资产实时定价与第一性原理驱动看板"
+    # 第五模块（左）：全球跨资产实时定价看板（Rows 39..59, Cols A:G）
+    dash_grid[39][0] = "五、全球跨资产实时定价与第一性原理驱动看板"
     dash_grid[40][0:7] = ["资产类别", "资产名称", "最新价格", "单日涨跌", "5日涨跌", "20日涨跌", "第一性原理定价驱动"]
     for idx_c, c_item in enumerate(cross_asset_items[:19]):
         dash_grid[41 + idx_c][0:7] = [
@@ -2088,41 +2078,28 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
             c_item["pct_1d"], c_item["pct_5d"], c_item["pct_20d"], c_item["driver"]
         ]
 
-    dash_grid[39][8] = "五、今日全球六大板块核心财经新闻与摘要速览（全部中文）"
-    dash_grid[40][8:15] = ["所属板块", "中文新闻标题", "", "核心摘要与市场传导影响", "", "", ""]
-    for idx_n, n in enumerate(news_list[:18]):
+    # 第六模块（右）：今日全球六大板块核心财经新闻（Rows 39..59, Cols I:O）
+    dash_grid[39][8] = "六、今日全球六大板块精选宏观财经新闻（全中文）"
+    dash_grid[40][8] = "所属板块"
+    dash_grid[40][9] = "中文新闻标题"
+    dash_grid[40][11] = "核心摘要与跨市场传导影响"
+    for idx_n, n in enumerate(news_list[:16]):
         r_ptr = 41 + idx_n
         dash_grid[r_ptr][8] = n["sector"]
         dash_grid[r_ptr][9] = n["title"]
         dash_grid[r_ptr][11] = n.get("summary", "")
 
-    dash_grid[61][0] = "六、宏观第一性原理金字塔·十六大多元结构图与AI四维关联解说（自塔基L1至塔尖L6层层递进）"
+    # 第七模块：8大核心金字塔图表（左侧 A:G 放图，右侧 I:O 同排紧跟 AI 四维读图解说）
+    dash_grid[60][0] = "七、宏观第一性原理金字塔·八大核心枢纽图与AI四维关联读图（左图右解说·自塔基L1至塔尖L6）"
 
-    tier_titles = [
-        "【金字塔第1阶 L1：信用引擎与货币活化】",
-        "【金字塔第2阶 L1-L2：实体信贷派生与美元三蓄水池】",
-        "【金字塔第3阶 L2：全球定价之锚（美债期限曲线与实际利率）】",
-        "【金字塔第4阶 L3：宏观增长—通胀四象限与非农就业引擎】",
-        "【金字塔第5阶 L3：工业补库周期与美国财政付息生死线】",
-        "【金字塔第6阶 L4：中美跨境利差与全球汇率套息总阀门】",
-        "【金字塔第7阶 L5：全球16大资产资金流向全景与美股恐慌锚】",
-        "【金字塔第8阶 L5-L6：跨资产背离验证与36维风险雷达塔尖】",
-    ]
-
-    spec_by_tier_side = {(s["tier"], s["side"]): s for s in CHART_SPECS_MASTER}
+    # 设置精确列宽：左栏 A:G 总宽 900px，隔离列 H 36px，右栏 I:O 总宽 900px
+    left_col_widths = [85, 130, 175, 130, 155, 90, 135]   # sum = 900px
+    right_col_widths = [95, 150, 110, 110, 110, 100, 225]  # sum = 900px
 
     merge_and_style_reqs = [
         {
             "unmergeCells": {
-                "range": {"sheetId": ws_dash.id, "startRowIndex": 0, "endRowIndex": 308, "startColumnIndex": 0, "endColumnIndex": 16}
-            }
-        },
-        # 显式锁定左栏 A:G (7列*122px=854px)、中间隔离带 H (36px)、右栏 I:O (7列*122px=854px) 宽度，物理隔绝横向重叠
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": ws_dash.id, "dimension": "COLUMNS", "startIndex": 0, "endIndex": 7},
-                "properties": {"pixelSize": 122},
-                "fields": "pixelSize"
+                "range": {"sheetId": ws_dash.id, "startRowIndex": 0, "endRowIndex": 205, "startColumnIndex": 0, "endColumnIndex": 16}
             }
         },
         {
@@ -2132,37 +2109,160 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
                 "fields": "pixelSize"
             }
         },
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": ws_dash.id, "dimension": "COLUMNS", "startIndex": 8, "endIndex": 15},
-                "properties": {"pixelSize": 122},
-                "fields": "pixelSize"
-            }
-        },
-        {
-            "mergeCells": {
-                "range": {"sheetId": ws_dash.id, "startRowIndex": 2, "endRowIndex": 18, "startColumnIndex": 0, "endColumnIndex": 15},
-                "mergeType": "MERGE_ALL"
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": ws_dash.id, "startRowIndex": 2, "endRowIndex": 18, "startColumnIndex": 0, "endColumnIndex": 15},
-                "cell": {
-                    "userEnteredFormat": {
-                        "wrapStrategy": "WRAP",
-                        "verticalAlignment": "TOP",
-                        "backgroundColor": {"red": 0.96, "green": 0.98, "blue": 1.0},
-                        "textFormat": {"fontSize": 10}
-                    }
-                },
-                "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,backgroundColor,textFormat)"
-            }
-        }
     ]
 
-    for idx_n in range(18):
-        r_ptr = 41 + idx_n
+    for c_idx, w_px in enumerate(left_col_widths):
+        merge_and_style_reqs.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": ws_dash.id, "dimension": "COLUMNS", "startIndex": c_idx, "endIndex": c_idx + 1},
+                "properties": {"pixelSize": w_px},
+                "fields": "pixelSize"
+            }
+        })
+    for c_idx, w_px in enumerate(right_col_widths):
+        merge_and_style_reqs.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": ws_dash.id, "dimension": "COLUMNS", "startIndex": 8 + c_idx, "endIndex": 9 + c_idx},
+                "properties": {"pixelSize": w_px},
+                "fields": "pixelSize"
+            }
+        })
+
+    # 样式：主标题栏 Row 0
+    merge_and_style_reqs.append({
+        "repeatCell": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 0, "endColumnIndex": 15},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.11, "green": 0.18, "blue": 0.28},
+                    "textFormat": {"bold": True, "fontSize": 11, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                    "verticalAlignment": "MIDDLE"
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)"
+        }
+    })
+
+    # 样式：六大维度多视角战略结论矩阵（Rows 2..8）
+    for r_idx in range(2, 9):
+        for c_s, c_e in [(0, 2), (2, 4), (4, 10), (10, 15)]:
+            merge_and_style_reqs.append({
+                "mergeCells": {
+                    "range": {"sheetId": ws_dash.id, "startRowIndex": r_idx, "endRowIndex": r_idx + 1, "startColumnIndex": c_s, "endColumnIndex": c_e},
+                    "mergeType": "MERGE_ALL"
+                }
+            })
+        row_h = 28 if r_idx == 2 else 46
+        merge_and_style_reqs.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": ws_dash.id, "dimension": "ROWS", "startIndex": r_idx, "endIndex": r_idx + 1},
+                "properties": {"pixelSize": row_h},
+                "fields": "pixelSize"
+            }
+        })
+
+    merge_and_style_reqs.append({
+        "repeatCell": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 0, "endColumnIndex": 15},
+            "cell": {
+                "userEnteredFormat": {
+                    "backgroundColor": {"red": 0.88, "green": 0.92, "blue": 0.97},
+                    "textFormat": {"bold": True, "fontSize": 10},
+                    "verticalAlignment": "MIDDLE"
+                }
+            },
+            "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)"
+        }
+    })
+    merge_and_style_reqs.append({
+        "repeatCell": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 3, "endRowIndex": 9, "startColumnIndex": 0, "endColumnIndex": 15},
+            "cell": {
+                "userEnteredFormat": {
+                    "wrapStrategy": "WRAP",
+                    "verticalAlignment": "MIDDLE",
+                    "backgroundColor": {"red": 0.98, "green": 0.99, "blue": 1.0},
+                    "textFormat": {"fontSize": 9.5}
+                }
+            },
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,backgroundColor,textFormat)"
+        }
+    })
+
+    # 样式：全景推演综述合并区（Rows 11..17）
+    merge_and_style_reqs.append({
+        "mergeCells": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 11, "endRowIndex": 18, "startColumnIndex": 0, "endColumnIndex": 15},
+            "mergeType": "MERGE_ALL"
+        }
+    })
+    merge_and_style_reqs.append({
+        "repeatCell": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 11, "endRowIndex": 18, "startColumnIndex": 0, "endColumnIndex": 15},
+            "cell": {
+                "userEnteredFormat": {
+                    "wrapStrategy": "WRAP",
+                    "verticalAlignment": "TOP",
+                    "backgroundColor": {"red": 0.96, "green": 0.98, "blue": 1.0},
+                    "textFormat": {"fontSize": 9.5}
+                }
+            },
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,backgroundColor,textFormat)"
+        }
+    })
+
+    # 样式：表头加粗与所有快照/风险/行情/新闻单元格强制 WRAP 自动换行，彻底消除截断
+    for hdr_row in [20, 40]:
+        merge_and_style_reqs.append({
+            "repeatCell": {
+                "range": {"sheetId": ws_dash.id, "startRowIndex": hdr_row, "endRowIndex": hdr_row + 1, "startColumnIndex": 0, "endColumnIndex": 15},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.90, "green": 0.93, "blue": 0.98},
+                        "textFormat": {"bold": True, "fontSize": 9.5},
+                        "verticalAlignment": "MIDDLE"
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)"
+            }
+        })
+
+    merge_and_style_reqs.append({
+        "repeatCell": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 21, "endRowIndex": 60, "startColumnIndex": 0, "endColumnIndex": 15},
+            "cell": {
+                "userEnteredFormat": {
+                    "wrapStrategy": "WRAP",
+                    "verticalAlignment": "MIDDLE",
+                    "textFormat": {"fontSize": 9}
+                }
+            },
+            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)"
+        }
+    })
+    merge_and_style_reqs.append({
+        "updateDimensionProperties": {
+            "range": {"sheetId": ws_dash.id, "dimension": "ROWS", "startIndex": 21, "endIndex": 60},
+            "properties": {"pixelSize": 32},
+            "fields": "pixelSize"
+        }
+    })
+
+    # 跨资产涨跌幅列（D42:F60）格式化为百分比 +0.00%;-0.00%;0.00%
+    merge_and_style_reqs.append({
+        "repeatCell": {
+            "range": {"sheetId": ws_dash.id, "startRowIndex": 41, "endRowIndex": 60, "startColumnIndex": 3, "endColumnIndex": 6},
+            "cell": {
+                "userEnteredFormat": {
+                    "numberFormat": {"type": "PERCENT", "pattern": "+0.00%;-0.00%;0.00%"}
+                }
+            },
+            "fields": "userEnteredFormat.numberFormat"
+        }
+    })
+
+    # 合并新闻列单元格（表头与内容行）
+    for r_ptr in range(40, 57):
         merge_and_style_reqs.append({
             "mergeCells": {
                 "range": {"sheetId": ws_dash.id, "startRowIndex": r_ptr, "endRowIndex": r_ptr + 1, "startColumnIndex": 9, "endColumnIndex": 11},
@@ -2175,28 +2275,12 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
                 "mergeType": "MERGE_ALL"
             }
         })
-    merge_and_style_reqs.append({
-        "repeatCell": {
-            "range": {"sheetId": ws_dash.id, "startRowIndex": 41, "endRowIndex": 59, "startColumnIndex": 8, "endColumnIndex": 15},
-            "cell": {"userEnteredFormat": {"wrapStrategy": "WRAP", "verticalAlignment": "MIDDLE", "textFormat": {"fontSize": 9}}},
-            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,textFormat)"
-        }
-    })
 
-    # 填充 8 阶金字塔（每阶 30 行：T+0阶梯横幅 | T+1图表卡片头 | T+2..T+17图表画布(384px) | T+18..T+28AI四维解说(286px) | T+29空行）
-    for tier_idx, t_title in enumerate(tier_titles):
-        t_row = 63 + tier_idx * 30
-        left_spec = spec_by_tier_side[(tier_idx, "left")]
-        right_spec = spec_by_tier_side[(tier_idx, "right")]
-
-        dash_grid[t_row][0] = t_title
-        dash_grid[t_row + 1][0] = f"📊 {left_spec['title']}"
-        dash_grid[t_row + 1][8] = f"📊 {right_spec['title']}"
-
-        card_start = t_row + 18
-        card_end = t_row + 29
-        dash_grid[card_start][0] = chart_notes.get(left_spec["key"], "")
-        dash_grid[card_start][8] = chart_notes.get(right_spec["key"], "")
+    # 填充 8 大金字塔【左图右解说】同排卡片（每阶 17 行：T+0 阶梯横幅 | T+1..T+15 左图 A:G & 右文 I:O | T+16 留白隔断）
+    for spec in CHART_SPECS_CORE:
+        t_row = 62 + spec["tier"] * 17
+        dash_grid[t_row][0] = spec["tier_banner"]
+        dash_grid[t_row + 1][8] = chart_notes.get(spec["key"], "")
 
         merge_and_style_reqs.append({
             "mergeCells": {
@@ -2210,7 +2294,7 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
                 "cell": {
                     "userEnteredFormat": {
                         "backgroundColor": {"red": 0.16, "green": 0.24, "blue": 0.36},
-                        "textFormat": {"bold": True, "fontSize": 11, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
+                        "textFormat": {"bold": True, "fontSize": 10.5, "foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}},
                         "verticalAlignment": "MIDDLE"
                     }
                 },
@@ -2220,81 +2304,53 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
         merge_and_style_reqs.append({
             "updateDimensionProperties": {
                 "range": {"sheetId": ws_dash.id, "dimension": "ROWS", "startIndex": t_row, "endIndex": t_row + 1},
-                "properties": {"pixelSize": 30},
+                "properties": {"pixelSize": 28},
                 "fields": "pixelSize"
             }
         })
 
-        # 图表画布区 16 行 * 24px = 384px (> 350px 图表高)
+        # 15 行内容区 * 26px = 390px（左侧图表高 365px 完全容纳，右侧 AI 四维解说从容展示）
         merge_and_style_reqs.append({
             "updateDimensionProperties": {
-                "range": {"sheetId": ws_dash.id, "dimension": "ROWS", "startIndex": t_row + 2, "endIndex": card_start},
-                "properties": {"pixelSize": 24},
-                "fields": "pixelSize"
-            }
-        })
-        # AI 四维解说卡片区 11 行 * 26px = 286px（充足展示全部四维深度解说无截断）
-        merge_and_style_reqs.append({
-            "updateDimensionProperties": {
-                "range": {"sheetId": ws_dash.id, "dimension": "ROWS", "startIndex": card_start, "endIndex": card_end},
+                "range": {"sheetId": ws_dash.id, "dimension": "ROWS", "startIndex": t_row + 1, "endIndex": t_row + 16},
                 "properties": {"pixelSize": 26},
                 "fields": "pixelSize"
             }
         })
 
-        for c_start, c_end in [(0, 7), (8, 15)]:
-            merge_and_style_reqs.append({
-                "mergeCells": {
-                    "range": {"sheetId": ws_dash.id, "startRowIndex": t_row + 1, "endRowIndex": t_row + 2, "startColumnIndex": c_start, "endColumnIndex": c_end},
-                    "mergeType": "MERGE_ALL"
-                }
-            })
-            merge_and_style_reqs.append({
-                "repeatCell": {
-                    "range": {"sheetId": ws_dash.id, "startRowIndex": t_row + 1, "endRowIndex": t_row + 2, "startColumnIndex": c_start, "endColumnIndex": c_end},
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": {"red": 0.90, "green": 0.93, "blue": 0.98},
-                            "textFormat": {"bold": True, "fontSize": 10, "foregroundColor": {"red": 0.1, "green": 0.18, "blue": 0.32}},
-                            "verticalAlignment": "MIDDLE"
-                        }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)"
-                }
-            })
+        merge_and_style_reqs.append({
+            "mergeCells": {
+                "range": {"sheetId": ws_dash.id, "startRowIndex": t_row + 1, "endRowIndex": t_row + 16, "startColumnIndex": 8, "endColumnIndex": 15},
+                "mergeType": "MERGE_ALL"
+            }
+        })
+        merge_and_style_reqs.append({
+            "repeatCell": {
+                "range": {"sheetId": ws_dash.id, "startRowIndex": t_row + 1, "endRowIndex": t_row + 16, "startColumnIndex": 8, "endColumnIndex": 15},
+                "cell": {
+                    "userEnteredFormat": {
+                        "wrapStrategy": "WRAP",
+                        "verticalAlignment": "MIDDLE",
+                        "backgroundColor": {"red": 0.97, "green": 0.98, "blue": 0.99},
+                        "textFormat": {"fontSize": 9.5, "foregroundColor": {"red": 0.12, "green": 0.16, "blue": 0.24}}
+                    }
+                },
+                "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,backgroundColor,textFormat)"
+            }
+        })
 
-            merge_and_style_reqs.append({
-                "mergeCells": {
-                    "range": {"sheetId": ws_dash.id, "startRowIndex": card_start, "endRowIndex": card_end, "startColumnIndex": c_start, "endColumnIndex": c_end},
-                    "mergeType": "MERGE_ALL"
-                }
-            })
-            merge_and_style_reqs.append({
-                "repeatCell": {
-                    "range": {"sheetId": ws_dash.id, "startRowIndex": card_start, "endRowIndex": card_end, "startColumnIndex": c_start, "endColumnIndex": c_end},
-                    "cell": {
-                        "userEnteredFormat": {
-                            "wrapStrategy": "WRAP",
-                            "verticalAlignment": "TOP",
-                            "backgroundColor": {"red": 0.97, "green": 0.98, "blue": 0.99},
-                            "textFormat": {"fontSize": 9, "foregroundColor": {"red": 0.12, "green": 0.16, "blue": 0.24}}
-                        }
-                    },
-                    "fields": "userEnteredFormat(wrapStrategy,verticalAlignment,backgroundColor,textFormat)"
-                }
-            })
+        border_style = {"style": "SOLID_MEDIUM", "color": {"red": 0.72, "green": 0.78, "blue": 0.86}}
+        merge_and_style_reqs.append({
+            "updateBorders": {
+                "range": {"sheetId": ws_dash.id, "startRowIndex": t_row + 1, "endRowIndex": t_row + 16, "startColumnIndex": 8, "endColumnIndex": 15},
+                "top": border_style,
+                "bottom": border_style,
+                "left": border_style,
+                "right": border_style,
+            }
+        })
 
-            border_style = {"style": "SOLID_MEDIUM", "color": {"red": 0.72, "green": 0.78, "blue": 0.86}}
-            merge_and_style_reqs.append({
-                "updateBorders": {
-                    "range": {"sheetId": ws_dash.id, "startRowIndex": t_row + 1, "endRowIndex": card_end, "startColumnIndex": c_start, "endColumnIndex": c_end},
-                    "top": border_style,
-                    "bottom": border_style,
-                    "left": border_style,
-                    "right": border_style,
-                }
-            })
-
+    # 红黄绿灯条件格式高亮（覆盖多视角矩阵 + 硬数据快照 + 风险雷达）
     for text_val, bg_rgb in [
         ("🔴", {"red": 0.99, "green": 0.91, "blue": 0.90}),
         ("🟡", {"red": 1.0, "green": 0.97, "blue": 0.88}),
@@ -2303,7 +2359,10 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
         merge_and_style_reqs.append({
             "addConditionalFormatRule": {
                 "rule": {
-                    "ranges": [{"sheetId": ws_dash.id, "startRowIndex": 20, "endRowIndex": 38, "startColumnIndex": 6, "endColumnIndex": 14}],
+                    "ranges": [
+                        {"sheetId": ws_dash.id, "startRowIndex": 3, "endRowIndex": 9, "startColumnIndex": 2, "endColumnIndex": 4},
+                        {"sheetId": ws_dash.id, "startRowIndex": 21, "endRowIndex": 38, "startColumnIndex": 6, "endColumnIndex": 14},
+                    ],
                     "booleanRule": {
                         "condition": {"type": "TEXT_CONTAINS", "values": [{"userEnteredValue": text_val}]},
                         "format": {"backgroundColor": bg_rgb, "textFormat": {"bold": True}}
@@ -2313,11 +2372,15 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
             }
         })
 
+    # 清洗数据写入（避免对动态公式行 Row 0 的 COUNTIF 误加单引号）
+    sanitized_dash = sanitize_matrix_for_sheets(dash_grid)
+    sanitized_dash[0][7] = dash_grid[0][7]
+
     ws_dash.clear()
-    ws_dash.update(range_name="A1", values=dash_grid, value_input_option="USER_ENTERED")
+    ws_dash.update(range_name="A1", values=sanitized_dash, value_input_option="USER_ENTERED")
 
     if ts_matrix and len(ts_matrix) > 2:
-        chart_reqs = build_16_pyramid_charts_requests(
+        chart_reqs = build_8_pyramid_charts_requests(
             ws_dash.id,
             ws_ts_calc.id,
             len(ts_matrix),
@@ -2331,14 +2394,15 @@ def sync_all_sheets(cross_asset_items, risk_rows, country_rows, macro_rows, ts_m
 
 
 if __name__ == "__main__":
-    print(f"[{NOW_STR}] 启动全球宏观六层第一性原理自动驾驶舱同步...")
+    print(f"[{NOW_STR}] 启动全球宏观六层第一性原理多视角自动驾驶舱同步...")
     s_obs, s_dates, s_dmaps, lt_hist = fetch_fred_data()
     cross_items, mkt_stats = fetch_market_assets(s_obs, lt_hist)
-    fetch_china_macro_akshare(s_obs, s_dates, lt_hist)
+    cn_ok_cnt = fetch_china_macro_akshare(s_obs, s_dates, lt_hist)
     wb_m, imf_m, ext_v = fetch_external_apis()
     news = fetch_global_macro_news()
 
-    risk_r, country_r, macro_r, flow_mat, quad_xy, llm_ctx, fb_rep, fb_notes = analyze_all_factors(
+    health_info = f"数据源状态：FRED {len(s_obs)}项 | 跨资产 {len(mkt_stats)}项 | 中国接口 {cn_ok_cnt}/5项"
+    risk_r, country_r, macro_r, flow_mat, quad_xy, llm_ctx, fb_persp, fb_rep, fb_notes = analyze_all_factors(
         s_obs, s_dates, s_dmaps, wb_m, imf_m, ext_v, mkt_stats, news
     )
     ts_mat = build_clean_chart_timeseries(lt_hist)
@@ -2346,6 +2410,8 @@ if __name__ == "__main__":
 
     sync_all_sheets(
         cross_items, risk_r, country_r, macro_r,
-        ts_mat, quad_mat, flow_mat, news, llm_ctx, fb_rep, fb_notes
+        ts_mat, quad_mat, flow_mat, news, llm_ctx,
+        fb_persp, fb_rep, fb_notes, health_info
     )
-    print(f"[{NOW_STR}] 同步完成！已生成 16 张多元结构图及四维关联式 AI 深度解说。")
+    print(f"[{NOW_STR}] 同步完成！已生成六大维度多视角结论矩阵与 8 张左图右文金字塔核心图。")
+
