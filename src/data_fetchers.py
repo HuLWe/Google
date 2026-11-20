@@ -179,7 +179,7 @@ def fetch_macro_and_cross_assets() -> dict:
     else:
         gate_signal, max_alloc = "🟡 震荡控仓", 0.65
 
-    # 计算 11 大板块 RS (相对强弱)
+    # 计算 11 大板块 RS
     sector_rs_matrix = []
     spy_perf = {
         "5D": (spy.iloc[-1] - spy.iloc[-6]) / spy.iloc[-6],
