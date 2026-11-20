@@ -1,6 +1,7 @@
 import json
 import os
 import gspread
+import pandas as pd
 import yfinance as yf
 from google.oauth2.service_account import Credentials
 from config import SHEET_ID, GURU_WATCHLIST
@@ -24,7 +25,7 @@ def ensure_worksheets(sh):
     worksheets = {}
     for name in needed:
         if name not in existing:
-            worksheets[name] = sh.add_worksheet(title=name, rows="100", cols="20")
+            worksheets[name] = sh.add_worksheet(title=name, rows="500", cols="30")
         else:
             worksheets[name] = sh.worksheet(name)
     return worksheets
@@ -37,6 +38,7 @@ def run_pipeline():
     cockpit = ws["Master_Visual_Cockpit"]
     heatmap = ws["13F_Heatmap_Matrix"]
     diag = ws["Single_Stock_Diagnostic"]
+    macro_store = ws["FRED_Macro_Data"]
     
     # 1. 屏 1 主控台塔顶宏观更新
     macro = fetch_macro_and_cross_assets()
@@ -51,7 +53,7 @@ def run_pipeline():
                 f"{macro['hy_oas_now']}%",
                 f"{macro['tips_now']}%",
                 f"{macro['t10y2y_now']}% / {macro['t10yie_now']}%",
-                f"DXY {macro['dxy_now']} | JPY {macro['usdjpy_now']} | 铜金比 {macro['copper_gold']} | WTI ${macro['oil_now']} | VIX {macro['vix_now']} | MOVE {macro['move_now']} | BTC ${macro['btc_now']}k",
+                f"DXY {macro['dxy_now']} | JPY {macro['usdjpy_now']} | 铜金比 {macro['copper_gold']} | WTI ${macro['oil_now']} | VIX {macro['vix_now']} | BTC ${macro['btc_now']}k",
                 "✅ 水文同步"
             ]
         ],
@@ -61,10 +63,37 @@ def run_pipeline():
     guru_5states = fetch_guru_13f_5state_holdings()
     watchlist = ["MSFT", "COST", "NVDA", "AAPL", "GOOGL", "AMZN", "META"]
     
-    # 【性能核心优化】一次性批量并发下载所有自选股 5 年 K 线
+    # 【高稳健下载与索引扁平化】
     print("🚀 正在一次性批量拉取自选股历史 K 线数据...")
-    all_hist = yf.download(watchlist, period="5y", progress=False)["Close"].ffill()
+    df_raw = yf.download(watchlist, period="5y", progress=False)
     
+    # 扁平化多重索引（防止出现 Key 访问错误）
+    if isinstance(df_raw.columns, pd.MultiIndex):
+        if 'Close' in df_raw.columns.levels[0]:
+            all_hist = df_raw['Close'].ffill()
+        else:
+            all_hist = df_raw.xs('Close', axis=1, level=0).ffill()
+    else:
+        all_hist = df_raw.ffill()
+
+    # ----------------------------------------------------
+    # 【需求实现】：将所有股票 5 年历史 K 线留存写入 FRED_Macro_Data
+    # ----------------------------------------------------
+    print("💾 正在留存全部股票与风向标历史序列到 FRED_Macro_Data...")
+    hist_to_save = all_hist.reset_index()
+    hist_to_save['Date'] = hist_to_save['Date'].dt.strftime('%Y-%m-%d')
+    
+    # 截取近 100 天历史留存，防止超过单元格上限
+    save_headers = [str(col) for col in hist_to_save.columns]
+    save_values = hist_to_save.tail(100).fillna("-").values.tolist()
+    
+    macro_store.clear()
+    macro_store.update(
+        range_name="A1",
+        values=[["全量股票与跨资产历史收盘价留存底仓 (最新100个交易日)"]] + [save_headers] + save_values,
+        value_input_option="USER_ENTERED"
+    )
+
     stock_rows = []
     diag_rows = []
 
@@ -77,8 +106,12 @@ def run_pipeline():
             
             bm = calculate_business_model_score({**sec, **ai_notes})
             
-            # 提取单只股票的 5年价格序列并传入计算
-            hist_series = all_hist[tk] if isinstance(all_hist, pd.DataFrame) and tk in all_hist else all_hist
+            # 安全提取单个股票的 pd.Series
+            if isinstance(all_hist, pd.DataFrame) and tk in all_hist.columns:
+                hist_series = all_hist[tk]
+            else:
+                hist_series = all_hist
+                
             pricing = calculate_institutional_buy_sell_prices(tk, sec, bm["grade"], hist_series, guru_5states)
             
             stock_rows.append([
@@ -96,7 +129,9 @@ def run_pipeline():
                 sec["audit_status"], f"{sec['dilution_rate']:.1%}", bm["archetype"], bm["alerts"]
             ])
         except Exception as e:
-            stock_rows.append([tk, f"⚠️待核查({str(e)[:10]})", "-", "-", "-", "-", "-", "-"])
+            # 记录具体的错误消息，方便追查
+            err_msg = str(e).replace("\n", " ")
+            stock_rows.append([tk, f"⚠️待核查({err_msg[:12]})", "-", "-", "-", "-", "-", "-"])
 
     cockpit.update(
         range_name="A6:H15",
@@ -107,7 +142,7 @@ def run_pipeline():
         value_input_option="USER_ENTERED"
     )
 
-    # 2. 屏 2 塔身板块与 13F 矩阵更新
+    # 2. 屏 2 板块与 13F 矩阵
     guru_ciks = list(GURU_WATCHLIST.keys())
     guru_headers = [GURU_WATCHLIST[c]["name"] for c in guru_ciks]
     
@@ -138,7 +173,7 @@ def run_pipeline():
         value_input_option="USER_ENTERED"
     )
 
-    # 3. 屏 3 单股深度诊断更新
+    # 3. 屏 3 单股诊断更新
     diag.update(
         range_name="A1:L15",
         values=[
@@ -148,7 +183,7 @@ def run_pipeline():
         value_input_option="USER_ENTERED"
     )
 
-    cockpit.update(range_name="D1", values=[["✅ V5.3 多屏全量数据已成功推送"]], value_input_option="USER_ENTERED")
+    cockpit.update(range_name="D1", values=[["✅ V5.3 多屏全量数据已成功推送并完成历史全量留存"]], value_input_option="USER_ENTERED")
 
 if __name__ == "__main__":
     run_pipeline()
