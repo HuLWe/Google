@@ -1,5 +1,5 @@
 import numpy as np
-import yfinance as yf
+import pandas as pd
 
 def calculate_business_model_score(metrics: dict) -> dict:
     score_q1, score_q2, score_q3 = 0.0, 0.0, 0.0
@@ -58,10 +58,9 @@ def calculate_business_model_score(metrics: dict) -> dict:
         "tags": " | ".join(tags), "alerts": " | ".join(alerts) if alerts else "无红线"
     }
 
-def calculate_institutional_buy_sell_prices(ticker: str, sec_data: dict, bm_grade: str, guru_5states: dict = None) -> dict:
-    tk_obj = yf.Ticker(ticker)
-    hist = tk_obj.history(period="5y")["Close"]
-    curr_price = float(hist.iloc[-1])
+def calculate_institutional_buy_sell_prices(ticker: str, sec_data: dict, bm_grade: str, hist: pd.Series, guru_5states: dict = None) -> dict:
+    '''直接接收外部传入的 5年收盘价序列 hist，消除循环内重复网络开销'''
+    curr_price = float(hist.dropna().iloc[-1])
     
     yr = sec_data["latest_yr"]
     ann = sec_data["annual"]
@@ -94,15 +93,14 @@ def calculate_institutional_buy_sell_prices(ticker: str, sec_data: dict, bm_grad
     
     mos_req = 0.20 if "S" in bm_grade else 0.28
     p_buy_dcf = p_dcf_intrinsic * (1.0 - mos_req)
-    p_hist_20 = float(np.percentile(hist, 20))
+    p_hist_20 = float(np.percentile(hist.dropna(), 20))
     
-    w_close = hist.resample("W").last()
+    w_close = hist.dropna().resample("W").last()
     ma_20w = float(w_close.rolling(20).mean().iloc[-1])
     
-    # 彻底废除 min(...) 死锁逻辑，生成双层买入价
     p_base_buy = round((p_buy_dcf + p_hist_20) / 2.0, 2)
     p_aggressive_buy = round(max(ma_20w, min(p_buy_dcf, p_hist_20 * 1.15)), 2)
-    p_alert_sell = round(max(p_dcf_intrinsic * 1.30, float(np.percentile(hist, 85))), 2)
+    p_alert_sell = round(max(p_dcf_intrinsic * 1.30, float(np.percentile(hist.dropna(), 85))), 2)
     
     smart_money_tag = "➖ 维持/观望"
     if guru_5states:
