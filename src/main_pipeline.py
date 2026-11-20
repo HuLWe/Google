@@ -1,6 +1,7 @@
 import json
 import os
 import gspread
+import yfinance as yf
 from google.oauth2.service_account import Credentials
 from config import SHEET_ID, GURU_WATCHLIST
 from data_fetchers import (
@@ -18,7 +19,6 @@ def get_gspread_client():
     return gspread.authorize(Credentials.from_service_account_info(creds_dict, scopes=scopes))
 
 def ensure_worksheets(sh):
-    '''自动保障 3 屏 + 1 底层数据工作表存在'''
     needed = ["Master_Visual_Cockpit", "13F_Heatmap_Matrix", "Single_Stock_Diagnostic", "FRED_Macro_Data"]
     existing = [ws.title for ws in sh.worksheets()]
     worksheets = {}
@@ -38,9 +38,8 @@ def run_pipeline():
     heatmap = ws["13F_Heatmap_Matrix"]
     diag = ws["Single_Stock_Diagnostic"]
     
-    # ================= 屏 1：主控台 (Master_Visual_Cockpit) =================
+    # 1. 屏 1 主控台塔顶宏观更新
     macro = fetch_macro_and_cross_assets()
-    
     cockpit.update(
         range_name="A1:F4",
         values=[
@@ -59,11 +58,13 @@ def run_pipeline():
         value_input_option="USER_ENTERED"
     )
 
-    # 抓取 13F 大师持仓
     guru_5states = fetch_guru_13f_5state_holdings()
-
-    # 默认股票列表
     watchlist = ["MSFT", "COST", "NVDA", "AAPL", "GOOGL", "AMZN", "META"]
+    
+    # 【性能核心优化】一次性批量并发下载所有自选股 5 年 K 线
+    print("🚀 正在一次性批量拉取自选股历史 K 线数据...")
+    all_hist = yf.download(watchlist, period="5y", progress=False)["Close"].ffill()
+    
     stock_rows = []
     diag_rows = []
 
@@ -75,7 +76,10 @@ def run_pipeline():
             ai_notes = extract_10k_notes_with_ai(tk, sec["cik"], sec["subs"], rev_now)
             
             bm = calculate_business_model_score({**sec, **ai_notes})
-            pricing = calculate_institutional_buy_sell_prices(tk, sec, bm["grade"], guru_5states)
+            
+            # 提取单只股票的 5年价格序列并传入计算
+            hist_series = all_hist[tk] if isinstance(all_hist, pd.DataFrame) and tk in all_hist else all_hist
+            pricing = calculate_institutional_buy_sell_prices(tk, sec, bm["grade"], hist_series, guru_5states)
             
             stock_rows.append([
                 tk, pricing["action_signal"], pricing["smart_money_tag"],
@@ -86,7 +90,6 @@ def run_pipeline():
                 ai_notes.get("one_sentence_business", "")
             ])
 
-            # 诊断屏明细数据
             diag_rows.append([
                 tk, bm["grade"], f"{sec['roic']:.1%}", "8.9%", f"${pricing['curr_price']}",
                 f"${pricing['p_base_buy']}", f"${pricing['p_aggressive_buy']}", f"${pricing['p_alert_sell']}",
@@ -95,7 +98,6 @@ def run_pipeline():
         except Exception as e:
             stock_rows.append([tk, f"⚠️待核查({str(e)[:10]})", "-", "-", "-", "-", "-", "-"])
 
-    # 更新屏 1 下半区 (自选股买卖点总表)
     cockpit.update(
         range_name="A6:H15",
         values=[
@@ -105,7 +107,7 @@ def run_pipeline():
         value_input_option="USER_ENTERED"
     )
 
-    # ================= 屏 2：塔身板块 × 13F 矩阵 (13F_Heatmap_Matrix) =================
+    # 2. 屏 2 塔身板块与 13F 矩阵更新
     guru_ciks = list(GURU_WATCHLIST.keys())
     guru_headers = [GURU_WATCHLIST[c]["name"] for c in guru_ciks]
     
@@ -116,11 +118,9 @@ def run_pipeline():
             f"{sec_info['rs_5d']:.1%}", f"{sec_info['rs_20d']:.1%}", f"{sec_info['rs_60d']:.1%}",
             f"{sec_info['rs_120d']:.1%}", f"{sec_info['rs_250d']:.1%}", sec_info["signal"]
         ]
-        # 填充 8 位大师在各板块中的综合 5 态
         for cik in guru_ciks:
             st_text = "➖ 维持"
             if cik in guru_5states:
-                # 简单聚合判断大师该板块状态
                 st_list = list(guru_5states[cik].get("states", {}).values())
                 if any("★" in s for s in st_list): st_text = "★ 新建仓"
                 elif any("▲" in s for s in st_list): st_text = "▲ 增持"
@@ -138,7 +138,7 @@ def run_pipeline():
         value_input_option="USER_ENTERED"
     )
 
-    # ================= 屏 3：单股深度视觉诊断 (Single_Stock_Diagnostic) =================
+    # 3. 屏 3 单股深度诊断更新
     diag.update(
         range_name="A1:L15",
         values=[
