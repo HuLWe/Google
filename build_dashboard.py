@@ -16,6 +16,12 @@ import yfinance as yf
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
+# 隔离 yfinance 本地 SQLite 缓存路径，防止多线程/多进程锁死
+try:
+    yf.set_tz_cache_location("/tmp/yf_tz_cache")
+except Exception:
+    pass
+
 # ==========================================
 # 1. 环境与密钥初始化
 # ==========================================
@@ -100,8 +106,8 @@ def yoy_pct(s: pd.Series, periods: int = 12) -> pd.Series:
 
 def fetch_existing_home_sales_yoy() -> pd.Series:
     """
-    以 FRED 官方季调全美成屋销售(EXHOSLUSM495S)同比为主基准，
-    仅当 Redfin 有更新月份数据时向后补齐最新单月，避免跨统计口径拼接跳变。
+    获取完整 60 个月全美成屋销售同比(%)：
+    兼容 Redfin 的 '30 days' / '1 month' 月度周期字段，并在样本充足时合并 FRED 官方最新一期数据。
     """
     fred_s = yoy_pct(fetch_fred("EXHOSLUSM495S", start_date="2019-01-01"))
     if not fred_s.empty:
@@ -123,20 +129,20 @@ def fetch_existing_home_sales_yoy() -> pd.Series:
 
             sub = df.copy()
             if dur_col:
-                sub = sub[sub[dur_col].astype(str).str.lower().str.contains("1 month", na=False)]
+                dur_mask = sub[dur_col].astype(str).str.lower().str.contains(r"1 month|30 day", regex=True, na=False)
+                if dur_mask.any():
+                    sub = sub[dur_mask]
             if t_col and "All Residential" in sub[t_col].values:
                 sub = sub[sub[t_col] == "All Residential"]
             if sa_col:
-                # 优先匹配与 FRED 一致的季调口径，若无则回退未季调
+                false_rows = sub[sub[sa_col].astype(str).str.lower().isin(["false", "0", "f"])]
                 true_rows = sub[sub[sa_col].astype(str).str.lower().isin(["true", "1", "t"])]
-                if not true_rows.empty:
+                if not false_rows.empty:
+                    sub = false_rows
+                elif not true_rows.empty:
                     sub = true_rows
-                else:
-                    false_rows = sub[sub[sa_col].astype(str).str.lower().isin(["false", "0", "f"])]
-                    if not false_rows.empty:
-                        sub = false_rows
 
-            if p_col:
+            if p_col and not sub.empty:
                 sub[p_col] = pd.to_datetime(sub[p_col], errors="coerce")
                 sub = sub.dropna(subset=[p_col]).sort_values(p_col)
                 if sold_col and sub[sold_col].notna().sum() >= 24:
@@ -148,7 +154,6 @@ def fetch_existing_home_sales_yoy() -> pd.Series:
                     sub[y_col] = pd.to_numeric(sub[y_col], errors="coerce")
                     s = sub.dropna(subset=[y_col]).set_index(p_col)[y_col]
                     s = s[~s.index.duplicated(keep="last")].resample("ME").last().dropna()
-                    # Redfin TSV 中 HOMES_SOLD_YOY 固定存储为小数比率 (如 -0.123 = -12.3%)
                     s = s * 100.0
                 else:
                     s = pd.Series(dtype=float)
@@ -159,14 +164,22 @@ def fetch_existing_home_sales_yoy() -> pd.Series:
     except Exception as e:
         print(f"[Info] Redfin 通道回退至 FRED: {e}")
 
-    if not fred_s.empty:
+    # 若 FRED 有完整 24 个月以上历史，以 FRED 为主并补充 Redfin 更新月份
+    if len(fred_s) >= 24:
         if not redfin_s.empty:
             newer_redfin = redfin_s[redfin_s.index > fred_s.index.max()]
             if not newer_redfin.empty:
                 fred_s = pd.concat([fred_s, newer_redfin]).sort_index()
         return fred_s.rename("成屋销售同比(%)")
 
-    return redfin_s.rename("成屋销售同比(%)")
+    # 若 FRED 仅返回近 13 个月（同比仅 1 个点），以 Redfin 完整 60 个月为底座并叠加 FRED 最新点
+    if not redfin_s.empty:
+        r_m = redfin_s.resample("ME").last()
+        if not fred_s.empty:
+            r_m = fred_s.combine_first(r_m).sort_index()
+        return r_m.rename("成屋销售同比(%)")
+
+    return fred_s.rename("成屋销售同比(%)")
 
 
 def fetch_ism_pmi() -> tuple:
@@ -203,7 +216,6 @@ def fetch_ism_pmi() -> tuple:
             r = requests.get(te_url, headers=HEADERS, timeout=20)
             if r.status_code != 200:
                 return pd.Series(dtype=float)
-            # 严格匹配连续 12 个以上 [毫秒时间戳, PMI数值] 组成的 Highcharts 主序列数组
             arr_matches = re.findall(
                 r'data\s*:\s*\[\s*(\[\s*\d{13}\s*,\s*\d{2}(?:\.\d+)?\s*\](?:\s*,\s*\[\s*\d{13}\s*,\s*\d{2}(?:\.\d+)?\s*\]){11,})\s*\]',
                 r.text,
@@ -237,7 +249,6 @@ def fetch_ism_pmi() -> tuple:
     ny_mfg = fetch_fred("GACDISA066MSFRBNY", start_date="2019-01-01")
     philly_mfg = fetch_fred("GACDFSA066MSFRBPHI", start_date="2019-01-01")
     if not ny_mfg.empty and not philly_mfg.empty:
-        # 校准波动系数 0.12，使区域联储扩散指数与全国 ISM 制造业 PMI 方差匹配
         fed_mfg_proxy = (50.0 + (ny_mfg.resample("MS").last() + philly_mfg.resample("MS").last()) * 0.12).dropna()
         if mfg_pmi.empty:
             mfg_pmi = fed_mfg_proxy
@@ -265,8 +276,10 @@ def fetch_ism_pmi() -> tuple:
 
 
 def fetch_yf_ohlcv(tickers: list, period: str = "5y") -> dict:
-    """批量拉取 Yahoo Finance 完整 OHLCV 数据并统一去除时区"""
-    raw = yf.download(tickers, period=period, auto_adjust=True, progress=False, group_by="column")
+    """批量拉取 Yahoo Finance 完整 OHLCV 数据（关闭多线程防 SQLite 锁死 + 失败自动单只补抓）"""
+    raw = yf.download(
+        tickers, period=period, auto_adjust=True, progress=False, group_by="column", threads=False
+    )
     data = {}
     for field in ["Open", "High", "Low", "Close", "Volume"]:
         if isinstance(raw.columns, pd.MultiIndex):
@@ -277,6 +290,21 @@ def fetch_yf_ohlcv(tickers: list, period: str = "5y") -> dict:
         df.index = pd.to_datetime(df.index).tz_localize(None)
         df = df[~df.index.duplicated(keep="last")].sort_index()
         data[field] = df
+
+    # 对任何意外失败的标的自动重试补抓（如 XLC 等）
+    missing = [t for t in tickers if t not in data["Close"].columns or data["Close"][t].dropna().empty]
+    for t in missing:
+        print(f"[Retry] 正在补抓缺失标的: {t}")
+        time.sleep(1.5)
+        retry = yf.download(t, period=period, auto_adjust=True, progress=False, threads=False)
+        if not retry.empty:
+            retry.index = pd.to_datetime(retry.index).tz_localize(None)
+            retry = retry[~retry.index.duplicated(keep="last")].sort_index()
+            for field in ["Open", "High", "Low", "Close", "Volume"]:
+                if field in retry.columns:
+                    s = retry[field].iloc[:, 0] if isinstance(retry[field], pd.DataFrame) else retry[field]
+                    data[field][t] = s
+
     return data
 
 
@@ -353,7 +381,6 @@ def compute_global_outflow_panic(ohlcv: dict, vix: pd.Series, credit_spread: pd.
     valid_cnt = cmf_w.notna().sum(axis=1).replace(0, np.nan)
     outflow_breadth = ((cmf_w < 0).sum(axis=1) / valid_cnt * 100.0).rename("同步净流出资产占比(%)")
 
-    # 零轴重校准：平均 CMF = +5% 记 0 分，CMF = 0% 记 20 分，CMF = -20% 记 100 分
     avg_outflow_pressure = ((-cmf_w.mean(axis=1) + 5.0) / 25.0 * 100.0).clip(0, 100)
 
     vix_w = vix.resample("W-FRI").last().reindex(cmf_w.index).ffill(limit=6)
@@ -477,7 +504,7 @@ def fetch_institutional_equity_exposure() -> pd.DataFrame:
         if not frames:
             return pd.DataFrame()
 
-        tff = pd.concat(frames, ignore_index=True)
+        tff = pd.concat(frames, ignore_index=True).copy()
         name_col = [c for c in tff.columns if "Market_and_Exchange_Names" in c][0]
         date_col = [c for c in tff.columns if "Report_Date_as_YYYY-MM-DD" in c][0]
         am_long_col = [c for c in tff.columns if "Asset_Mgr_Positions_Long_All" in c][0]
@@ -586,7 +613,8 @@ def fetch_cftc_cot_all_assets() -> tuple:
         if not frames:
             return pd.DataFrame(), pd.DataFrame()
 
-        cot = pd.concat(frames, ignore_index=True)
+        # 使用 .copy() 消除 DataFrame 内存碎片化警告
+        cot = pd.concat(frames, ignore_index=True).copy()
         name_col = [c for c in cot.columns if "Market and Exchange Names" in c][0]
         date_col = [c for c in cot.columns if "As of Date in Form YYYY-MM-DD" in c][0]
         long_col = [c for c in cot.columns if "Noncommercial Positions-Long (All)" in c][0]
@@ -595,7 +623,7 @@ def fetch_cftc_cot_all_assets() -> tuple:
         cot[date_col] = pd.to_datetime(cot[date_col])
         cot[long_col] = pd.to_numeric(cot[long_col], errors="coerce")
         cot[short_col] = pd.to_numeric(cot[short_col], errors="coerce")
-        cot["_clean_name"] = cot[name_col].astype(str).str.strip().str.upper()
+        clean_names = cot[name_col].astype(str).str.strip().str.upper()
 
         asset_configs = [
             (
@@ -642,7 +670,7 @@ def fetch_cftc_cot_all_assets() -> tuple:
             combined_hands = pd.Series(dtype=float)
             combined_ratio = pd.Series(dtype=float)
             for cname in exact_names:
-                sub = cot[cot["_clean_name"] == cname].dropna(subset=[long_col, short_col]).set_index(date_col).sort_index()
+                sub = cot[clean_names == cname].dropna(subset=[long_col, short_col]).set_index(date_col).sort_index()
                 if sub.empty:
                     continue
                 if hands_label:
@@ -685,7 +713,7 @@ def fetch_sp500_breadth() -> pd.DataFrame:
             "DIS", "GS", "AMAT", "UBER", "SPGI", "RTX", "LOW", "HON", "UNP", "NEE",
         ]
     try:
-        raw = yf.download(tickers, period="2y", auto_adjust=True, progress=False, group_by="column")
+        raw = yf.download(tickers, period="2y", auto_adjust=True, progress=False, group_by="column", threads=False)
         prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
         prices.index = pd.to_datetime(prices.index).tz_localize(None)
         ma50 = prices.rolling(50).mean()
@@ -777,7 +805,6 @@ def build_all_charts() -> list:
     cs20_yoy = yoy_pct(fetch_fred("SPCS20RSA")).rename("20大都市房价同比(%)")
     med_new_yoy = yoy_pct(fetch_fred("MSPNHSUS")).rename("新房价格中位数同比(%)")
 
-    # 修复量纲：TOTALSA 原始单位为百万辆，×100 统一转换为“万辆”
     totalsa_raw = fetch_fred("TOTALSA")
     veh_sales = (totalsa_raw * 100.0).rename("全美汽车销量(万辆)")
     veh_yoy = yoy_pct(totalsa_raw).rename("汽车销量同比(%)")
@@ -856,7 +883,6 @@ def build_all_charts() -> list:
         "DBC": "大宗商品(DBC)",
         "IBIT": "比特币ETF(IBIT)",
     }
-    # 近 12 个月分组柱状图，保证每根柱体宽度清晰可辨，并与图 23 月份严格对齐
     global_flow_df = compute_monthly_flow_intensity(ohlcv, global_flow_tickers, window=20, tail_months=12)
 
     if not cot_ratio_df.empty:
@@ -1413,7 +1439,6 @@ def compute_axis_bounds(df: pd.DataFrame, cols: list, is_column: bool = False) -
 def render_to_google_sheets(charts: list, ai_summary: str):
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # 动态计算底层数据表行数上限，防止超界报错
     max_len = max((len(c["df"]) for c in charts if not c["df"].empty), default=10)
     CARD_ROWS = 44
     total_dash_rows = 1220
@@ -1557,7 +1582,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
     dash_grid = [[""] * 16 for _ in range(total_dash_rows)]
     dash_grid[1][1] = "📈 美股核心 26 张宏观、机构全球资金流比(含BTC)、恐慌与美元跷跷板全景看板"
     dash_grid[2][1] = (
-        f"最近数据完成时间：{now_str}   |   手动刷新：顶部菜单【📊 宏观量化看板 → 🔄 手动刷新数据】   |   "
+        f"最近数据完成时间：{now_str}   |   手动刷新：顶部菜单【📊 宏观量化看板 → 🔄 手动刷新全部 26 张图表】   |   "
         "来源：FRED · CFTC · CBOE · Redfin · Yahoo Finance · AAII"
     )
     dash_grid[3][1] = f"🤖 AI 宏观与资金流总评：{ai_summary}"
