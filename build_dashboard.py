@@ -3,7 +3,9 @@ import json
 import os
 import re
 import time
+import warnings
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import gspread
@@ -116,7 +118,6 @@ def compute_rolling_flow_intensity(ohlcv: dict, ticker_labels: dict, window: int
     """
     计算机构级 Chaikin Money Flow (CMF) 20日资金流净强弱指数 (%)
     公式: CMF(%) = Sum_20d(CLV * Dollar_Volume) / Sum_20d(Dollar_Volume) * 100
-    说明: 消除 SPY 与 GLD/DBC/IBIT 绝对成交额体量差异，使七大资产处于同一可比量纲 (-30% ~ +30%)
     """
     high = ohlcv["High"]
     low = ohlcv["Low"]
@@ -140,44 +141,68 @@ def compute_rolling_flow_intensity(ohlcv: dict, ticker_labels: dict, window: int
     return flow_df.iloc[-260:].resample("W-FRI").last().dropna(how="all")
 
 
+def _normalize_header_table(raw: pd.DataFrame, required_keywords: list) -> pd.DataFrame:
+    """自动扫描前 10 行定位真实表头，防止顶部标题/空行导致列名错位"""
+    df = raw.copy()
+    cols_lower = [str(c).strip().lower() for c in df.columns]
+    if all(any(kw in c for c in cols_lower) for kw in required_keywords):
+        df.columns = cols_lower
+        return df
+
+    for idx in range(min(10, len(df))):
+        row_vals = [str(v).strip().lower() for v in df.iloc[idx].tolist()]
+        if all(any(kw in v for v in row_vals) for kw in required_keywords):
+            df = df.iloc[idx + 1 :].copy()
+            df.columns = row_vals
+            return df
+
+    df.columns = cols_lower
+    return df
+
+
 def fetch_aaii_sentiment() -> pd.DataFrame:
-    """多源容错抓取 AAII 散户情绪调查 (看涨% - 看跌%)"""
-    # 通道 1: 官方 Excel 历史全量表
+    """多源容错抓取 AAII 散户情绪调查 (看涨% - 看跌%)，消除 Pandas 3/4 xlrd 警告"""
+    # 通道 1: 官方数据文件（优先 calamine / 自动引擎 / HTML 伪装表解析）
     try:
         url = "https://www.aaii.com/files/surveys/sentiment.xls"
         r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
         raw = None
-        for engine in [None, "xlrd", "openpyxl"]:
-            try:
-                raw = pd.read_excel(io.BytesIO(r.content), engine=engine)
-                if raw is not None and not raw.empty:
-                    break
-            except Exception:
-                continue
-        if raw is None:
-            tables = pd.read_html(io.BytesIO(r.content))
-            raw = tables[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            for engine in ["calamine", None, "openpyxl"]:
+                try:
+                    raw = pd.read_excel(io.BytesIO(r.content), engine=engine)
+                    if raw is not None and not raw.empty:
+                        break
+                except Exception:
+                    continue
+            if raw is None:
+                tables = pd.read_html(io.BytesIO(r.content))
+                if tables:
+                    raw = tables[0]
 
-        raw.columns = [str(c).strip().lower() for c in raw.columns]
-        date_col = [c for c in raw.columns if "date" in c][0]
-        bull_col = [c for c in raw.columns if "bull" in c][0]
-        bear_col = [c for c in raw.columns if "bear" in c][0]
-        df = raw[[date_col, bull_col, bear_col]].copy()
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df[bull_col] = pd.to_numeric(df[bull_col], errors="coerce")
-        df[bear_col] = pd.to_numeric(df[bear_col], errors="coerce")
-        df = df.dropna().set_index(date_col).sort_index()
-        if df[bull_col].max() <= 1.5:
-            df[bull_col] *= 100.0
-            df[bear_col] *= 100.0
-        spread = (df[bull_col] - df[bear_col]).rename("散户净看涨差值(%)")
-        ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
-        res = pd.concat([spread, ma20], axis=1).dropna()
-        if len(res) > 20:
-            return res
+        if raw is not None and not raw.empty:
+            raw = _normalize_header_table(raw, ["date", "bull", "bear"])
+            date_col = [c for c in raw.columns if "date" in c][0]
+            bull_col = [c for c in raw.columns if "bull" in c][0]
+            bear_col = [c for c in raw.columns if "bear" in c][0]
+            df = raw[[date_col, bull_col, bear_col]].copy()
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            for col in [bull_col, bear_col]:
+                df[col] = pd.to_numeric(df[col].astype(str).str.replace("%", ""), errors="coerce")
+            df = df.dropna().set_index(date_col).sort_index()
+            if not df.empty and df[bull_col].max() <= 1.5:
+                df[bull_col] *= 100.0
+                df[bear_col] *= 100.0
+            spread = (df[bull_col] - df[bear_col]).rename("散户净看涨差值(%)")
+            ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+            res = pd.concat([spread, ma20], axis=1).dropna()
+            if len(res) > 20:
+                print(f"[OK] AAII 散户情绪成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
+                return res
     except Exception as e:
-        print(f"[Info] AAII Excel 通道切换至网页直抓: {e}")
+        print(f"[Info] AAII 文件通道切换至网页直抓: {e}")
 
     # 通道 2: AAII 官网情绪调查结果 HTML 表格
     try:
@@ -185,9 +210,9 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
         page.raise_for_status()
         tables = pd.read_html(io.StringIO(page.text))
         for tbl in tables:
-            cols = [str(c).strip().lower() for c in tbl.columns]
+            tbl = _normalize_header_table(tbl, ["bull", "bear"])
+            cols = list(tbl.columns)
             if any("bull" in c for c in cols) and any("bear" in c for c in cols):
-                tbl.columns = cols
                 d_col = cols[0]
                 b_col = [c for c in cols if "bull" in c][0]
                 s_col = [c for c in cols if "bear" in c][0]
@@ -200,6 +225,7 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
                 ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
                 res = pd.concat([spread, ma20], axis=1).dropna()
                 if not res.empty:
+                    print(f"[OK] AAII 网页通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
                     return res
     except Exception as e:
         print(f"[Warning] AAII 数据全部通道抓取失败: {e}")
@@ -214,20 +240,27 @@ def fetch_naaim_exposure() -> pd.DataFrame:
         page.raise_for_status()
 
         # 通道 1: 自动提取页面中的官方 Excel/CSV 数据直链
-        file_links = re.findall(r'href=["\']([^"\']+(?:NAAIM|Exposure)[^"\']*\.(?:xlsx|xls|csv))["\']', page.text, flags=re.I)
+        file_links = re.findall(
+            r'href=["\']([^"\']+(?:NAAIM|Exposure|Data)[^"\']*\.(?:xlsx|xls|csv))["\']',
+            page.text,
+            flags=re.I,
+        )
         for link in file_links:
             if link.startswith("/"):
                 link = "https://www.naaim.org" + link
             try:
                 fr = requests.get(link, headers=HEADERS, timeout=30)
                 if fr.status_code == 200:
-                    if link.lower().endswith(".csv"):
-                        raw = pd.read_csv(io.BytesIO(fr.content))
-                    else:
-                        raw = pd.read_excel(io.BytesIO(fr.content))
-                    raw.columns = [str(c).strip().lower() for c in raw.columns]
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore")
+                        if link.lower().endswith(".csv"):
+                            raw = pd.read_csv(io.BytesIO(fr.content))
+                        else:
+                            raw = pd.read_excel(io.BytesIO(fr.content))
+                    raw = _normalize_header_table(raw, ["date"])
                     d_col = [c for c in raw.columns if "date" in c][0]
-                    v_col = [c for c in raw.columns if "mean" in c or "number" in c or "exposure" in c][0]
+                    v_candidates = [c for c in raw.columns if "mean" in c or "number" in c or "exposure" in c]
+                    v_col = v_candidates[0] if v_candidates else raw.columns[1]
                     df = raw[[d_col, v_col]].copy()
                     df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
                     df[v_col] = pd.to_numeric(df[v_col], errors="coerce")
@@ -236,6 +269,7 @@ def fetch_naaim_exposure() -> pd.DataFrame:
                     ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
                     res = pd.concat([exp, ma20], axis=1).dropna()
                     if len(res) > 20:
+                        print(f"[OK] NAAIM 文件通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
                         return res
             except Exception:
                 continue
@@ -243,9 +277,9 @@ def fetch_naaim_exposure() -> pd.DataFrame:
         # 通道 2: 解析页面内嵌 HTML 表格
         tables = pd.read_html(io.StringIO(page.text))
         for tbl in tables:
-            cols = [str(c).strip().lower() for c in tbl.columns]
+            tbl = _normalize_header_table(tbl, ["date"])
+            cols = list(tbl.columns)
             if len(cols) >= 2:
-                tbl.columns = cols
                 d_col = cols[0]
                 v_candidates = [c for c in cols if "mean" in c or "number" in c or "exposure" in c]
                 v_col = v_candidates[0] if v_candidates else cols[1]
@@ -257,60 +291,77 @@ def fetch_naaim_exposure() -> pd.DataFrame:
                 ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
                 res = pd.concat([exp, ma20], axis=1).dropna()
                 if len(res) > 20:
+                    print(f"[OK] NAAIM 网页通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
                     return res
     except Exception as e:
         print(f"[Warning] NAAIM 数据抓取异常: {e}")
     return pd.DataFrame()
 
 
+def _fetch_single_cboe_day(d_str: str):
+    """请求单个交易日的 CBOE 官方市场统计 JSON"""
+    u = f"https://cdn.cboe.com/data/us/options/market_statistics/daily/{d_str}_daily_options"
+    try:
+        r = requests.get(u, headers=HEADERS, timeout=8)
+        if r.status_code != 200:
+            return None
+        payload = r.json()
+        ratios = payload.get("ratios", [])
+        equity_val = None
+        total_val = None
+        for item in ratios:
+            name = str(item.get("name", "")).upper()
+            val = item.get("value")
+            if val is None:
+                continue
+            if "EQUITY PUT/CALL" in name:
+                equity_val = float(val)
+            elif "TOTAL PUT/CALL" in name:
+                total_val = float(val)
+        chosen = equity_val if equity_val is not None else total_val
+        if chosen is not None:
+            return (pd.to_datetime(d_str), chosen)
+    except Exception:
+        return None
+    return None
+
+
 def fetch_cboe_put_call() -> pd.DataFrame:
     """
-    抓取实时 CBOE 股票看跌/看涨期权成交量比值 (杜绝使用已停更的 2019 静态 CSV)
+    并发直连 CBOE 官方每日市场统计 CDN 接口拉取真实 Put/Call 比值
+    （已彻底移除 Yahoo Finance 已下线的 ^CPCE / ^CPC）
     """
-    # 通道 1: Yahoo Finance CBOE Equity Put/Call Ratio (^CPCE) 与 Total Put/Call (^CPC)
-    for ticker in ["^CPCE", "^CPC"]:
-        try:
-            df_yf = yf.download(ticker, period="2y", progress=False)
-            if not df_yf.empty:
-                close_s = df_yf["Close"]
-                if isinstance(close_s, pd.DataFrame):
-                    close_s = close_s.iloc[:, 0]
-                close_s = pd.to_numeric(close_s, errors="coerce").dropna()
-                close_s.index = pd.to_datetime(close_s.index).tz_localize(None)
-                if len(close_s) > 30 and close_s.index[-1] >= pd.Timestamp.now() - pd.Timedelta(days=15):
-                    pcr = close_s.rename("Put/Call比值")
-                    ma20 = pcr.rolling(20, min_periods=5).mean().rename("20日均线")
-                    return pd.concat([pcr, ma20], axis=1).dropna()
-        except Exception:
-            continue
-
-    # 通道 2: CBOE 每日市场统计 JSON 接口（逐日回溯最近 180 个交易日）
     try:
-        records = []
         today = datetime.now(timezone.utc).date()
-        for delta in range(0, 210):
-            d = today - timedelta(days=delta)
-            if d.weekday() >= 5:
-                continue
-            d_str = d.strftime("%Y-%m-%d")
-            u = f"https://cdn.cboe.com/data/us/options/market_statistics/daily/{d_str}_daily_options"
-            r = requests.get(u, headers=HEADERS, timeout=6)
-            if r.status_code == 200:
-                payload = r.json()
-                ratios = payload.get("ratios", [])
-                for item in ratios:
-                    name = str(item.get("name", "")).upper()
-                    if "EQUITY PUT/CALL" in name:
-                        val = float(item.get("value"))
-                        records.append((pd.to_datetime(d_str), val))
-                        break
+        candidate_dates = [
+            (today - timedelta(days=delta)).strftime("%Y-%m-%d")
+            for delta in range(0, 320)
+            if (today - timedelta(days=delta)).weekday() < 5
+        ]
+        records = []
+        with ThreadPoolExecutor(max_workers=14) as executor:
+            futures = [executor.submit(_fetch_single_cboe_day, d_str) for d_str in candidate_dates]
+            for fut in as_completed(futures):
+                res = fut.result()
+                if res is not None:
+                    records.append(res)
+
         if len(records) >= 20:
             records.sort(key=lambda x: x[0])
-            pcr = pd.Series([v for _, v in records], index=[dt for dt, _ in records], name="Put/Call比值")
+            pcr = pd.Series(
+                [v for _, v in records],
+                index=pd.DatetimeIndex([dt for dt, _ in records]),
+                name="Put/Call比值",
+            )
+            pcr = pcr[~pcr.index.duplicated(keep="last")].sort_index()
             ma20 = pcr.rolling(20, min_periods=5).mean().rename("20日均线")
-            return pd.concat([pcr, ma20], axis=1).dropna()
+            out = pd.concat([pcr, ma20], axis=1).dropna()
+            print(f"[OK] CBOE Put/Call 成功拉取 {len(out)} 个交易日数据 (最新: {out.index[-1].strftime('%Y-%m-%d')})")
+            return out
+        else:
+            print(f"[Warning] CBOE Put/Call 有效返回不足 ({len(records)} 条)")
     except Exception as e:
-        print(f"[Warning] CBOE 每日 JSON 统计抓取异常: {e}")
+        print(f"[Warning] CBOE 每日统计抓取异常: {e}")
 
     return pd.DataFrame()
 
@@ -358,7 +409,9 @@ def fetch_cftc_cot() -> pd.DataFrame:
             .sort_index()
             .rename("纳指100投机净持仓(万手)")
         )
-        return pd.concat([sp_net, nq_net], axis=1)
+        res = pd.concat([sp_net, nq_net], axis=1)
+        print(f"[OK] CFTC COT 持仓成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
+        return res
     except Exception as e:
         print(f"[Warning] CFTC COT 抓取异常: {e}")
         return pd.DataFrame()
@@ -371,7 +424,6 @@ def fetch_sp500_breadth() -> pd.DataFrame:
         sp_table = pd.read_html(io.StringIO(r.text))[0]
         tickers = [t.replace(".", "-") for t in sp_table["Symbol"].tolist()]
     except Exception:
-        # 备用核心 60 只标普权重代表成分股
         tickers = [
             "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "LLY", "AVGO", "JPM",
             "TSLA", "UNH", "XOM", "V", "PG", "MA", "JNJ", "COST", "HD", "ABBV",
@@ -391,6 +443,7 @@ def fetch_sp500_breadth() -> pd.DataFrame:
         b50 = ((prices > ma50).sum(axis=1) / valid_50 * 100.0).rename("50日市场宽度(%)")
         b200 = ((prices > ma200).sum(axis=1) / valid_200 * 100.0).rename("200日市场宽度(%)")
         df = pd.concat([b50, b200], axis=1).dropna()
+        print(f"[OK] S&P 500 市场宽度计算完成 ({len(df)} 个交易日)")
         return df.iloc[-300:]
     except Exception as e:
         print(f"[Warning] 市场宽度计算异常: {e}")
@@ -449,7 +502,7 @@ def build_all_charts() -> list:
     breadth_df = fetch_sp500_breadth()
 
     print(">>> 正在拉取 FRED 宏观与利率数据...")
-    # 一、消费端（量纲统一：初请折算万人，续请折算十万人，避免左右轴量级压扁）
+    # 一、消费端
     icsa_w = (fetch_fred("ICSA") / 10000.0).rename("初请失业金(万人)")
     ccsa_10w = (fetch_fred("CCSA") / 100000.0).rename("续请失业金(十万人)")
     payems_yoy = yoy_pct(fetch_fred("PAYEMS")).rename("非农就业同比(%)")
@@ -500,7 +553,7 @@ def build_all_charts() -> list:
         credit_spread = (ccc_y - dgs10).dropna().rename("CCC级高收益债信用利差(%)")
     vix = mkt["^VIX"].rename("VIX恐慌指数")
 
-    # 四、市场端：11大板块拆分为「20A 进攻周期6板块」与「20B 防御利率敏感5板块」，避免11条线缠绕
+    # 四、市场端：11大板块拆分为「20A 进攻周期6板块」与「20B 防御利率敏感5板块」
     offense_map = {
         "XLK": "科技XLK",
         "XLC": "通讯XLC",
@@ -591,7 +644,7 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "同比变化 (%)",
             "right_title": "",
-            "what": "• 蓝线/蓝点：成屋销售同比(%)（注：NAR官方仅公开近1年数据，圆点为最新值）\n• 红线：新屋销售同比(%)（4年完整周期曲线）\n• 黄线：标普Case-Shiller 20大都市房价指数同比(%)\n• 绿线：全美新房销售中位价同比(%)",
+            "what": "• 蓝线/蓝点：成屋销售同比(%)（注：NAR官方仅公开近1年数据，圆点为最新值）\n• 红线：新屋销售同比(%)（完整周期曲线）\n• 黄线：标普Case-Shiller 20大都市房价指数同比(%)\n• 绿线：全美新房销售中位价同比(%)",
             "how": "房地产是美国家庭最大宗资产，直接牵动家电、建材、家具、按揭金融全产业链。地产周期严格遵循「量在价先」规律：成交量（蓝/红线）通常领先房价（黄/绿线）3~6个月见顶或见底。",
             "changes": "• 红线/蓝线由负转正且持续上行：按揭利率压力缓和，买家入市，预计3~6个月后房价止跌回升\n• 红线见顶大幅回落、黄线仍在高位：典型的「量缩价撑」顶背离，预示随后房价将步入阴跌\n• 黄线与绿线剪刀差扩大：豪宅/核心都市房价坚挺，而大众刚需新房正在降价促销",
             "signal": "💡 实战信号：新屋销售同比连续3个月站稳 0% 上方，是布局地产建筑商(ITB/XHB)与家居链的领先信号。",
@@ -1048,7 +1101,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
     current_cat = None
     layout_blocks = []
 
-    # 每张图占 26 行（25行内容 + 1行间距），配合右侧 5 列宽幅面板，容纳超详细四段式解读
     CARD_ROWS = 25
 
     for c in charts:
@@ -1088,7 +1140,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
     raw_id = raw_ws.id
     requests_batch = []
 
-    # 左侧图表占 B:I (8列 * 102px = 816px)，右侧读图指南占 J:N (5列 * 136px = 680px)
     col_widths = (
         [(0, 1, 24)]
         + [(i, i + 1, 102) for i in range(1, 9)]
@@ -1110,7 +1161,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         }
     })
 
-    # 顶部标题与AI总评
     requests_batch.extend([
         {
             "mergeCells": {
@@ -1230,7 +1280,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             }
         })
 
-        # 卡片主标题栏 (J:N)
         requests_batch.extend([
             {
                 "mergeCells": {
@@ -1253,7 +1302,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             },
         ])
 
-        # 4 个小节标题栏
         for sr in [r0 + 1, r0 + 6, r0 + 12, r0 + 20]:
             requests_batch.extend([
                 {
@@ -1277,7 +1325,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                 },
             ])
 
-        # 4 个内容正文区
         body_blocks = [
             (r0 + 2, r0 + 6),
             (r0 + 7, r0 + 12),
@@ -1332,7 +1379,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         left_cols = [col for col in cols if col not in right_set]
         active_right_cols = [col for col in cols if col in right_set]
 
-        # 计算左右轴自适应范围，彻底解决曲线被压缩粘连
         l_min, l_max = compute_axis_bounds(c["df"], left_cols)
         left_axis_spec = {"position": "LEFT_AXIS", "title": c["left_title"]}
         if l_min is not None and l_max is not None:
@@ -1362,7 +1408,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         for j, col_name in enumerate(cols):
             target_ax = "RIGHT_AXIS" if col_name in right_set else "LEFT_AXIS"
             color_rgb = PALETTE[j % len(PALETTE)]
-            # 若序列有效点数较少（如成屋销售仅近1年），自动显示圆点标记使其清晰可见
             pt_size = 5 if valid_counts.get(col_name, 99) <= 15 else 0
             series_item = {
                 "series": {
