@@ -99,7 +99,7 @@ def yoy_pct(s: pd.Series, periods: int = 12) -> pd.Series:
 
 
 def fetch_existing_home_sales_yoy() -> pd.Series:
-    """合并 Redfin 官方全国成屋成交同比与 FRED 最新值，确保连续多年无单点截断"""
+    """过滤 Redfin 全国月度成屋成交量并计算完整 60 个月同比，合并 FRED 最新值"""
     fred_s = yoy_pct(fetch_fred("EXHOSLUSM495S", start_date="2019-01-01"))
     redfin_s = pd.Series(dtype=float)
     try:
@@ -109,21 +109,42 @@ def fetch_existing_home_sales_yoy() -> pd.Series:
             df = pd.read_csv(io.BytesIO(r.content), sep="\t", compression="gzip", low_memory=False)
             cols_map = {c.upper(): c for c in df.columns}
             p_col = cols_map.get("PERIOD_END") or cols_map.get("PERIOD_BEGIN")
+            dur_col = cols_map.get("PERIOD_DURATION")
             t_col = cols_map.get("PROPERTY_TYPE")
+            sa_col = cols_map.get("IS_SEASONALLY_ADJUSTED")
+            sold_col = cols_map.get("HOMES_SOLD")
             y_col = cols_map.get("HOMES_SOLD_YOY")
-            if p_col and y_col:
-                sub = df.copy()
-                if t_col and "All Residential" in sub[t_col].values:
-                    sub = sub[sub[t_col] == "All Residential"]
+
+            sub = df.copy()
+            if dur_col:
+                sub = sub[sub[dur_col].astype(str).str.lower().str.contains("1 month", na=False)]
+            if t_col and "All Residential" in sub[t_col].values:
+                sub = sub[sub[t_col] == "All Residential"]
+            if sa_col:
+                false_rows = sub[sub[sa_col].astype(str).str.lower().isin(["false", "0", "f"])]
+                if not false_rows.empty:
+                    sub = false_rows
+
+            if p_col:
                 sub[p_col] = pd.to_datetime(sub[p_col], errors="coerce")
-                sub[y_col] = pd.to_numeric(sub[y_col], errors="coerce")
-                sub = sub.dropna(subset=[p_col, y_col]).sort_values(p_col)
-                s = sub.set_index(p_col)[y_col]
-                s = s[~s.index.duplicated(keep="last")]
-                if not s.empty and s.abs().max() <= 3.0:
-                    s = s * 100.0
+                sub = sub.dropna(subset=[p_col]).sort_values(p_col)
+                if sold_col and sub[sold_col].notna().sum() >= 24:
+                    sub[sold_col] = pd.to_numeric(sub[sold_col], errors="coerce")
+                    s_cnt = sub.dropna(subset=[sold_col]).set_index(p_col)[sold_col]
+                    s_cnt = s_cnt[~s_cnt.index.duplicated(keep="last")].resample("ME").last().dropna()
+                    s = (s_cnt.pct_change(12) * 100.0).dropna()
+                elif y_col:
+                    sub[y_col] = pd.to_numeric(sub[y_col], errors="coerce")
+                    s = sub.dropna(subset=[y_col]).set_index(p_col)[y_col]
+                    s = s[~s.index.duplicated(keep="last")].resample("ME").last().dropna()
+                    if not s.empty and s.abs().max() <= 3.0:
+                        s = s * 100.0
+                else:
+                    s = pd.Series(dtype=float)
+
                 redfin_s = s[s.index >= "2019-01-01"]
-                print(f"[OK] Redfin 成屋销售同比拉取成功 ({len(redfin_s)} 个月, 最新: {redfin_s.index[-1].strftime('%Y-%m-%d')})")
+                if not redfin_s.empty:
+                    print(f"[OK] Redfin 成屋销售同比拉取成功 ({len(redfin_s)} 个月, 最新: {redfin_s.index[-1].strftime('%Y-%m-%d')})")
     except Exception as e:
         print(f"[Info] Redfin 通道回退至 FRED: {e}")
 
@@ -140,14 +161,13 @@ def fetch_existing_home_sales_yoy() -> pd.Series:
 def fetch_ism_pmi() -> tuple:
     """
     获取真实连续的美国 ISM 制造业 PMI 与非制造业 PMI（50为荣枯线）：
-    1) 清洗 DBnomics 有效区间（剔除 2025 年末后抓取错误的 <25 脏值）；
+    1) 清洗 DBnomics 有效区间（剔除抓取错误的 <28 脏值）；
     2) 从 TradingEconomics 抓取最新月度 ISM 制造业与服务业 PMI 历史数组拼接补全；
     3) 若外部网页受限，使用 FRED 美联储工业产出/扩散景气指标映射校准确保不断线。
     """
     def _clean_pmi_series(s: pd.Series) -> pd.Series:
         if s is None or s.empty:
             return pd.Series(dtype=float)
-        # 真实 ISM PMI 历史区间在 30 ~ 72 之间，剔除明显异常脏值
         s = s[(s >= 28.0) & (s <= 75.0)]
         return s[~s.index.duplicated(keep="last")].sort_index()
 
@@ -177,7 +197,6 @@ def fetch_ism_pmi() -> tuple:
             r = requests.get(te_url, headers=HEADERS, timeout=20)
             if r.status_code != 200:
                 return pd.Series(dtype=float)
-            # 匹配 TradingEconomics 内嵌时间序列 [timestamp_ms, value] 或日期字符串
             pairs = re.findall(r'\[\s*(\d{13})\s*,\s*(\d{2}(?:\.\d+)?)\s*\]', r.text)
             if len(pairs) >= 12:
                 records = []
@@ -200,7 +219,6 @@ def fetch_ism_pmi() -> tuple:
     svc_te = _get_te_series("https://tradingeconomics.com/united-states/non-manufacturing-pmi")
     svc_pmi = svc_te.combine_first(svc_db) if not svc_te.empty else svc_db
 
-    # 如果官方 ISM 抓取截止早于近 3 个月，使用 FRED 官方纽约联储+费城联储+达拉斯联储制造业综合景气指数对齐到 50 荣枯线标尺平滑衔接
     ny_mfg = fetch_fred("GACDISA066MSFRBNY", start_date="2019-01-01")
     philly_mfg = fetch_fred("GACDFSA066MSFRBPHI", start_date="2019-01-01")
     if not ny_mfg.empty and not philly_mfg.empty:
@@ -296,11 +314,9 @@ def compute_global_outflow_panic(ohlcv: dict, vix: pd.Series, credit_spread: pd.
         cmf_all[t] = (num / den) * 100.0
 
     cmf_w = cmf_all.resample("W-FRI").last().dropna(how="all")
-    # 同步净流出资产占比 (%)
     valid_cnt = cmf_w.notna().sum(axis=1).replace(0, np.nan)
     outflow_breadth = ((cmf_w < 0).sum(axis=1) / valid_cnt * 100.0).rename("同步净流出资产占比(%)")
 
-    # 跨资产平均净流出强度（将负向资金流转化为 0~100 压力分）
     avg_outflow_pressure = ((-cmf_w.mean(axis=1) + 15.0) / 30.0 * 100.0).clip(0, 100)
 
     vix_w = vix.resample("W-FRI").last().reindex(cmf_w.index).ffill(limit=6)
@@ -407,10 +423,8 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
 
 def fetch_institutional_equity_exposure() -> pd.DataFrame:
     """
-    修复图 15 缺少红线与蓝线问题：
-    由于 NAAIM 官网已转为付费订阅制，改用美国 CFTC 官方每周《金融机构持仓报告》(TFF - Traders in Financial Futures)
-    中「Asset Manager / Institutional（共同基金、养老金、保险、资管机构）」标普500期货真实多头占比(%)
-    及其 20周移动平均线(%)，100% 官方真实机构仓位数据且每周连续更新！
+    美国 CFTC 官方每周《金融机构持仓报告》(TFF - Traders in Financial Futures)
+    「Asset Manager / Institutional（共同基金、养老金、保险、资管机构）」标普500期货真实多头占比(%) 及其 20周均线(%)
     """
     try:
         year = datetime.now().year
@@ -550,8 +564,8 @@ def fetch_cftc_cot_all_assets() -> tuple:
             "nq": ("NASDAQ MINI|NASDAQ-100 Consolidated", "纳指100投机净持仓(万手)", "美股科技纳指机构净比(%)"),
             "ty": ("10-YEAR U.S. TREASURY NOTES - CHICAGO BOARD OF TRADE|UST 10Y NOTE - CHICAGO BOARD OF TRADE", None, "10年期美债机构净比(%)"),
             "gc": ("GOLD - COMMODITY EXCHANGE INC.", None, "实物黄金机构净比(%)"),
-            "cl": ("CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE", None, "WTI原油机构净比(%)"),
-            "dx": ("U.S. DOLLAR INDEX - ICE FUTURES U.S.", None, "美元指数机构净比(%)"),
+            "cl": ("WTI-PHYSICAL - NEW YORK MERCANTILE EXCHANGE|CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE", None, "WTI原油机构净比(%)"),
+            "dx": ("USD INDEX - ICE FUTURES U.S.|U.S. DOLLAR INDEX - ICE FUTURES U.S.", None, "美元指数机构净比(%)"),
         }
 
         net_hands_dict = {}
@@ -589,7 +603,7 @@ def fetch_cftc_cot_all_assets() -> tuple:
 
         hands_df = pd.concat(list(net_hands_dict.values()), axis=1, sort=True) if net_hands_dict else pd.DataFrame()
         ratio_df = pd.concat(list(net_ratio_dict.values()), axis=1, sort=True) if net_ratio_dict else pd.DataFrame()
-        print(f"[OK] CFTC 全球六大资产机构持仓与资金净比拉取成功 ({len(ratio_df)} 周, 最新: {ratio_df.index[-1].strftime('%Y-%m-%d')})")
+        print(f"[OK] CFTC 全球六大资产机构持仓与资金净比拉取成功 ({len(ratio_df)} 周, {list(ratio_df.columns)})")
         return hands_df, ratio_df
     except Exception as e:
         print(f"[Warning] CFTC COT 抓取异常: {e}")
@@ -651,7 +665,6 @@ def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=8) -> pd.DataFr
         first_valid = df[col].first_valid_index()
         last_valid = df[col].last_valid_index()
         if first_valid is not None and last_valid is not None:
-            # 内部区间按 max_ffill_steps 平滑连续填充，末端最多延续 6 周（覆盖月度宏观数据自然发布延迟）
             tail_limit_idx = min(global_end, last_valid + pd.Timedelta(weeks=6))
             sub = df.loc[first_valid:tail_limit_idx, col].ffill(limit=max_ffill_steps)
             df.loc[first_valid:tail_limit_idx, col] = sub
@@ -661,7 +674,7 @@ def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=8) -> pd.DataFr
 
 
 # ==========================================
-# 3. 组装全部 25 张图表（含新增机构真实流入/流出比 & 全球资产流出恐慌图）
+# 3. 组装全部 25 张图表（含机构全球流入/流出比 & 全球资产流出恐慌图）
 # ==========================================
 def build_all_charts() -> list:
     print(">>> 正在拉取市场行情、商品期货、AI板块与全球大类资产 ETF 数据...")
@@ -791,17 +804,14 @@ def build_all_charts() -> list:
         "DBC": "大宗商品(DBC)",
         "IBIT": "比特币ETF(IBIT)",
     }
-    # 图22时间拉长至 78 周（1.5 年完整周期）
     global_flow_df = compute_rolling_flow_intensity(ohlcv, global_flow_tickers, window=20, tail_weeks=78)
 
-    # 图23：大型机构在全球六大资产的真实流出/流入数据比（近 3 年 / 156 周）
     inst_global_ratio_df = (
         align_tail([cot_ratio_df[c] for c in cot_ratio_df.columns], freq="W-FRI", n=156, max_ffill_steps=4)
         if not cot_ratio_df.empty
         else pd.DataFrame()
     )
 
-    # 图24：全球资产流出恐慌指数与跨资产抛售压力图（近 3 年 / 156 周）
     outflow_panic_df = compute_global_outflow_panic(ohlcv, vix, credit_spread, n_weeks=156)
 
     charts = [
@@ -1019,7 +1029,7 @@ def build_all_charts() -> list:
             "left_title": "机构资管多头仓位占比 (%)",
             "right_title": "标普500点位",
             "what": "• 蓝线(左轴)：CFTC 资管机构(共同基金/养老金/保险)美股期货多头占比(%)\n• 红线(左轴)：机构多头占比20周移动均线(%)  • 黄线(右轴)：标普500指数",
-            "how": "真实追踪全球最大长线真金白银机构（Asset Managers）的每周实际多空仓位比例（替代已转为付费闭源的NAAIM调查）。当机构多头仓位接近极限高位时买盘枯竭；当机构砍仓至低位时卖压出清。",
+            "how": "真实追踪全球最大长线真金白银机构（Asset Managers）的每周实际多空仓位比例。当机构多头仓位接近极限高位时买盘枯竭；当机构砍仓至低位时卖压出清。",
             "changes": "• 蓝线升至 82%~88% 极端高位且贴近红线：机构做多仓位极度拥挤，后续增量买盘受限，警惕技术性回调\n• 蓝线大幅下穿红线并回落至 65% 以下：机构集中去杠杆砍仓，抛压充分释放，酝酿中期反弹\n• 黄线创新高但蓝线持续低于红线：机构在指数上涨过程中悄然减仓派发，注意顶部背离",
             "signal": "🎯 逆向阈值：机构多头占比 ≥ 85% 警惕仓位拥挤回调；跌破 65% 往往对应机构出清后的波段买点。",
         },
@@ -1115,7 +1125,7 @@ def build_all_charts() -> list:
             "changes": "• 蓝/红/黄三线集体抬头跑赢大盘：典型的「Risk-Off 避险预警」，说明机构正在撤出高波动股票转向防御\n• 绿线(房地产XLRE)与黄线(公用事业XLU)同步走强：市场正在交易美债收益率下行与降息周期\n• 三大防御板块持续单边下行：市场风险偏好极强，资金全线进攻",
             "signal": "🚨 避险警报：当必需消费(XLP)与公用事业(XLU)连续数周显著跑赢科技(XLK)时，大盘往往面临系统性回调压力。",
         },
-        # --- 五、核心焦点扩展模块（共4张：AI强弱 + 全球78周资金流 + 大型机构全球流出/流入真实比 + 全球资产流出恐慌图） ---
+        # --- 五、核心焦点扩展模块 ---
         {
             "id": "21",
             "category": "扩展",
@@ -1281,7 +1291,6 @@ def compute_axis_bounds(df: pd.DataFrame, cols: list, is_column: bool = False) -
 def render_to_google_sheets(charts: list, ai_summary: str):
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # 25 张图 + 5 个分类横幅 + 顶部标题区，总行数设为 740 行
     total_dash_rows = 740
     raw_rows_cap = 450
     raw_cols_cap = 220
@@ -1776,7 +1785,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             "chartType": chart_type,
             "legendPosition": "BOTTOM_LEGEND",
             "headerCount": 1,
-            "interpolateNulls": True,
             "axis": axes,
             "domains": [{
                 "domain": {
@@ -1795,6 +1803,8 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         }
         if is_col_chart:
             basic_chart_spec["stackedType"] = "NOT_STACKED"
+        else:
+            basic_chart_spec["interpolateNulls"] = True
 
         requests_batch.append({
             "addChart": {
