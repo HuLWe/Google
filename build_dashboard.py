@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import re
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -42,7 +43,7 @@ RAW_SHEET_NAME = "📁 底层数据明细"
 
 
 # ==========================================
-# 2. 真实数据抓取工具函数
+# 2. 真实数据抓取与资金流计算函数
 # ==========================================
 def fetch_fred(series_id: str, start_date: str = "2021-01-01") -> pd.Series:
     """从 St. Louis Fed (FRED) 拉取官方时间序列"""
@@ -75,13 +76,42 @@ def yoy_pct(s: pd.Series, periods: int = 12) -> pd.Series:
     return (s.pct_change(periods=periods) * 100).dropna()
 
 
-def fetch_yf_close(tickers: list, period: str = "4y") -> pd.DataFrame:
-    """批量拉取 Yahoo Finance 收盘价"""
-    df = yf.download(tickers, period=period, auto_adjust=True, progress=False)["Close"]
-    if isinstance(df, pd.Series):
-        df = df.to_frame(name=tickers[0])
-    df.index = pd.to_datetime(df.index).tz_localize(None)
-    return df.sort_index()
+def fetch_yf_ohlcv(tickers: list, period: str = "4y") -> dict:
+    """批量拉取 Yahoo Finance 完整 OHLCV 数据"""
+    raw = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+    data = {}
+    for field in ["Open", "High", "Low", "Close", "Volume"]:
+        df = raw[field].copy()
+        if isinstance(df, pd.Series):
+            df = df.to_frame(name=tickers[0])
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        data[field] = df.sort_index()
+    return data
+
+
+def compute_rolling_dollar_flow(ohlcv: dict, ticker_labels: dict, window: int = 20) -> pd.DataFrame:
+    """
+    基于机构级 Chaikin Money Flow Dollar Volume 计算滚动资金净流入/流出 (单位: 亿美元)
+    公式: Daily Flow = [((Close - Low) - (High - Close)) / (High - Low)] * Volume * Close
+    """
+    high = ohlcv["High"]
+    low = ohlcv["Low"]
+    close = ohlcv["Close"]
+    vol = ohlcv["Volume"]
+
+    flow_df = pd.DataFrame(index=close.index)
+    for ticker, label in ticker_labels.items():
+        if ticker not in close.columns:
+            continue
+        hl_range = (high[ticker] - low[ticker]).replace(0, np.nan)
+        clv = ((close[ticker] - low[ticker]) - (high[ticker] - close[ticker])) / hl_range
+        clv = clv.fillna(0.0)
+        # 每日资金净流向（亿美元）
+        daily_flow_100m = (clv * vol[ticker] * close[ticker]) / 1e8
+        # 20个交易日（约1个月）滚动累计净流向
+        flow_df[label] = daily_flow_100m.rolling(window=window, min_periods=10).sum()
+
+    return flow_df.iloc[-250:].resample("W-FRI").last().dropna(how="all")
 
 
 def fetch_aaii_sentiment() -> pd.DataFrame:
@@ -98,7 +128,6 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
         df = raw[[date_col, bull_col, bear_col]].copy()
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
         df = df.dropna().set_index(date_col).sort_index()
-        # 若为小数(0.45)则转为百分比(45.0)
         if df[bull_col].max() <= 1.5:
             df[bull_col] *= 100
             df[bear_col] *= 100
@@ -106,12 +135,12 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
         ma20 = spread.rolling(20).mean().rename("20周均线(%)")
         return pd.concat([spread, ma20], axis=1).dropna()
     except Exception as e:
-        print(f"[Warning] AAII 数据抓取异常，启用备用回退: {e}")
+        print(f"[Warning] AAII 数据抓取异常: {e}")
         return pd.DataFrame()
 
 
 def fetch_naaim_exposure() -> pd.DataFrame:
-    """抓取 NAAIM 机构投资经理风险敞口"""
+    """抓取 NAAIM 机构投资经理风险敞口 (指定 bs4 解析器消除警告)"""
     try:
         page = requests.get(
             "https://www.naaim.org/programs/naaim-exposure-index/",
@@ -119,7 +148,7 @@ def fetch_naaim_exposure() -> pd.DataFrame:
             timeout=30,
         )
         page.raise_for_status()
-        tables = pd.read_html(io.StringIO(page.text))
+        tables = pd.read_html(io.StringIO(page.text), flavor="bs4")
         df = tables[0].copy()
         df.columns = [str(c).strip().lower() for c in df.columns]
         date_col = df.columns[0]
@@ -136,13 +165,17 @@ def fetch_naaim_exposure() -> pd.DataFrame:
 
 
 def fetch_cboe_put_call() -> pd.DataFrame:
-    """抓取 CBOE 股票看跌/看涨期权成交量比值"""
+    """抓取 CBOE 股票看跌/看涨期权成交量比值 (正则精准过滤顶部免责声明)"""
     try:
         url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv"
         r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
-        lines = [ln for ln in r.text.splitlines() if "/" in ln or "-" in ln]
-        df = pd.read_csv(io.StringIO("\n".join(lines)))
+        valid_lines = []
+        for ln in r.text.splitlines():
+            s = ln.strip()
+            if s.upper().startswith("DATE,") or re.match(r"^\d{1,2}/\d{1,2}/\d{4},", s):
+                valid_lines.append(s)
+        df = pd.read_csv(io.StringIO("\n".join(valid_lines)))
         df.columns = [str(c).strip().upper() for c in df.columns]
         date_col = df.columns[0]
         ratio_col = [c for c in df.columns if "RATIO" in c or "P/C" in c][-1]
@@ -206,7 +239,7 @@ def fetch_sp500_breadth() -> pd.DataFrame:
     """实时计算标普500成分股高于50日/200日均线的市场宽度比例"""
     try:
         r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=HEADERS, timeout=30)
-        sp_table = pd.read_html(io.StringIO(r.text))[0]
+        sp_table = pd.read_html(io.StringIO(r.text), flavor="bs4")[0]
         tickers = [t.replace(".", "-") for t in sp_table["Symbol"].tolist()]
         prices = yf.download(tickers, period="2y", auto_adjust=True, progress=False)["Close"]
         prices.index = pd.to_datetime(prices.index).tz_localize(None)
@@ -217,23 +250,31 @@ def fetch_sp500_breadth() -> pd.DataFrame:
         b50 = ((prices > ma50).sum(axis=1) / valid_50 * 100).rename("50日市场宽度(%)")
         b200 = ((prices > ma200).sum(axis=1) / valid_200 * 100).rename("200日市场宽度(%)")
         df = pd.concat([b50, b200], axis=1).dropna()
-        return df.iloc[-300:]  # 保留最近约1.2年交易日
+        return df.iloc[-300:]
     except Exception as e:
         print(f"[Warning] 市场宽度计算异常: {e}")
         return pd.DataFrame()
 
 
 # ==========================================
-# 4. 组装全部 20 张图表的数据与解读定义
+# 3. 组装全部 22 张图表的数据与读图指南
 # ==========================================
-def build_all_20_datasets() -> list:
-    print(">>> 正在拉取市场行情与商品期货数据 (Yahoo Finance)...")
+def build_all_charts() -> list:
+    print(">>> 正在拉取市场行情、商品期货、AI板块与全球大类资产 ETF 数据...")
     market_tickers = [
-        "^GSPC", "HG=F", "GC=F", "CL=F", "^VIX",
-        "VTI", "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC"
+        "^GSPC", "^NDX", "HG=F", "GC=F", "CL=F", "^VIX",
+        # 全市场与11大经济板块
+        "VTI", "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC",
+        # AI 板块与四大宽基指数
+        "SMH", "AIQ", "BOTZ", "SPY", "QQQ", "IWM", "DIA",
+        # 全球核心大类资产旗舰 ETF (美股、新兴市场、美债、黄金、商品、比特币)
+        "EEM", "TLT", "GLD", "DBC", "IBIT",
     ]
-    mkt = fetch_yf_close(market_tickers, period="4y").ffill()
+    ohlcv = fetch_yf_ohlcv(market_tickers, period="4y")
+    mkt = ohlcv["Close"].ffill()
+
     spx = mkt["^GSPC"].rename("标普500指数")
+    ndx = mkt["^NDX"].rename("纳斯达克100指数")
     copper_gold = (mkt["HG=F"] / mkt["GC=F"] * 1000).rename("铜金比(×1000)")
     oil_gold = (mkt["CL=F"] / mkt["GC=F"] * 100).rename("油金比(×100)")
 
@@ -298,7 +339,7 @@ def build_all_20_datasets() -> list:
             df = df.resample(freq).last().dropna()
         return df.iloc[-n:]
 
-    # 板块相对强度 (标准化起点=100，便于同图直观对比强弱轮动)
+    # 图 20：完整 11 个经济部门 ETF 相对全市场 VTI 强弱 (起点=100)
     sector_map = {
         "XLK": "科技XLK",
         "XLF": "金融XLF",
@@ -307,16 +348,43 @@ def build_all_20_datasets() -> list:
         "XLP": "必需消费XLP(防御)",
         "XLE": "能源XLE",
         "XLI": "工业XLI",
+        "XLB": "原材料XLB",
         "XLU": "公用事业XLU(防御)",
+        "XLRE": "房地产XLRE",
         "XLC": "通讯XLC",
     }
     sec_df = pd.DataFrame(index=mkt.index)
     for code, label in sector_map.items():
-        rel = mkt[code] / mkt["VTI"]
-        rel = rel.dropna()
-        rel_recent = rel.iloc[-260:]
-        sec_df[label] = (rel_recent / rel_recent.iloc[0]) * 100
+        rel = (mkt[code] / mkt["VTI"]).dropna().iloc[-260:]
+        sec_df[label] = (rel / rel.iloc[0]) * 100
     sec_df = sec_df.resample("W-FRI").last().dropna()
+
+    # 图 21：AI 板块对比标普500及三大股指相对强弱比 (起点=100)
+    ai_ratio_pairs = [
+        ("SMH", "SPY", "AI芯片SMH / 标普SPY"),
+        ("AIQ", "SPY", "AI应用AIQ / 标普SPY"),
+        ("BOTZ", "SPY", "AI机器人BOTZ / 标普SPY"),
+        ("SMH", "QQQ", "AI芯片SMH / 纳指QQQ"),
+        ("SMH", "IWM", "AI芯片SMH / 罗素小盘IWM"),
+        ("SMH", "DIA", "AI芯片SMH / 道指DIA"),
+    ]
+    ai_df = pd.DataFrame(index=mkt.index)
+    for num, den, label in ai_ratio_pairs:
+        rel = (mkt[num] / mkt[den]).dropna().iloc[-260:]
+        ai_df[label] = (rel / rel.iloc[0]) * 100
+    ai_df = ai_df.resample("W-FRI").last().dropna()
+
+    # 图 22：全球六大核心资产 20日滚动资金净流入/流出 (亿美元)
+    global_flow_tickers = {
+        "SPY": "美股大盘(SPY)",
+        "QQQ": "美股科技(QQQ)",
+        "EEM": "新兴市场(EEM)",
+        "TLT": "美债长债(TLT)",
+        "GLD": "实物黄金(GLD)",
+        "DBC": "大宗商品(DBC)",
+        "IBIT": "比特币ETF(IBIT)",
+    }
+    global_flow_df = compute_rolling_dollar_flow(ohlcv, global_flow_tickers, window=20)
 
     charts = [
         # --- 一、消费端 ---
@@ -329,7 +397,7 @@ def build_all_20_datasets() -> list:
             "left_title": "申领人数 (人)",
             "right_title": "非农同比 (%)",
             "what": "• 蓝线：初次申领失业金人数（每周新增失业）\n• 红线：连续申领失业金人数（持续失业规模）\n• 黄线(右轴)：非农就业人数年度同比变化(%)",
-            "how": "美国70%GDP靠消费，就业是消费的源头。失业金曲线低位走平、非农同比稳健说明居民有持续收入；若初请/续请连续飙升且非农同比快速下滑，说明劳动力市场开始恶化。",
+            "how": "美国70%GDP靠消费，就业是消费的源头。失业金曲线低位走平、非农同比稳健说明居民有持续收入；若初请/续请连续飙升且非农同比快速下滑，说明劳动力市场恶化。",
             "signal": "⚠️ 预警信号：初请失业金持续突破 30万人 且续请同步抬头，往往预示消费即将降温。",
         },
         {
@@ -365,7 +433,7 @@ def build_all_20_datasets() -> list:
             "left_title": "销量(百万辆) / 同比(%)",
             "right_title": "二手车指数",
             "what": "• 蓝线：全美汽车月度折年销量(百万辆)\n• 红线：汽车销量同比增速(%)\n• 黄线(右轴)：二手车价格指数",
-            "how": "汽车是第二大耐用消费品。供应链正常时，销量稳定在 1500~1700 万辆区间；若二手车价格指数飙升（如2021年缺芯），会推高核心CPI并迫使消费者观望。",
+            "how": "汽车是第二大耐用消费品。供应链正常时，销量稳定在 1500~1700 万辆区间；若二手车价格指数飙升（如缺芯期），会推高核心CPI并迫使消费者观望。",
             "signal": "💡 观察要点：二手车价格回落 + 汽车销量同比转正，代表大件消费恢复且商品通胀缓和。",
         },
         {
@@ -420,12 +488,12 @@ def build_all_20_datasets() -> list:
         {
             "id": "09",
             "category": "供给",
-            "title": "09. 铜金比与PPI (Industrial & PPI)",
-            "df": align_tail([copper_gold, ppi_yoy], freq="W-FRI", n=156),
-            "right_cols": ["PPI出厂价格同比(%)"],
+            "title": "09. 铜金比与PPI/PMI (Industrial & PPI)",
+            "df": align_tail([copper_gold, ppi_yoy, mfg_pmi], freq="W-FRI", n=156),
+            "right_cols": ["PPI出厂价格同比(%)", "制造业景气PMI指数"],
             "left_title": "铜金比 (×1000)",
-            "right_title": "PPI同比 (%)",
-            "what": "• 蓝线：铜金比（铜期货 ÷ 黄金期货 ×1000）\n• 红线(右轴)：工业品出厂价格指数 PPI 同比(%)",
+            "right_title": "PPI同比(%) / PMI指数",
+            "what": "• 蓝线：铜金比（铜期货 ÷ 黄金期货 ×1000）\n• 红线(右轴)：工业品出厂价格指数 PPI 同比(%)\n• 黄线(右轴)：制造业景气 PMI 指数",
             "how": "铜代表全球工业需求，黄金代表避险情绪。铜金比衡量「隐含风险溢价的工业景气度」，是 PPI 与制造业 PMI 的高频先行指标。",
             "signal": "💡 领先规律：铜金比持续走强，预示未来几个月工业景气回升、PPI 通胀压力抬头。",
         },
@@ -539,13 +607,13 @@ def build_all_20_datasets() -> list:
             "id": "18",
             "category": "市场",
             "title": "18. Nasdaq 100 投机者持仓 (CFTC COT)",
-            "df": align_tail([cot_df["纳指100投机净持仓(手)"], spx], freq="W-FRI", n=156)
+            "df": align_tail([cot_df["纳指100投机净持仓(手)"], ndx], freq="W-FRI", n=156)
             if not cot_df.empty and "纳指100投机净持仓(手)" in cot_df
-            else align_tail([spx], freq="W-FRI", n=156),
-            "right_cols": ["标普500指数"],
+            else align_tail([ndx], freq="W-FRI", n=156),
+            "right_cols": ["纳斯达克100指数"],
             "left_title": "非商业净持仓 (手)",
-            "right_title": "标普500点位",
-            "what": "• 蓝线：CFTC 纳斯达克100期货大型投机者净多空持仓\n• 红线(右轴)：标普500指数",
+            "right_title": "纳斯达克100点位",
+            "what": "• 蓝线：CFTC 纳斯达克100期货大型投机者净多空持仓\n• 红线(右轴)：纳斯达克100指数",
             "how": "对比图17，观察大型机构对「大型科技成长股」与「全市场大盘」的态度分化。",
             "signal": "💡 观察要点：若标普净空而纳指净多，说明资金抱团AI与科技龙头；若纳指多头极度拥挤则防科技股获利回吐。",
         },
@@ -566,521 +634,7 @@ def build_all_20_datasets() -> list:
         {
             "id": "20",
             "category": "市场",
-            "title": "20. 美股板块相对强度轮动 (Sector Rotation)",
+            "title": "20. 美股11大板块相对强度轮动 (11 Sectors)",
             "df": sec_df,
             "right_cols": [],
-            "left_title": "相对VTI强弱指数 (起点=100)",
-            "right_title": "",
-            "what": "• 各行业ETF ÷ 全市场ETF(VTI) 标准化强弱比值\n• 进攻板块：科技XLK、可选消费XLY、金融XLF\n• 防御板块：必需消费XLP、医疗XLV、公用事业XLU",
-            "how": "比值上升代表该板块跑赢大盘，比值下降代表跑输大盘。通过防御板块与进攻板块的跷跷板，判断主力资金的风险偏好。",
-            "signal": "🎯 轮动策略：必需消费/医疗/公用事业走强＝Risk-Off（避险防御）；科技/可选消费走强＝Risk-On（积极进攻）。",
-        },
-    ]
-    return charts
-
-
-# ==========================================
-# 5. 调用 OpenAI 生成顶部实时宏观简评
-# ==========================================
-def generate_ai_summary(charts: list) -> str:
-    metrics_snapshot = []
-    for c in charts:
-        df = c["df"]
-        if df.empty:
-            continue
-        last_row = df.iloc[-1]
-        date_str = df.index[-1].strftime("%Y-%m-%d")
-        vals = ", ".join([f"{col}={last_row[col]:.2f}" for col in df.columns[:4]])
-        metrics_snapshot.append(f"{c['title']} ({date_str}): {vals}")
-    context_text = "\n".join(metrics_snapshot)
-
-    if OPENAI_API_KEY:
-        try:
-            prompt = (
-                "你是资深美股宏观与量化策略师。请根据以下最新拉取的20张核心图表数据快照，"
-                "用简洁有力的中文写一段180字以内的【本期宏观与市场状态总评】，依次点明："
-                "1) 消费与供给趋势；2) 利率与信用风险；3) 市场情绪/宽度与当前处于Risk-On还是Risk-Off。\n\n"
-                f"{context_text}"
-            )
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_API_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "messages": [{"role": "user", "content": prompt}],
-                    "temperature": 0.3,
-                    "max_tokens": 350,
-                },
-                timeout=30,
-            )
-            if resp.status_code == 200:
-                return resp.json()["choices"][0]["message"]["content"].strip()
-        except Exception as e:
-            print(f"[Warning] OpenAI 摘要生成失败，切换至规则摘要: {e}")
-
-    # 规则降级摘要
-    return (
-        "数据已自动同步至最新交易日。请重点核查：① 纽约联储WEI指数是否维持正值、油金/铜金比与通胀走向；"
-        "② 10年与2年期美债利率结构及CCC信用利差；③ 标普500 50日市场宽度是否触及85%过热区或15%超卖区，"
-        "结合防御板块(XLP/XLV/XLU)与科技板块(XLK)相对强度调整仓位。"
-    )
-
-
-# ==========================================
-# 6. 写入底层数据并渲染美观的 20 图看板
-# ==========================================
-def render_to_google_sheets(charts: list, ai_summary: str):
-    sh = gc.open_by_key(SPREADSHEET_ID)
-
-    # 创建或获取两个工作表
-    existing_titles = {ws.title: ws for ws in sh.worksheets()}
-    if DASH_SHEET_NAME not in existing_titles:
-        dash_ws = sh.add_worksheet(title=DASH_SHEET_NAME, rows=420, cols=16)
-    else:
-        dash_ws = existing_titles[DASH_SHEET_NAME]
-        dash_ws.resize(rows=420, cols=16)
-
-    if RAW_SHEET_NAME not in existing_titles:
-        raw_ws = sh.add_worksheet(title=RAW_SHEET_NAME, rows=400, cols=150)
-    else:
-        raw_ws = existing_titles[RAW_SHEET_NAME]
-        raw_ws.resize(rows=400, cols=150)
-
-    # 清除旧数据与旧图表
-    dash_ws.clear()
-    raw_ws.clear()
-
-    meta = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    delete_requests = []
-    for s in meta.get("sheets", []):
-        if s["properties"]["sheetId"] == dash_ws.id:
-            for ch in s.get("charts", []):
-                delete_requests.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
-    if delete_requests:
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID, body={"requests": delete_requests}
-        ).execute()
-
-    # ------------------------------------------
-    # A. 写入 Raw_Data 底层数据（按列块水平排布）
-    # ------------------------------------------
-    max_len = max((len(c["df"]) for c in charts if not c["df"].empty), default=10)
-    total_cols = sum((len(c["df"].columns) + 2) for c in charts)
-    raw_grid = [[""] * total_cols for _ in range(max_len + 2)]
-
-    col_cursor = 0
-    chart_ranges = {}  # 存储每个图表在 Raw_Data 中的列索引与行数
-
-    for c in charts:
-        df = c["df"]
-        if df.empty:
-            continue
-        n_rows = len(df)
-        n_cols = len(df.columns)
-        raw_grid[0][col_cursor] = c["title"]
-        raw_grid[1][col_cursor] = "日期"
-        for j, col_name in enumerate(df.columns):
-            raw_grid[1][col_cursor + 1 + j] = col_name
-
-        for i, (dt, row) in enumerate(df.iterrows()):
-            raw_grid[2 + i][col_cursor] = dt.strftime("%Y-%m-%d")
-            for j, val in enumerate(row):
-                raw_grid[2 + i][col_cursor + 1 + j] = None if pd.isna(val) else round(float(val), 4)
-
-        chart_ranges[c["id"]] = {
-            "start_col": col_cursor,
-            "num_series": n_cols,
-            "num_rows": n_rows,
-            "columns": list(df.columns),
-        }
-        col_cursor += n_cols + 2  # 留1列空白间隔
-
-    raw_ws.update(range_name="A1", values=raw_grid, value_input_option="USER_ENTERED")
-
-    # ------------------------------------------
-    # B. 构建 Dashboard 文本卡片与章节结构
-    # ------------------------------------------
-    tz_cst = timezone(timedelta(hours=8))
-    now_str = datetime.now(tz_cst).strftime("%Y-%m-%d %H:%M (UTC+8)")
-
-    dash_grid = [[""] * 14 for _ in range(410)]
-    dash_grid[1][1] = "📈 美股核心 20 张宏观与市场数据看板（消费 · 供给 · 利率 · 市场）"
-    dash_grid[2][1] = f"自动更新时间：{now_str}   |   数据来源：FRED 美联储数据库 · Yahoo Finance · AAII · NAAIM · CBOE · CFTC"
-    dash_grid[3][1] = f"🤖 AI 宏观与市场简评：{ai_summary}"
-
-    category_banners = {
-        "消费": ("一、消费端 (Consumption — 美国经济 70% 核心驱动，有工作才有收入与消费)", {"red": 0.11, "green": 0.29, "blue": 0.49}),
-        "供给": ("二、供给端 (Supply — 提前 3~6 个月预判供需缺口与通胀拐点的先行指标)", {"red": 0.08, "green": 0.42, "blue": 0.45}),
-        "利率": ("三、利率端 (Interest Rates — 资产定价之锚、曲线倒挂与系统性违约风险标杆)", {"red": 0.34, "green": 0.22, "blue": 0.48}),
-        "市场": ("四、市场端 (Market — 群体情绪极值反转、机构持仓拥挤度与板块轮动)", {"red": 0.13, "green": 0.42, "blue": 0.32}),
-    }
-
-    row_cursor = 5
-    current_cat = None
-    layout_blocks = []
-
-    for c in charts:
-        cat = c["category"]
-        if cat != current_cat:
-            current_cat = cat
-            banner_text, banner_color = category_banners[cat]
-            dash_grid[row_cursor][1] = banner_text
-            layout_blocks.append({"type": "section", "row": row_cursor, "color": banner_color})
-            row_cursor += 2
-
-        # 每个图表模块占据 17 行 (row_cursor 到 row_cursor + 16)
-        # 左侧 B:I 列 (col 1..8) 放置图表；右侧 J:M 列 (col 9..12) 放置读图指南卡片
-        r0 = row_cursor
-        dash_grid[r0][9] = f"📌 {c['title']} — 读图指南"
-        dash_grid[r0 + 1][9] = "【曲线分别代表什么】"
-        dash_grid[r0 + 2][9] = c["what"]
-        dash_grid[r0 + 6][9] = "【怎么看 / 核心逻辑】"
-        dash_grid[r0 + 7][9] = c["how"]
-        dash_grid[r0 + 12][9] = "【关键阈值与信号】"
-        dash_grid[r0 + 13][9] = c["signal"]
-
-        layout_blocks.append({
-            "type": "chart_card",
-            "row": r0,
-            "chart": c,
-            "color": category_banners[cat][1],
-        })
-        row_cursor += 18  # 留1行呼吸空隙
-
-    dash_ws.update(range_name="A1", values=dash_grid[: row_cursor + 5], value_input_option="USER_ENTERED")
-
-    # ------------------------------------------
-    # C. 批量发送排版样式 + 20张原生图表构建请求
-    # ------------------------------------------
-    dash_id = dash_ws.id
-    raw_id = raw_ws.id
-    requests_batch = []
-
-    # 1) 设置列宽 (A列边距, B:I列放图表总宽776px, J:M列放说明卡片总宽540px)
-    col_widths = [(0, 1, 24)] + [(i, i + 1, 97) for i in range(1, 9)] + [(i, i + 1, 135) for i in range(9, 13)]
-    for start_c, end_c, px in col_widths:
-        requests_batch.append({
-            "updateDimensionProperties": {
-                "range": {"sheetId": dash_id, "dimension": "COLUMNS", "startIndex": start_c, "endIndex": end_c},
-                "properties": {"pixelSize": px},
-                "fields": "pixelSize",
-            }
-        })
-
-    # 2) 隐藏网格线，使看板呈现现代卡片质感
-    requests_batch.append({
-        "updateSheetProperties": {
-            "properties": {"sheetId": dash_id, "gridProperties": {"hideGridlines": True}},
-            "fields": "gridProperties.hideGridlines",
-        }
-    })
-
-    # 3) 顶部大标题与 AI 简评卡片美化
-    requests_batch.extend([
-        {
-            "mergeCells": {
-                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 13},
-                "mergeType": "MERGE_ALL",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 13},
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.10, "green": 0.15, "blue": 0.23},
-                        "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 15, "bold": True},
-                        "verticalAlignment": "MIDDLE",
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": 1, "endIndex": 2},
-                "properties": {"pixelSize": 38},
-                "fields": "pixelSize",
-            }
-        },
-        {
-            "mergeCells": {
-                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 13},
-                "mergeType": "MERGE_ALL",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 13},
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 0.94, "green": 0.96, "blue": 0.98},
-                        "textFormat": {"foregroundColor": {"red": 0.25, "green": 0.30, "blue": 0.38}, "fontSize": 10},
-                        "verticalAlignment": "MIDDLE",
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
-            }
-        },
-        {
-            "mergeCells": {
-                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 13},
-                "mergeType": "MERGE_ALL",
-            }
-        },
-        {
-            "repeatCell": {
-                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 13},
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": {"red": 1.0, "green": 0.98, "blue": 0.90},
-                        "textFormat": {"foregroundColor": {"red": 0.15, "green": 0.15, "blue": 0.15}, "fontSize": 10, "bold": False},
-                        "wrapStrategy": "WRAP",
-                        "verticalAlignment": "MIDDLE",
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,textFormat,wrapStrategy,verticalAlignment)",
-            }
-        },
-        {
-            "updateDimensionProperties": {
-                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": 3, "endIndex": 4},
-                "properties": {"pixelSize": 52},
-                "fields": "pixelSize",
-            }
-        },
-    ])
-
-    # 4) 遍历四大类横幅与 20 个图表+读图卡片模块
-    for blk in layout_blocks:
-        r0 = blk["row"]
-        col_rgb = blk["color"]
-
-        if blk["type"] == "section":
-            requests_batch.extend([
-                {
-                    "mergeCells": {
-                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 13},
-                        "mergeType": "MERGE_ALL",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 13},
-                        "cell": {
-                            "userEnteredFormat": {
-                                "backgroundColor": col_rgb,
-                                "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 12, "bold": True},
-                                "verticalAlignment": "MIDDLE",
-                            }
-                        },
-                        "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
-                    }
-                },
-                {
-                    "updateDimensionProperties": {
-                        "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + 1},
-                        "properties": {"pixelSize": 32},
-                        "fields": "pixelSize",
-                    }
-                },
-            ])
-            continue
-
-        # 卡片右侧说明区 J:M (col 9..13) 合并单元格与美化
-        c = blk["chart"]
-        requests_batch.append({
-            "updateDimensionProperties": {
-                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + 17},
-                "properties": {"pixelSize": 22},
-                "fields": "pixelSize",
-            }
-        })
-
-        # 卡片标题栏 (r0)
-        requests_batch.extend([
-            {
-                "mergeCells": {
-                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 13},
-                    "mergeType": "MERGE_ALL",
-                }
-            },
-            {
-                "repeatCell": {
-                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 13},
-                    "cell": {
-                        "userEnteredFormat": {
-                            "backgroundColor": col_rgb,
-                            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 10, "bold": True},
-                            "verticalAlignment": "MIDDLE",
-                        }
-                    },
-                    "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
-                }
-            },
-        ])
-
-        # 三个小标题行 (r0+1, r0+6, r0+12) 与三个正文块 (r0+2..6, r0+7..12, r0+13..17)
-        sub_headers = [r0 + 1, r0 + 6, r0 + 12]
-        for sr in sub_headers:
-            requests_batch.extend([
-                {
-                    "mergeCells": {
-                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 13},
-                        "mergeType": "MERGE_ALL",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 13},
-                        "cell": {
-                            "userEnteredFormat": {
-                                "backgroundColor": {"red": 0.93, "green": 0.95, "blue": 0.98},
-                                "textFormat": {"foregroundColor": col_rgb, "fontSize": 9, "bold": True},
-                                "verticalAlignment": "MIDDLE",
-                            }
-                        },
-                        "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
-                    }
-                },
-            ])
-
-        body_blocks = [(r0 + 2, r0 + 6), (r0 + 7, r0 + 12), (r0 + 13, r0 + 17)]
-        for idx_b, (br_start, br_end) in enumerate(body_blocks):
-            bg = {"red": 0.99, "green": 0.96, "blue": 0.95} if idx_b == 2 else {"red": 0.98, "green": 0.99, "blue": 1.0}
-            requests_batch.extend([
-                {
-                    "mergeCells": {
-                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 13},
-                        "mergeType": "MERGE_ALL",
-                    }
-                },
-                {
-                    "repeatCell": {
-                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 13},
-                        "cell": {
-                            "userEnteredFormat": {
-                                "backgroundColor": bg,
-                                "textFormat": {"foregroundColor": {"red": 0.15, "green": 0.18, "blue": 0.22}, "fontSize": 9},
-                                "wrapStrategy": "WRAP",
-                                "verticalAlignment": "TOP",
-                            }
-                        },
-                        "fields": "userEnteredFormat(backgroundColor,textFormat,wrapStrategy,verticalAlignment)",
-                    }
-                },
-            ])
-
-        # 为右侧读图卡片添加外边框
-        border_style = {"style": "SOLID", "width": 1, "color": {"red": 0.80, "green": 0.84, "blue": 0.90}}
-        requests_batch.append({
-            "updateBorders": {
-                "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 17, "startColumnIndex": 9, "endColumnIndex": 13},
-                "top": border_style,
-                "bottom": border_style,
-                "left": border_style,
-                "right": border_style,
-            }
-        })
-
-        # ------------------------------------------
-        # 构建左侧原生 Google Sheets 图表 (addChart)
-        # ------------------------------------------
-        info = chart_ranges.get(c["id"])
-        if not info:
-            continue
-
-        sc = info["start_col"]
-        nr = info["num_rows"]
-        cols = info["columns"]
-        right_set = set(c.get("right_cols", []))
-
-        axes = [
-            {"position": "BOTTOM_AXIS", "title": "日期"},
-            {"position": "LEFT_AXIS", "title": c["left_title"]},
-        ]
-        if right_set and any(col in right_set for col in cols):
-            axes.append({"position": "RIGHT_AXIS", "title": c["right_title"]})
-
-        series_specs = []
-        for j, col_name in enumerate(cols):
-            target_ax = "RIGHT_AXIS" if col_name in right_set else "LEFT_AXIS"
-            series_specs.append({
-                "series": {
-                    "sourceRange": {
-                        "sources": [{
-                            "sheetId": raw_id,
-                            "startRowIndex": 1,
-                            "endRowIndex": 2 + nr,
-                            "startColumnIndex": sc + 1 + j,
-                            "endColumnIndex": sc + 2 + j,
-                        }]
-                    }
-                },
-                "targetAxis": target_ax,
-            })
-
-        # 在图表副标题上直接浓缩写出【曲线代表什么 + 核心阈值】
-        short_sub = c["what"].replace("\n", " | ")
-        if len(short_sub) > 120:
-            short_sub = short_sub[:117] + "..."
-
-        requests_batch.append({
-            "addChart": {
-                "chart": {
-                    "spec": {
-                        "title": c["title"],
-                        "subtitle": short_sub,
-                        "basicChart": {
-                            "chartType": "LINE",
-                            "legendPosition": "BOTTOM_LEGEND",
-                            "headerCount": 1,
-                            "axis": axes,
-                            "domains": [{
-                                "domain": {
-                                    "sourceRange": {
-                                        "sources": [{
-                                            "sheetId": raw_id,
-                                            "startRowIndex": 1,
-                                            "endRowIndex": 2 + nr,
-                                            "startColumnIndex": sc,
-                                            "endColumnIndex": sc + 1,
-                                        }]
-                                    }
-                                }
-                            }],
-                            "series": series_specs,
-                        },
-                    },
-                    "position": {
-                        "overlayPosition": {
-                            "anchorCell": {"sheetId": dash_id, "rowIndex": r0, "columnIndex": 1},
-                            "offsetXPixels": 2,
-                            "offsetYPixels": 2,
-                            "widthPixels": 768,
-                            "heightPixels": 370,
-                        }
-                    },
-                }
-            }
-        })
-
-    # 分批提交 batchUpdate 防止单次请求过大
-    chunk_size = 60
-    for i in range(0, len(requests_batch), chunk_size):
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={"requests": requests_batch[i : i + chunk_size]},
-        ).execute()
-        time.sleep(1)
-
-    print("✅ 20 张美股核心图表与读图卡片已全部更新完毕！")
-
-
-if __name__ == "__main__":
-    all_charts = build_all_20_datasets()
-    summary = generate_ai_summary(all_charts)
-    render_to_google_sheets(all_charts, summary)
+            "left
