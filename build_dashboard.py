@@ -43,7 +43,7 @@ RAW_SHEET_NAME = "📁 底层数据明细"
 
 
 # ==========================================
-# 2. 真实数据抓取与资金流计算函数
+# 2. 真实数据抓取与资金流计算函数（带容错处理）
 # ==========================================
 def fetch_fred(series_id: str, start_date: str = "2021-01-01") -> pd.Series:
     """从 St. Louis Fed (FRED) 拉取官方时间序列"""
@@ -54,25 +54,33 @@ def fetch_fred(series_id: str, start_date: str = "2021-01-01") -> pd.Series:
         "file_type": "json",
         "observation_start": start_date,
     }
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    obs = r.json().get("observations", [])
-    records = []
-    for o in obs:
-        if o["value"] != ".":
-            records.append((pd.to_datetime(o["date"]), float(o["value"])))
-    if not records:
+    try:
+        r = requests.get(url, params=params, timeout=30)
+        if r.status_code != 200:
+            print(f"[Warning] FRED 指标 {series_id} 请求失败 ({r.status_code}): {r.text[:160]}")
+            return pd.Series(dtype=float, name=series_id)
+        obs = r.json().get("observations", [])
+        records = []
+        for o in obs:
+            if o["value"] != ".":
+                records.append((pd.to_datetime(o["date"]), float(o["value"])))
+        if not records:
+            return pd.Series(dtype=float, name=series_id)
+        s = pd.Series(
+            [v for _, v in records],
+            index=pd.DatetimeIndex([d for d, _ in records]),
+            name=series_id,
+        )
+        return s[~s.index.duplicated(keep="last")].sort_index()
+    except Exception as e:
+        print(f"[Warning] FRED 指标 {series_id} 拉取异常: {e}")
         return pd.Series(dtype=float, name=series_id)
-    s = pd.Series(
-        [v for _, v in records],
-        index=pd.DatetimeIndex([d for d, _ in records]),
-        name=series_id,
-    )
-    return s[~s.index.duplicated(keep="last")].sort_index()
 
 
 def yoy_pct(s: pd.Series, periods: int = 12) -> pd.Series:
     """计算同比变化百分比 (%)"""
+    if s is None or s.empty:
+        return pd.Series(dtype=float, name=getattr(s, "name", ""))
     return (s.pct_change(periods=periods) * 100).dropna()
 
 
@@ -106,9 +114,7 @@ def compute_rolling_dollar_flow(ohlcv: dict, ticker_labels: dict, window: int = 
         hl_range = (high[ticker] - low[ticker]).replace(0, np.nan)
         clv = ((close[ticker] - low[ticker]) - (high[ticker] - close[ticker])) / hl_range
         clv = clv.fillna(0.0)
-        # 每日资金净流向（亿美元）
         daily_flow_100m = (clv * vol[ticker] * close[ticker]) / 1e8
-        # 20个交易日（约1个月）滚动累计净流向
         flow_df[label] = daily_flow_100m.rolling(window=window, min_periods=10).sum()
 
     return flow_df.iloc[-250:].resample("W-FRI").last().dropna(how="all")
@@ -140,7 +146,7 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
 
 
 def fetch_naaim_exposure() -> pd.DataFrame:
-    """抓取 NAAIM 机构投资经理风险敞口 (指定 bs4 解析器消除警告)"""
+    """抓取 NAAIM 机构投资经理风险敞口"""
     try:
         page = requests.get(
             "https://www.naaim.org/programs/naaim-exposure-index/",
@@ -165,7 +171,7 @@ def fetch_naaim_exposure() -> pd.DataFrame:
 
 
 def fetch_cboe_put_call() -> pd.DataFrame:
-    """抓取 CBOE 股票看跌/看涨期权成交量比值 (正则精准过滤顶部免责声明)"""
+    """抓取 CBOE 股票看跌/看涨期权成交量比值"""
     try:
         url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv"
         r = requests.get(url, headers=HEADERS, timeout=30)
@@ -306,7 +312,10 @@ def build_all_charts() -> list:
 
     retail_yoy = yoy_pct(fetch_fred("RSAFS")).rename("总体零售同比(%)")
     ex_auto_yoy = yoy_pct(fetch_fred("RSXFS")).rename("核心连锁零售同比(%)")
-    ecom_yoy = yoy_pct(fetch_fred("MRTSSM4541USS")).rename("电商非实体零售同比(%)")
+    ecom_raw = fetch_fred("MRTSSM454USS")
+    if ecom_raw.empty:
+        ecom_raw = fetch_fred("MRTSSM4541USS")
+    ecom_yoy = yoy_pct(ecom_raw).rename("电商非实体零售同比(%)")
 
     # 供给端
     permit_yoy = yoy_pct(fetch_fred("PERMIT")).rename("建房许可同比(%)")
@@ -321,21 +330,27 @@ def build_all_charts() -> list:
     ppi_yoy = yoy_pct(fetch_fred("PPIACO")).rename("PPI出厂价格同比(%)")
     cpi_yoy = yoy_pct(fetch_fred("CPIAUCSL")).rename("CPI通胀同比(%)")
 
-    # 利率端
+    # 利率端（已修复 BAMLH0A3HYCEY 官方代码并增加回退）
     fed_rate = fetch_fred("DFF").rename("美联储政策利率(%)")
     dgs10 = fetch_fred("DGS10").rename("10年期美债收益率(%)")
     dgs5 = fetch_fred("DGS5").rename("5年期美债收益率(%)")
     dgs2 = fetch_fred("DGS2").rename("2年期美债收益率(%)")
     dgs3m = fetch_fred("DGS3MO").rename("3个月期美债利率(%)")
 
-    ccc_yield = fetch_fred("BAMLH0A3HYEY")
+    ccc_yield = fetch_fred("BAMLH0A3HYCEY")
     real_10y = fetch_fred("DFII10")
-    credit_spread = (ccc_yield - real_10y).dropna().rename("CCC级信用利差(%)")
+    if not ccc_yield.empty and not real_10y.empty:
+        credit_spread = (ccc_yield - real_10y).dropna().rename("CCC级信用利差(%)")
+    else:
+        credit_spread = fetch_fred("BAMLH0A3HYC").rename("CCC级信用利差(%)")
     vix = mkt["^VIX"].rename("VIX恐慌指数")
 
     def align_tail(series_list, freq="W-FRI", n=156):
-        df = pd.concat(series_list, axis=1).sort_index().ffill().dropna()
-        if freq:
+        valid_series = [s for s in series_list if s is not None and not s.empty]
+        if not valid_series:
+            return pd.DataFrame()
+        df = pd.concat(valid_series, axis=1).sort_index().ffill().dropna()
+        if freq and not df.empty:
             df = df.resample(freq).last().dropna()
         return df.iloc[-n:]
 
@@ -374,7 +389,7 @@ def build_all_charts() -> list:
         ai_df[label] = (rel / rel.iloc[0]) * 100
     ai_df = ai_df.resample("W-FRI").last().dropna()
 
-    # 图 22：全球六大核心资产 20日滚动资金净流入/流出 (亿美元)
+    # 图 22：全球七大核心资产 20日滚动资金净流入/流出 (亿美元)
     global_flow_tickers = {
         "SPY": "美股大盘(SPY)",
         "QQQ": "美股科技(QQQ)",
@@ -643,7 +658,7 @@ def build_all_charts() -> list:
             "how": "比值上升代表该板块跑赢大盘，比值下降代表跑输大盘。通过防御板块与进攻板块的跷跷板，判断主力资金的风险偏好。",
             "signal": "🎯 轮动策略：必需消费/医疗/公用事业走强＝Risk-Off（避险防御）；科技/可选消费走强＝Risk-On（积极进攻）。",
         },
-        # --- 五、进阶扩展模块 (AI板块强弱比 & 全球大类资产资金流向) ---
+        # --- 五、进阶扩展模块 ---
         {
             "id": "21",
             "category": "扩展",
@@ -727,7 +742,6 @@ def generate_ai_summary(charts: list) -> str:
 def render_to_google_sheets(charts: list, ai_summary: str):
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # 22张图表约需 425 行，预留 470 行确保充足空间
     existing_titles = {ws.title: ws for ws in sh.worksheets()}
     if DASH_SHEET_NAME not in existing_titles:
         dash_ws = sh.add_worksheet(title=DASH_SHEET_NAME, rows=470, cols=16)
