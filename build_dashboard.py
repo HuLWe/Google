@@ -637,4 +637,526 @@ def build_all_charts() -> list:
             "title": "20. 美股11大板块相对强度轮动 (11 Sectors)",
             "df": sec_df,
             "right_cols": [],
-            "left
+            "left_title": "相对VTI强弱指数 (起点=100)",
+            "right_title": "",
+            "what": "• 全部11个经济部门ETF ÷ 全市场VTI 标准化强弱比值\n• 进攻：科技XLK/可选XLY/金融XLF/通讯XLC/工业XLI/能源XLE/材料XLB/地产XLRE\n• 防御：必需消费XLP/医疗XLV/公用事业XLU",
+            "how": "比值上升代表该板块跑赢大盘，比值下降代表跑输大盘。通过防御板块与进攻板块的跷跷板，判断主力资金的风险偏好。",
+            "signal": "🎯 轮动策略：必需消费/医疗/公用事业走强＝Risk-Off（避险防御）；科技/可选消费走强＝Risk-On（积极进攻）。",
+        },
+        # --- 五、进阶扩展模块 (AI板块强弱比 & 全球大类资产资金流向) ---
+        {
+            "id": "21",
+            "category": "扩展",
+            "title": "21. AI板块对比标普与三大股指强弱比 (AI vs Indices)",
+            "df": ai_df,
+            "right_cols": [],
+            "left_title": "相对强弱指数 (1年前起点=100)",
+            "right_title": "",
+            "what": "• AI芯片SMH ÷ 标普SPY / 纳指QQQ / 罗素小盘IWM / 道指DIA\n• AI应用AIQ ÷ 标普SPY  |  AI机器人BOTZ ÷ 标普SPY",
+            "how": "衡量AI核心资产相对美股四大宽基的超额收益与资金虹吸效应。SMH/SPY持续走高代表AI算力领涨大盘；对比SMH/IWM与SMH/DIA可判断资金是抱团AI科技还是轮动至传统蓝筹与中小盘。",
+            "signal": "🎯 轮动信号：SMH/SPY 与 AIQ/SPY 同步创高＝AI主升浪；若 SMH/SPY 跌破趋势而 SMH/IWM 回落＝资金高低切换（从AI撤向中小盘/价值股）。",
+        },
+        {
+            "id": "22",
+            "category": "扩展",
+            "title": "22. 全球七大核心资产资金净流入/流出 (Global Flows)",
+            "df": global_flow_df,
+            "right_cols": [],
+            "left_title": "20日滚动资金净流向 (亿美元)",
+            "right_title": "",
+            "what": "• 旗舰ETF 20日滚动累计主动资金净流向（亿美元）：\n• 美股SPY、科技QQQ、新兴市场EEM、美债TLT、黄金GLD、商品DBC、比特币IBIT",
+            "how": "基于每日成交额与多空收盘强度的机构资金流模型。零轴(0)上方代表过去1个月买盘主导的净流入，零轴下方代表抛盘主导的净流出。",
+            "signal": "🎯 资金风向：SPY/QQQ/IBIT 同步净流入＝全球风险偏好极强；TLT/GLD 净流入而股市净流出＝全球大资金转向避险。",
+        },
+    ]
+    return charts
+
+
+# ==========================================
+# 4. 调用 OpenAI 生成顶部实时宏观简评
+# ==========================================
+def generate_ai_summary(charts: list) -> str:
+    metrics_snapshot = []
+    for c in charts:
+        df = c["df"]
+        if df.empty:
+            continue
+        last_row = df.iloc[-1]
+        date_str = df.index[-1].strftime("%Y-%m-%d")
+        vals = ", ".join([f"{col}={last_row[col]:.2f}" for col in df.columns[:4]])
+        metrics_snapshot.append(f"{c['title']} ({date_str}): {vals}")
+    context_text = "\n".join(metrics_snapshot)
+
+    if OPENAI_API_KEY:
+        try:
+            prompt = (
+                "你是资深美股宏观与量化策略师。请根据以下最新拉取的22张核心图表数据快照，"
+                "用简洁有力的中文写一段200字以内的【本期宏观、AI强弱与全球资金流总评】，依次点明："
+                "1) 消费与供给趋势；2) 利率与信用风险；3) 市场宽度、AI板块相对大盘强弱及全球主要资产净流入方向。\n\n"
+                f"{context_text}"
+            )
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "messages": [{"role": "user", "content": prompt}],
+                    "temperature": 0.3,
+                    "max_tokens": 380,
+                },
+                timeout=30,
+            )
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"[Warning] OpenAI 摘要生成失败，切换至规则摘要: {e}")
+
+    return (
+        "数据已自动同步至最新交易日。请重点核查：① 纽约联储WEI指数与油金/铜金比通胀方向；"
+        "② 10年与2年期美债利率倒挂状态及CCC信用利差；③ 标普500市场宽度是否触及85%/15%极区；"
+        "④ AI芯片(SMH)/应用(AIQ)相对标普SPY超额强弱，以及全球股/债/黄金/比特币20日资金净流向。"
+    )
+
+
+# ==========================================
+# 5. 写入底层数据并渲染美观的 22 图看板
+# ==========================================
+def render_to_google_sheets(charts: list, ai_summary: str):
+    sh = gc.open_by_key(SPREADSHEET_ID)
+
+    # 22张图表约需 425 行，预留 470 行确保充足空间
+    existing_titles = {ws.title: ws for ws in sh.worksheets()}
+    if DASH_SHEET_NAME not in existing_titles:
+        dash_ws = sh.add_worksheet(title=DASH_SHEET_NAME, rows=470, cols=16)
+    else:
+        dash_ws = existing_titles[DASH_SHEET_NAME]
+        dash_ws.resize(rows=470, cols=16)
+
+    if RAW_SHEET_NAME not in existing_titles:
+        raw_ws = sh.add_worksheet(title=RAW_SHEET_NAME, rows=420, cols=180)
+    else:
+        raw_ws = existing_titles[RAW_SHEET_NAME]
+        raw_ws.resize(rows=420, cols=180)
+
+    dash_ws.clear()
+    raw_ws.clear()
+
+    # 清除旧图表对象
+    meta = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
+    delete_requests = []
+    for s in meta.get("sheets", []):
+        if s["properties"]["sheetId"] == dash_ws.id:
+            for ch in s.get("charts", []):
+                delete_requests.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
+    if delete_requests:
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID, body={"requests": delete_requests}
+        ).execute()
+
+    # ------------------------------------------
+    # A. 写入 Raw_Data 底层数据
+    # ------------------------------------------
+    max_len = max((len(c["df"]) for c in charts if not c["df"].empty), default=10)
+    total_cols = sum((len(c["df"].columns) + 2) for c in charts)
+    raw_grid = [[""] * total_cols for _ in range(max_len + 2)]
+
+    col_cursor = 0
+    chart_ranges = {}
+
+    for c in charts:
+        df = c["df"]
+        if df.empty:
+            continue
+        n_rows = len(df)
+        n_cols = len(df.columns)
+        raw_grid[0][col_cursor] = c["title"]
+        raw_grid[1][col_cursor] = "日期"
+        for j, col_name in enumerate(df.columns):
+            raw_grid[1][col_cursor + 1 + j] = col_name
+
+        for i, (dt, row) in enumerate(df.iterrows()):
+            raw_grid[2 + i][col_cursor] = dt.strftime("%Y-%m-%d")
+            for j, val in enumerate(row):
+                raw_grid[2 + i][col_cursor + 1 + j] = None if pd.isna(val) else round(float(val), 4)
+
+        chart_ranges[c["id"]] = {
+            "start_col": col_cursor,
+            "num_series": n_cols,
+            "num_rows": n_rows,
+            "columns": list(df.columns),
+        }
+        col_cursor += n_cols + 2
+
+    raw_ws.update(range_name="A1", values=raw_grid, value_input_option="USER_ENTERED")
+
+    # ------------------------------------------
+    # B. 构建 Dashboard 文本卡片与章节结构
+    # ------------------------------------------
+    tz_cst = timezone(timedelta(hours=8))
+    now_str = datetime.now(tz_cst).strftime("%Y-%m-%d %H:%M (UTC+8)")
+
+    dash_grid = [[""] * 14 for _ in range(465)]
+    dash_grid[1][1] = "📈 美股核心 22 张宏观、AI强弱与全球资金流看板"
+    dash_grid[2][1] = f"自动更新时间：{now_str}   |   数据来源：FRED 美联储 · Yahoo Finance · AAII · NAAIM · CBOE · CFTC"
+    dash_grid[3][1] = f"🤖 AI 宏观与资金流总评：{ai_summary}"
+
+    category_banners = {
+        "消费": ("一、消费端 (Consumption — 美国经济 70% 核心驱动，有工作才有收入与消费)", {"red": 0.11, "green": 0.29, "blue": 0.49}),
+        "供给": ("二、供给端 (Supply — 提前 3~6 个月预判供需缺口与通胀拐点的先行指标)", {"red": 0.08, "green": 0.42, "blue": 0.45}),
+        "利率": ("三、利率端 (Interest Rates — 资产定价之锚、曲线倒挂与系统性违约风险标杆)", {"red": 0.34, "green": 0.22, "blue": 0.48}),
+        "市场": ("四、市场端 (Market — 群体情绪极值反转、机构持仓拥挤度与11大板块轮动)", {"red": 0.13, "green": 0.42, "blue": 0.32}),
+        "扩展": ("五、核心焦点扩展 (AI 板块对比各大股指相对强弱 & 全球七大资产资金净流入/流出)", {"red": 0.65, "green": 0.24, "blue": 0.14}),
+    }
+
+    row_cursor = 5
+    current_cat = None
+    layout_blocks = []
+
+    for c in charts:
+        cat = c["category"]
+        if cat != current_cat:
+            current_cat = cat
+            banner_text, banner_color = category_banners[cat]
+            dash_grid[row_cursor][1] = banner_text
+            layout_blocks.append({"type": "section", "row": row_cursor, "color": banner_color})
+            row_cursor += 2
+
+        r0 = row_cursor
+        dash_grid[r0][9] = f"📌 {c['title']} — 读图指南"
+        dash_grid[r0 + 1][9] = "【曲线分别代表什么】"
+        dash_grid[r0 + 2][9] = c["what"]
+        dash_grid[r0 + 6][9] = "【怎么看 / 核心逻辑】"
+        dash_grid[r0 + 7][9] = c["how"]
+        dash_grid[r0 + 12][9] = "【关键阈值与信号】"
+        dash_grid[r0 + 13][9] = c["signal"]
+
+        layout_blocks.append({
+            "type": "chart_card",
+            "row": r0,
+            "chart": c,
+            "color": category_banners[cat][1],
+        })
+        row_cursor += 18
+
+    dash_ws.update(range_name="A1", values=dash_grid[: row_cursor + 5], value_input_option="USER_ENTERED")
+
+    # ------------------------------------------
+    # C. 批量发送排版样式 + 22张原生图表构建请求
+    # ------------------------------------------
+    dash_id = dash_ws.id
+    raw_id = raw_ws.id
+    requests_batch = []
+
+    col_widths = [(0, 1, 24)] + [(i, i + 1, 97) for i in range(1, 9)] + [(i, i + 1, 138) for i in range(9, 13)]
+    for start_c, end_c, px in col_widths:
+        requests_batch.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": dash_id, "dimension": "COLUMNS", "startIndex": start_c, "endIndex": end_c},
+                "properties": {"pixelSize": px},
+                "fields": "pixelSize",
+            }
+        })
+
+    requests_batch.append({
+        "updateSheetProperties": {
+            "properties": {"sheetId": dash_id, "gridProperties": {"hideGridlines": True}},
+            "fields": "gridProperties.hideGridlines",
+        }
+    })
+
+    requests_batch.extend([
+        {
+            "mergeCells": {
+                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 13},
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 13},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.10, "green": 0.15, "blue": 0.23},
+                        "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 15, "bold": True},
+                        "verticalAlignment": "MIDDLE",
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": 1, "endIndex": 2},
+                "properties": {"pixelSize": 38},
+                "fields": "pixelSize",
+            }
+        },
+        {
+            "mergeCells": {
+                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 13},
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 13},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 0.94, "green": 0.96, "blue": 0.98},
+                        "textFormat": {"foregroundColor": {"red": 0.25, "green": 0.30, "blue": 0.38}, "fontSize": 10},
+                        "verticalAlignment": "MIDDLE",
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+            }
+        },
+        {
+            "mergeCells": {
+                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 13},
+                "mergeType": "MERGE_ALL",
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 13},
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {"red": 1.0, "green": 0.98, "blue": 0.90},
+                        "textFormat": {"foregroundColor": {"red": 0.15, "green": 0.15, "blue": 0.15}, "fontSize": 10},
+                        "wrapStrategy": "WRAP",
+                        "verticalAlignment": "MIDDLE",
+                    }
+                },
+                "fields": "userEnteredFormat(backgroundColor,textFormat,wrapStrategy,verticalAlignment)",
+            }
+        },
+        {
+            "updateDimensionProperties": {
+                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": 3, "endIndex": 4},
+                "properties": {"pixelSize": 56},
+                "fields": "pixelSize",
+            }
+        },
+    ])
+
+    for blk in layout_blocks:
+        r0 = blk["row"]
+        col_rgb = blk["color"]
+
+        if blk["type"] == "section":
+            requests_batch.extend([
+                {
+                    "mergeCells": {
+                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 13},
+                        "mergeType": "MERGE_ALL",
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 13},
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": col_rgb,
+                                "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 12, "bold": True},
+                                "verticalAlignment": "MIDDLE",
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+                    }
+                },
+                {
+                    "updateDimensionProperties": {
+                        "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + 1},
+                        "properties": {"pixelSize": 32},
+                        "fields": "pixelSize",
+                    }
+                },
+            ])
+            continue
+
+        c = blk["chart"]
+        requests_batch.append({
+            "updateDimensionProperties": {
+                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + 17},
+                "properties": {"pixelSize": 22},
+                "fields": "pixelSize",
+            }
+        })
+
+        requests_batch.extend([
+            {
+                "mergeCells": {
+                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                    "mergeType": "MERGE_ALL",
+                }
+            },
+            {
+                "repeatCell": {
+                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                    "cell": {
+                        "userEnteredFormat": {
+                            "backgroundColor": col_rgb,
+                            "textFormat": {"foregroundColor": {"red": 1, "green": 1, "blue": 1}, "fontSize": 10, "bold": True},
+                            "verticalAlignment": "MIDDLE",
+                        }
+                    },
+                    "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+                }
+            },
+        ])
+
+        for sr in [r0 + 1, r0 + 6, r0 + 12]:
+            requests_batch.extend([
+                {
+                    "mergeCells": {
+                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "mergeType": "MERGE_ALL",
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": {"red": 0.93, "green": 0.95, "blue": 0.98},
+                                "textFormat": {"foregroundColor": col_rgb, "fontSize": 9, "bold": True},
+                                "verticalAlignment": "MIDDLE",
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat,verticalAlignment)",
+                    }
+                },
+            ])
+
+        for idx_b, (br_start, br_end) in enumerate([(r0 + 2, r0 + 6), (r0 + 7, r0 + 12), (r0 + 13, r0 + 17)]):
+            bg = {"red": 0.99, "green": 0.96, "blue": 0.95} if idx_b == 2 else {"red": 0.98, "green": 0.99, "blue": 1.0}
+            requests_batch.extend([
+                {
+                    "mergeCells": {
+                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "mergeType": "MERGE_ALL",
+                    }
+                },
+                {
+                    "repeatCell": {
+                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "cell": {
+                            "userEnteredFormat": {
+                                "backgroundColor": bg,
+                                "textFormat": {"foregroundColor": {"red": 0.15, "green": 0.18, "blue": 0.22}, "fontSize": 9},
+                                "wrapStrategy": "WRAP",
+                                "verticalAlignment": "TOP",
+                            }
+                        },
+                        "fields": "userEnteredFormat(backgroundColor,textFormat,wrapStrategy,verticalAlignment)",
+                    }
+                },
+            ])
+
+        border_style = {"style": "SOLID", "width": 1, "color": {"red": 0.80, "green": 0.84, "blue": 0.90}}
+        requests_batch.append({
+            "updateBorders": {
+                "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 17, "startColumnIndex": 9, "endColumnIndex": 13},
+                "top": border_style,
+                "bottom": border_style,
+                "left": border_style,
+                "right": border_style,
+            }
+        })
+
+        info = chart_ranges.get(c["id"])
+        if not info:
+            continue
+
+        sc = info["start_col"]
+        nr = info["num_rows"]
+        cols = info["columns"]
+        right_set = set(c.get("right_cols", []))
+
+        axes = [
+            {"position": "BOTTOM_AXIS", "title": "日期"},
+            {"position": "LEFT_AXIS", "title": c["left_title"]},
+        ]
+        if right_set and any(col in right_set for col in cols):
+            axes.append({"position": "RIGHT_AXIS", "title": c["right_title"]})
+
+        series_specs = []
+        for j, col_name in enumerate(cols):
+            target_ax = "RIGHT_AXIS" if col_name in right_set else "LEFT_AXIS"
+            series_specs.append({
+                "series": {
+                    "sourceRange": {
+                        "sources": [{
+                            "sheetId": raw_id,
+                            "startRowIndex": 1,
+                            "endRowIndex": 2 + nr,
+                            "startColumnIndex": sc + 1 + j,
+                            "endColumnIndex": sc + 2 + j,
+                        }]
+                    }
+                },
+                "targetAxis": target_ax,
+            })
+
+        short_sub = c["what"].replace("\n", " | ")
+        if len(short_sub) > 120:
+            short_sub = short_sub[:117] + "..."
+
+        requests_batch.append({
+            "addChart": {
+                "chart": {
+                    "spec": {
+                        "title": c["title"],
+                        "subtitle": short_sub,
+                        "basicChart": {
+                            "chartType": "LINE",
+                            "legendPosition": "BOTTOM_LEGEND",
+                            "headerCount": 1,
+                            "axis": axes,
+                            "domains": [{
+                                "domain": {
+                                    "sourceRange": {
+                                        "sources": [{
+                                            "sheetId": raw_id,
+                                            "startRowIndex": 1,
+                                            "endRowIndex": 2 + nr,
+                                            "startColumnIndex": sc,
+                                            "endColumnIndex": sc + 1,
+                                        }]
+                                    }
+                                }
+                            }],
+                            "series": series_specs,
+                        },
+                    },
+                    "position": {
+                        "overlayPosition": {
+                            "anchorCell": {"sheetId": dash_id, "rowIndex": r0, "columnIndex": 1},
+                            "offsetXPixels": 2,
+                            "offsetYPixels": 2,
+                            "widthPixels": 768,
+                            "heightPixels": 370,
+                        }
+                    },
+                }
+            }
+        })
+
+    chunk_size = 60
+    for i in range(0, len(requests_batch), chunk_size):
+        sheets_service.spreadsheets().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"requests": requests_batch[i : i + chunk_size]},
+        ).execute()
+        time.sleep(1)
+
+    print("✅ 全部 22 张核心图表与读图指南卡片已更新完毕！")
+
+
+if __name__ == "__main__":
+    all_charts = build_all_charts()
+    summary = generate_ai_summary(all_charts)
+    render_to_google_sheets(all_charts, summary)
