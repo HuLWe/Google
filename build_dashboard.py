@@ -60,7 +60,7 @@ PALETTE = [
 # 2. 真实数据抓取与量化指标计算函数
 # ==========================================
 def fetch_fred(series_id: str, start_date: str = "2019-01-01") -> pd.Series:
-    """从 St. Louis Fed (FRED) 拉取官方时间序列"""
+    """从 St. Louis Fed (FRED) 拉取官方时间序列并做去重与数值校验"""
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
         "series_id": series_id,
@@ -95,7 +95,7 @@ def yoy_pct(s: pd.Series, periods: int = 12) -> pd.Series:
     """计算同比变化百分比 (%)"""
     if s is None or s.empty or len(s) <= periods:
         return pd.Series(dtype=float, name=getattr(s, "name", ""))
-    return (s.pct_change(periods=periods) * 100).dropna()
+    return (s.pct_change(periods=periods) * 100.0).replace([np.inf, -np.inf], np.nan).dropna()
 
 
 def fetch_existing_home_sales_yoy() -> pd.Series:
@@ -237,7 +237,7 @@ def fetch_ism_pmi() -> tuple:
 
 
 def fetch_yf_ohlcv(tickers: list, period: str = "5y") -> dict:
-    """批量拉取 Yahoo Finance 完整 OHLCV 数据"""
+    """批量拉取 Yahoo Finance 完整 OHLCV 数据并统一去除时区"""
     raw = yf.download(tickers, period=period, auto_adjust=True, progress=False, group_by="column")
     data = {}
     for field in ["Open", "High", "Low", "Close", "Volume"]:
@@ -247,14 +247,35 @@ def fetch_yf_ohlcv(tickers: list, period: str = "5y") -> dict:
             df = raw[[field]].copy()
             df.columns = [tickers[0]]
         df.index = pd.to_datetime(df.index).tz_localize(None)
-        data[field] = df.sort_index()
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        data[field] = df
     return data
+
+
+def normalize_to_common_base(series_dict: dict, tail_days: int = 252, freq: str = "W-FRI") -> pd.DataFrame:
+    """
+    修复跨市场基准日偏移隐患：
+    先将所有资产对齐到完全相同的共同交易日历并截取统一起点日 t0，
+    再统一除以 t0 当日收盘价 × 100，保证所有曲线在起点严格重合于 100.00！
+    """
+    valid = {k: v.dropna() for k, v in series_dict.items() if v is not None and not v.dropna().empty}
+    if not valid:
+        return pd.DataFrame()
+    df = pd.concat(valid, axis=1, sort=True).ffill(limit=4).dropna(how="any")
+    if df.empty:
+        return pd.DataFrame()
+    df = df.iloc[-tail_days:]
+    base_vals = df.iloc[0].replace(0, np.nan)
+    norm_df = (df / base_vals) * 100.0
+    if freq:
+        norm_df = norm_df.resample(freq).last().ffill(limit=3).dropna(how="all")
+    return norm_df
 
 
 def compute_monthly_flow_intensity(ohlcv: dict, ticker_labels: dict, window: int = 20, tail_months: int = 24) -> pd.DataFrame:
     """
     计算机构级 Chaikin Money Flow (CMF) 20日资金流净强弱指数 (%)，
-    并按月度聚合输出最近 tail_months 个月（默认 24 个月 = 2 年完整周期），确保柱状图宽大清晰、每根柱体一目了然！
+    并按月度聚合输出最近 24 个月（完整 2 年跨年度周期），确保每根柱宽清晰分明！
     """
     high = ohlcv["High"]
     low = ohlcv["Low"]
@@ -434,19 +455,16 @@ def fetch_institutional_equity_exposure() -> pd.DataFrame:
         am_short_col = [c for c in tff.columns if "Asset_Mgr_Positions_Short_All" in c][0]
 
         tff[date_col] = pd.to_datetime(tff[date_col])
+        tff[am_long_col] = pd.to_numeric(tff[am_long_col], errors="coerce")
+        tff[am_short_col] = pd.to_numeric(tff[am_short_col], errors="coerce")
+
         sp = tff[
-            tff[name_col].str.contains("E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE", case=False, na=False)
-            & ~tff[name_col].str.contains("MICRO", case=False, na=False)
+            tff[name_col].str.strip().str.match(r"^E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE$", case=False, na=False)
         ].copy()
-        sp = sp.set_index(date_col).sort_index()
+        sp = sp.dropna(subset=[am_long_col, am_short_col]).set_index(date_col).sort_index()
 
-        def _calc_ratio(row):
-            lg = float(row[am_long_col])
-            sh = float(row[am_short_col])
-            tot = lg + sh
-            return (lg / tot * 100.0) if tot > 0 else np.nan
-
-        exposure = sp.apply(_calc_ratio, axis=1).groupby(level=0).last().sort_index().rename("机构股票多头敞口(%)")
+        tot = (sp[am_long_col] + sp[am_short_col]).replace(0, np.nan)
+        exposure = (sp[am_long_col] / tot * 100.0).groupby(level=0).first().sort_index().rename("机构股票多头敞口(%)")
         ma20 = exposure.rolling(20, min_periods=5).mean().rename("20周均线(%)")
         res = pd.concat([exposure, ma20], axis=1, sort=True).dropna()
         print(f"[OK] CFTC 资管机构持仓敞口拉取成功 ({len(res)} 周, 最新: {res.index[-1].strftime('%Y-%m-%d')} = {res['机构股票多头敞口(%)'].iloc[-1]:.1f}%)")
@@ -476,7 +494,7 @@ def _fetch_single_cboe_day(d_str: str):
             elif "TOTAL PUT/CALL" in name:
                 total_val = float(val)
         chosen = equity_val if equity_val is not None else total_val
-        if chosen is not None:
+        if chosen is not None and 0.15 <= chosen <= 2.50:
             return (pd.to_datetime(d_str), chosen)
     except Exception:
         return None
@@ -484,12 +502,12 @@ def _fetch_single_cboe_day(d_str: str):
 
 
 def fetch_cboe_put_call() -> pd.DataFrame:
-    """并发直连 CBOE 官方每日市场统计 CDN 接口拉取真实 Put/Call 比值"""
+    """并发直连 CBOE 官方每日市场统计 CDN 接口拉取真实 Put/Call 比值并过滤极值异常"""
     try:
         today = datetime.now(timezone.utc).date()
         candidate_dates = [
             (today - timedelta(days=delta)).strftime("%Y-%m-%d")
-            for delta in range(0, 320)
+            for delta in range(0, 380)
             if (today - timedelta(days=delta)).weekday() < 5
         ]
         records = []
@@ -520,10 +538,8 @@ def fetch_cboe_put_call() -> pd.DataFrame:
 
 def fetch_cftc_cot_all_assets() -> tuple:
     """
-    抓取 CFTC 官方大型机构（非商业头寸）持仓：
-    - 严格剔除 MICRO 微型合约干扰（彻底修复黄金锯齿波）
-    - 新增 CME 比特币期货（BITCOIN - CHICAGO MERCANTILE EXCHANGE, CFTC #133741）
-    - 返回 (周度净持仓万手DataFrame, 全球七大资产机构真实流入/流出净比% DataFrame)
+    严格首尾锚定匹配 CFTC 官方标准主力合约（排除 ULTRA / MICRO / FINANCIAL 衍生合约串线）：
+    - 完整覆盖全球七大核心资产：标普500、纳指100、10年期美债、实物黄金、WTI原油、美元指数、比特币BTC
     """
     try:
         year = datetime.now().year
@@ -546,85 +562,77 @@ def fetch_cftc_cot_all_assets() -> tuple:
         date_col = [c for c in cot.columns if "As of Date in Form YYYY-MM-DD" in c][0]
         long_col = [c for c in cot.columns if "Noncommercial Positions-Long (All)" in c][0]
         short_col = [c for c in cot.columns if "Noncommercial Positions-Short (All)" in c][0]
-        cot[date_col] = pd.to_datetime(cot[date_col])
 
-        asset_patterns = {
-            "sp": (
-                r"E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE",
+        cot[date_col] = pd.to_datetime(cot[date_col])
+        cot[long_col] = pd.to_numeric(cot[long_col], errors="coerce")
+        cot[short_col] = pd.to_numeric(cot[short_col], errors="coerce")
+        cot["_clean_name"] = cot[name_col].astype(str).str.strip().str.upper()
+
+        # 按优先级有序匹配单一标准合约（若存在两个历史名称，按日期合并且不互相覆盖）
+        asset_configs = [
+            (
+                ["E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE"],
                 "标普500投机净持仓(万手)",
                 "美股标普500机构净比(%)",
             ),
-            "nq": (
-                r"NASDAQ MINI - CHICAGO MERCANTILE EXCHANGE|NASDAQ-100 Consolidated",
+            (
+                ["NASDAQ MINI - CHICAGO MERCANTILE EXCHANGE", "NASDAQ-100 CONSOLIDATED - CHICAGO MERCANTILE EXCHANGE"],
                 "纳指100投机净持仓(万手)",
                 "美股科技纳指机构净比(%)",
             ),
-            "ty": (
-                r"10-YEAR U\.S\. TREASURY NOTES - CHICAGO BOARD OF TRADE|UST 10Y NOTE - CHICAGO BOARD OF TRADE",
+            (
+                ["UST 10Y NOTE - CHICAGO BOARD OF TRADE", "10-YEAR U.S. TREASURY NOTES - CHICAGO BOARD OF TRADE"],
                 None,
                 "10年期美债机构净比(%)",
             ),
-            "gc": (
-                r"^GOLD - COMMODITY EXCHANGE INC\.",
+            (
+                ["GOLD - COMMODITY EXCHANGE INC."],
                 None,
                 "实物黄金机构净比(%)",
             ),
-            "cl": (
-                r"WTI-PHYSICAL - NEW YORK MERCANTILE EXCHANGE|CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE",
+            (
+                ["WTI-PHYSICAL - NEW YORK MERCANTILE EXCHANGE", "CRUDE OIL, LIGHT SWEET - NEW YORK MERCANTILE EXCHANGE"],
                 None,
                 "WTI原油机构净比(%)",
             ),
-            "dx": (
-                r"USD INDEX - ICE FUTURES U\.S\.|U\.S\. DOLLAR INDEX - ICE FUTURES U\.S\.",
+            (
+                ["USD INDEX - ICE FUTURES U.S.", "U.S. DOLLAR INDEX - ICE FUTURES U.S."],
                 None,
                 "美元指数机构净比(%)",
             ),
-            "btc": (
-                r"^BITCOIN - CHICAGO MERCANTILE EXCHANGE",
+            (
+                ["BITCOIN - CHICAGO MERCANTILE EXCHANGE"],
                 None,
                 "比特币BTC机构净比(%)",
             ),
-        }
+        ]
 
         net_hands_dict = {}
         net_ratio_dict = {}
 
-        for key, (pattern, hands_label, ratio_label) in asset_patterns.items():
-            sub = cot[
-                cot[name_col].str.strip().str.contains(pattern, case=False, na=False, regex=True)
-                & ~cot[name_col].str.contains("MICRO|CASH PERP", case=False, na=False)
-            ].copy()
-            if sub.empty:
-                continue
-            sub = sub.set_index(date_col).sort_index()
-            if hands_label:
-                s_hands = (
-                    sub.apply(lambda x: (float(x[long_col]) - float(x[short_col])) / 10000.0, axis=1)
-                    .groupby(level=0)
-                    .last()
-                    .sort_index()
-                    .rename(hands_label)
-                )
-                net_hands_dict[hands_label] = s_hands
+        for exact_names, hands_label, ratio_label in asset_configs:
+            combined_hands = pd.Series(dtype=float)
+            combined_ratio = pd.Series(dtype=float)
+            for cname in exact_names:
+                sub = cot[cot["_clean_name"] == cname].dropna(subset=[long_col, short_col]).set_index(date_col).sort_index()
+                if sub.empty:
+                    continue
+                if hands_label:
+                    s_h = ((sub[long_col] - sub[short_col]) / 10000.0).groupby(level=0).first()
+                    combined_hands = combined_hands.combine_first(s_h)
 
-            def _ratio_fn(x):
-                lg = float(x[long_col])
-                sh = float(x[short_col])
-                tot = lg + sh
-                return ((lg - sh) / tot * 100.0) if tot > 0 else np.nan
+                tot = (sub[long_col] + sub[short_col]).replace(0, np.nan)
+                s_r = ((sub[long_col] - sub[short_col]) / tot * 100.0).groupby(level=0).first()
+                combined_ratio = combined_ratio.combine_first(s_r)
 
-            s_ratio = (
-                sub.apply(_ratio_fn, axis=1)
-                .groupby(level=0)
-                .last()
-                .sort_index()
-                .rename(ratio_label)
-            )
-            net_ratio_dict[ratio_label] = s_ratio
+            if hands_label and not combined_hands.empty:
+                net_hands_dict[hands_label] = combined_hands.sort_index().rename(hands_label)
+            if not combined_ratio.empty:
+                net_ratio_dict[ratio_label] = combined_ratio.sort_index().rename(ratio_label)
 
         hands_df = pd.concat(list(net_hands_dict.values()), axis=1, sort=True) if net_hands_dict else pd.DataFrame()
         ratio_df = pd.concat(list(net_ratio_dict.values()), axis=1, sort=True) if net_ratio_dict else pd.DataFrame()
-        print(f"[OK] CFTC 全球七大资产机构持仓(含BTC)拉取成功 ({len(ratio_df)} 周, {list(ratio_df.columns)})")
+        print(f"[OK] CFTC 全球七大资产标准合约(含BTC)严格核验拉取成功 ({len(ratio_df)} 周, 列: {list(ratio_df.columns)})")
         return hands_df, ratio_df
     except Exception as e:
         print(f"[Warning] CFTC COT 抓取异常: {e}")
@@ -664,8 +672,8 @@ def fetch_sp500_breadth() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=8) -> pd.DataFrame:
-    """无断点连续对齐函数"""
+def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=10) -> pd.DataFrame:
+    """无断点连续对齐函数（支持月度发布滞后 10 周平滑衔接）"""
     valid_series = [s for s in series_list if s is not None and not s.empty]
     if not valid_series:
         return pd.DataFrame()
@@ -682,7 +690,7 @@ def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=8) -> pd.DataFr
         first_valid = df[col].first_valid_index()
         last_valid = df[col].last_valid_index()
         if first_valid is not None and last_valid is not None:
-            tail_limit_idx = min(global_end, last_valid + pd.Timedelta(weeks=6))
+            tail_limit_idx = min(global_end, last_valid + pd.Timedelta(weeks=10))
             sub = df.loc[first_valid:tail_limit_idx, col].ffill(limit=max_ffill_steps)
             df.loc[first_valid:tail_limit_idx, col] = sub
 
@@ -691,7 +699,7 @@ def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=8) -> pd.DataFr
 
 
 # ==========================================
-# 3. 组装全部 26 张图表与深度组合对比指南
+# 3. 组装全部 26 张图表与五段式深度指南
 # ==========================================
 def build_all_charts() -> list:
     print(">>> 正在拉取市场行情、商品期货、AI板块、美元指数与全球大类资产 ETF 数据...")
@@ -706,14 +714,13 @@ def build_all_charts() -> list:
 
     spx = mkt["^GSPC"].rename("标普500指数")
     ndx = mkt["^NDX"].rename("纳斯达克100指数")
-    copper_gold = (mkt["HG=F"] / mkt["GC=F"] * 1000).rename("铜金比(×1000)")
-    oil_gold = (mkt["CL=F"] / mkt["GC=F"] * 100).rename("油金比(×100)")
+    copper_gold = (mkt["HG=F"] / mkt["GC=F"] * 1000.0).rename("铜金比(×1000)")
+    oil_gold = (mkt["CL=F"] / mkt["GC=F"] * 100.0).rename("油金比(×100)")
 
-    # 美元指数 DXY 连续序列（DX-Y.NYB 优先，缺失部分由 UUP/FRED 广义美元指数平滑补齐）
     dxy_raw = mkt["DX-Y.NYB"].dropna() if "DX-Y.NYB" in mkt.columns else pd.Series(dtype=float)
     if dxy_raw.empty and "UUP" in mkt.columns:
         dxy_raw = mkt["UUP"].dropna()
-    dxy = dxy_raw.reindex(mkt.index).ffill(limit=5).rename("美元指数DXY")
+    dxy = dxy_raw.rename("美元指数DXY")
 
     print(">>> 正在拉取情绪、期权、CFTC七大资产持仓与市场宽度...")
     aaii_df = fetch_aaii_sentiment()
@@ -774,51 +781,37 @@ def build_all_charts() -> list:
         credit_spread = (ccc_y - dgs10).dropna().rename("CCC级高收益债信用利差(%)")
     vix = mkt["^VIX"].rename("VIX恐慌指数")
 
-    # 四、市场端：11大板块
-    offense_map = {
-        "XLK": "科技XLK",
-        "XLC": "通讯XLC",
-        "XLY": "可选消费XLY",
-        "XLF": "金融XLF",
-        "XLI": "工业XLI",
-        "XLE": "能源XLE",
+    # 四、市场端：11大板块（严格统一同一 t0 起点=100）
+    offense_raw = {
+        "科技XLK": mkt["XLK"] / mkt["VTI"],
+        "通讯XLC": mkt["XLC"] / mkt["VTI"],
+        "可选消费XLY": mkt["XLY"] / mkt["VTI"],
+        "金融XLF": mkt["XLF"] / mkt["VTI"],
+        "工业XLI": mkt["XLI"] / mkt["VTI"],
+        "能源XLE": mkt["XLE"] / mkt["VTI"],
     }
-    defense_map = {
-        "XLV": "医疗XLV(防御)",
-        "XLP": "必需消费XLP(防御)",
-        "XLU": "公用事业XLU(防御)",
-        "XLRE": "房地产XLRE",
-        "XLB": "原材料XLB",
+    sec_off_df = normalize_to_common_base(offense_raw, tail_days=252, freq="W-FRI")
+
+    defense_raw = {
+        "医疗XLV(防御)": mkt["XLV"] / mkt["VTI"],
+        "必需消费XLP(防御)": mkt["XLP"] / mkt["VTI"],
+        "公用事业XLU(防御)": mkt["XLU"] / mkt["VTI"],
+        "房地产XLRE": mkt["XLRE"] / mkt["VTI"],
+        "原材料XLB": mkt["XLB"] / mkt["VTI"],
     }
+    sec_def_df = normalize_to_common_base(defense_raw, tail_days=252, freq="W-FRI")
 
-    sec_off_df = pd.DataFrame(index=mkt.index)
-    for code, label in offense_map.items():
-        rel = (mkt[code] / mkt["VTI"]).dropna().iloc[-260:]
-        sec_off_df[label] = (rel / rel.iloc[0]) * 100.0
-    sec_off_df = sec_off_df.resample("W-FRI").last().ffill(limit=4).dropna(how="all")
+    # 五、扩展模块（严格统一同一 t0 起点=100）
+    ai_raw = {
+        "AI芯片SMH / 标普SPY": mkt["SMH"] / mkt["SPY"],
+        "AI应用AIQ / 标普SPY": mkt["AIQ"] / mkt["SPY"],
+        "AI机器人BOTZ / 标普SPY": mkt["BOTZ"] / mkt["SPY"],
+        "AI芯片SMH / 纳指QQQ": mkt["SMH"] / mkt["QQQ"],
+        "AI芯片SMH / 罗素小盘IWM": mkt["SMH"] / mkt["IWM"],
+        "AI芯片SMH / 道指DIA": mkt["SMH"] / mkt["DIA"],
+    }
+    ai_df = normalize_to_common_base(ai_raw, tail_days=378, freq="W-FRI")
 
-    sec_def_df = pd.DataFrame(index=mkt.index)
-    for code, label in defense_map.items():
-        rel = (mkt[code] / mkt["VTI"]).dropna().iloc[-260:]
-        sec_def_df[label] = (rel / rel.iloc[0]) * 100.0
-    sec_def_df = sec_def_df.resample("W-FRI").last().ffill(limit=4).dropna(how="all")
-
-    # 五、扩展模块（共5张：AI强弱 + 全球7大资产24个月资金流柱状图 + CFTC机构7大资产24个月净比柱状图 + 全球流出恐慌图 + 美元指数跨资产跷跷板对比图）
-    ai_ratio_pairs = [
-        ("SMH", "SPY", "AI芯片SMH / 标普SPY"),
-        ("AIQ", "SPY", "AI应用AIQ / 标普SPY"),
-        ("BOTZ", "SPY", "AI机器人BOTZ / 标普SPY"),
-        ("SMH", "QQQ", "AI芯片SMH / 纳指QQQ"),
-        ("SMH", "IWM", "AI芯片SMH / 罗素小盘IWM"),
-        ("SMH", "DIA", "AI芯片SMH / 道指DIA"),
-    ]
-    ai_df = pd.DataFrame(index=mkt.index)
-    for num, den, label in ai_ratio_pairs:
-        rel = (mkt[num] / mkt[den]).dropna().iloc[-390:]
-        ai_df[label] = (rel / rel.iloc[0]) * 100.0
-    ai_df = ai_df.resample("W-FRI").last().ffill(limit=4).dropna(how="all")
-
-    # 图22：全球七大核心资产 24个月（2年）月度资金净流入/流出强度柱状图（每根柱宽清晰易辨）
     global_flow_tickers = {
         "SPY": "美股大盘(SPY)",
         "QQQ": "美股科技(QQQ)",
@@ -830,18 +823,15 @@ def build_all_charts() -> list:
     }
     global_flow_df = compute_monthly_flow_intensity(ohlcv, global_flow_tickers, window=20, tail_months=24)
 
-    # 图23：大型机构在全球七大资产（含BTC）的真实流出/流入数据比（近 24 个月柱状图）
     inst_global_ratio_df = (
         cot_ratio_df.resample("ME").mean().dropna(how="all").iloc[-24:]
         if not cot_ratio_df.empty
         else pd.DataFrame()
     )
 
-    # 图24：全球资产流出恐慌指数与跨资产抛售压力图（近 3 年 / 156 周）
     outflow_panic_df = compute_global_outflow_panic(ohlcv, vix, credit_spread, n_weeks=156)
 
-    # 图25：新增！美元指数(DXY)强弱对比与全球五大核心资产跷跷板效应（近 2 年标准化对比，起点=100）
-    dxy_compare_map = {
+    dxy_compare_raw = {
         "美元指数DXY": dxy,
         "美股标普500(SPY)": mkt["SPY"],
         "新兴市场(EEM)": mkt["EEM"],
@@ -849,12 +839,7 @@ def build_all_charts() -> list:
         "美债长债(TLT)": mkt["TLT"],
         "比特币ETF(IBIT)": mkt["IBIT"],
     }
-    dxy_compare_df = pd.DataFrame(index=mkt.index)
-    for label, s_raw in dxy_compare_map.items():
-        s_clean = s_raw.dropna().iloc[-504:]  # 近2年约504个交易日
-        if not s_clean.empty and s_clean.iloc[0] != 0:
-            dxy_compare_df[label] = (s_clean / s_clean.iloc[0]) * 100.0
-    dxy_compare_df = dxy_compare_df.resample("W-FRI").last().ffill(limit=4).dropna(how="all").iloc[-104:]
+    dxy_compare_df = normalize_to_common_base(dxy_compare_raw, tail_days=504, freq="W-FRI")
 
     charts = [
         # --- 一、消费端 ---
@@ -867,10 +852,11 @@ def build_all_charts() -> list:
             "right_cols": ["非农就业同比(%)"],
             "left_title": "初请(万人) / 续请(十万人)",
             "right_title": "非农同比 (%)",
-            "what": "• 蓝线(左轴)：初请失业金人数(万人) —— 每周新增申领失业救济人数（裁员速度高频温度计）\n• 红线(左轴)：续请失业金人数(十万人) —— 连续两周及以上领取失业救济总规模（再就业难度指标）\n• 黄线(右轴)：美国非农就业总人数年度同比增速(%)",
-            "how": "美国70%GDP由个人消费贡献，薪资就业是消费扩张的底层水源。传导顺序严格遵循：「企业利润承压 → 冻结招聘并启动裁员（蓝线率先跳升）→ 失业人群滞留就业市场（红线延迟4~8周抬头）→ 非农总岗位增速下台阶（黄线趋势滑落）→ 居民削减消费」。",
-            "changes": "• 【组合① 蓝/红低位走平 + 黄线>1.2%】：黄金扩张组合，劳动力供需平衡，居民收入与消费动能稳健，美股盈利具备底部支撑。\n• 【组合② 蓝线急升(>26万) + 红线滞后抬头(>190万)】：典型「裁员扩散信号」，说明企业开始实质性缩编且失业者再就业受阻，未来1~2个季度零售与可选消费将明显降温。\n• 【组合③ 蓝/红高位钝化 + 黄线跌破0.8%向0%逼近】：萨姆规则(Sahm Rule)衰退预警触发区，市场将快速交易美联储大幅降息，美债长债(TLT)跑赢股票。\n• 【组合④ 蓝线脉冲冲高后迅速回落 + 黄线坚挺】：多为飓风、罢工或季节性扰动造成的假警报，不构成趋势反转。",
-            "signal": "⚠️ 量化风控阈值：初请失业金连续4周站上 28~30万人 且续请突破 200万人(红线>20.0)，同时非农同比跌破 0.8%，确认消费失速预警，建议增配防御板块(XLP/XLV)与美债。",
+            "what": "• 蓝线(左轴)：初请失业金人数(万人) —— 每周新增申领失业救济人数\n• 红线(左轴)：续请失业金人数(十万人) —— 连续两周及以上领取失业救济总规模\n• 黄线(右轴)：美国非农就业总人数年度同比增速(%)",
+            "up_down": "• 蓝线(初请)：上涨 = 企业裁员加速（利空经济）；下跌 = 裁员减少、用工稳健。\n• 红线(续请)：上涨 = 失业者再就业难度加大、失业周期拉长；下跌 = 劳动力市场吸纳能力强。\n• 黄线(非农同比)：上涨 = 全美总就业岗位加速扩张；下跌 = 招聘需求放缓、薪资消费水源收窄。",
+            "zones": "• ✅ 合理健康区间：初请 `19~24万人`、续请 `160~185万人(16.0~18.5)`、非农同比 `+1.0% ~ +2.2%`（充分就业且不引发恶性薪资通胀）。\n• 🚨 不合理/过热区间：初请 `<18万人` 且非农同比 `>+3.0%`（用工极度紧缺推高服务业通胀，迫使美联储紧缩）。\n• 🚨 不合理/衰退区间：初请 `>28万人` + 续请 `>200万人(红线>20)` + 非农同比 `<+0.8%`（裁员扩散，消费失速警报）。",
+            "changes": "• 【组合① 蓝/红低位走平 + 黄线>1.2%】：黄金扩张组合，居民收入与消费稳健，美股盈利有底。\n• 【组合② 蓝线急升(>26万) + 红线滞后抬头(>190万)】：裁员扩散信号，未来1~2个季度零售与可选消费明显降温。\n• 【组合③ 蓝/红高位钝化 + 黄线跌破0.8%向0%逼近】：萨姆规则衰退预警触发区，美债长债(TLT)跑赢股票。\n• 【组合④ 蓝线脉冲冲高后迅速回落 + 黄线坚挺】：多为飓风、罢工或季节性扰动，不构成趋势反转。",
+            "signal": "⚠️ 量化风控阈值：初请失业金连续4周站上 28万人 且续请突破 200万人(红线>20.0)，同时非农同比跌破 0.8%，确认消费失速预警，建议增配防御板块(XLP/XLV)与美债。",
         },
         {
             "id": "02",
@@ -881,9 +867,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "年度变化率 / 储蓄率 (%)",
             "right_title": "",
-            "what": "• 蓝线：个人总收入年度同比增速(%) —— 含薪资、股息利息及政府转移支付\n• 红线：个人消费支出(PCE)年度同比增速(%) —— 含商品与服务名义消费支出\n• 黄线：个人储蓄率(%) —— 税后可支配收入中未用于消费的留存比例（历史中枢约6%~7%）",
-            "how": "透视美国家庭资产负债表健康度的核心三棱镜。健康的可持续消费必须建立在「收入增速 ≥ 支出增速」的基础上；若支出长期跑赢收入，说明居民正在消耗超额储蓄或依赖20%+高息信用卡透支维持体面。",
-            "changes": "• 【组合① 蓝线 ≥ 红线 + 黄线稳居5.5%~8%】：健康内生增长组合，居民一边扩大消费一边积累财富，软着陆概率最高。\n• 【组合② 红线持续高于蓝线 + 黄线单边跌破4%】：「透支型消费陷阱」，家庭正在吃老本或借债消费，一旦储蓄率触及3%极限底线，消费将出现断崖式踩刹车。\n• 【组合③ 蓝线骤降 + 黄线被动跳升 + 红线暴跌】：预防性储蓄激增（衰退典型特征），居民因担忧失业而主动捂紧钱包，可选消费(XLY)与金融板块承压。\n• 【组合④ 蓝/红线同步维持5%以上高位】：名义收入与支出双过热，服务业通胀粘性强，美联储难以快速降息。",
+            "what": "• 蓝线：个人总收入年度同比增速(%) —— 含薪资、股息利息及政府转移支付\n• 红线：个人消费支出(PCE)年度同比增速(%) —— 含商品与服务名义消费支出\n• 黄线：个人储蓄率(%) —— 税后可支配收入中未用于消费的留存比例",
+            "up_down": "• 蓝线(个人收入)：上涨 = 家庭挣钱能力增强；下跌 = 薪资与经营性收入增速放缓。\n• 红线(消费支出)：上涨 = 居民花钱意愿与通胀名义支出扩大；下跌 = 消费支出收缩。\n• 黄线(储蓄率)：上涨 = 居民留存现金增多（主动积累财富或衰退期预防性囤钱）；下跌 = 居民消耗老本或借债消费。",
+            "zones": "• ✅ 合理健康区间：储蓄率 `5.0% ~ 7.5%`，且 `蓝线(收入增速) ≥ 红线(消费增速)`（量入为出的可持续内生增长）。\n• 🚨 不合理/过热区间：蓝/红线双双 `>+6.5%`（名义收支螺旋过热，服务业通胀顽固）。\n• 🚨 不合理/透支衰退区间：储蓄率 `<3.5%` 且 `红线 > 蓝线`（靠20%+高息信用卡透支维持消费，随时断崖）；或储蓄率骤升 `>9%` 伴随红线暴跌（衰退期恐慌捂钱包）。",
+            "changes": "• 【组合① 蓝线 ≥ 红线 + 黄线稳居5%~7.5%】：健康内生增长组合，软着陆概率最高。\n• 【组合② 红线持续高于蓝线 + 黄线单边跌破4%】：透支型消费陷阱，一旦储蓄率触及3%底线，消费将断崖刹车。\n• 【组合③ 蓝线骤降 + 黄线被动跳升 + 红线暴跌】：预防性储蓄激增（衰退典型特征），可选消费(XLY)承压。\n• 【组合④ 蓝/红线同步维持5%以上高位】：名义收入与支出双过热，美联储难以快速降息。",
             "signal": "⚠️ 量化风控阈值：个人储蓄率跌破 3.5% 且 消费增速(红线)高于收入增速(蓝线) 超过1.5个百分点，预示未来2个季度消费面临均值回归式收缩。",
         },
         {
@@ -895,9 +882,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "同比变化 (%)",
             "right_title": "",
-            "what": "• 蓝线：全美成屋销售量同比(%) —— 占美国房屋交易85%以上，反映二手房真实置换需求\n• 红线：全美新屋销售量同比(%) —— 开发商一手房签约量，对按揭利率与促销最敏感\n• 黄线：标普Case-Shiller 20大都市房价指数同比(%) —— 核心城市存量房价标杆\n• 绿线：全美新房销售中位价同比(%) —— 反映刚需新房定价与户型结构变化",
-            "how": "房地产是美国家庭第一大财富蓄水池，上下游拉动家电、建材、家具、银行按揭与地方税收。地产周期严格遵循「量在价先」铁律：成交量（蓝/红线）通常领先房价（黄/绿线）3~6个月见顶或筑底。",
-            "changes": "• 【组合① 蓝/红线由负转正上冲 + 黄/绿线仍在低位】：典型「量升价稳底部启动」，按揭利率回落释放积压刚需，预计3~6个月后核心都市房价(黄线)加速回升。\n• 【组合② 蓝/红线见顶大幅转负 + 黄线仍居高位】：典型「量缩价撑顶背离」，卖家惜售导致成交冰冻，随后房价将被迫降价补跌。\n• 【组合③ 红线明显强于蓝线 + 绿线走弱而黄线坚挺】：高利率锁死二手房房东置换意愿（不愿放弃3%低息房贷），买家被迫转向开发商降价促销的新房市场。\n• 【组合④ 四线全线深陷负值区】：地产深度去库周期，家居建材与地区银行信用风险承压。",
+            "what": "• 蓝线：全美成屋销售量同比(%) —— 二手房真实置换需求（占交易量85%以上）\n• 红线：全美新屋销售量同比(%) —— 开发商一手房签约量（对按揭利率最敏感）\n• 黄线：标普20大都市房价同比(%)  • 绿线：全美新房中位价同比(%)",
+            "up_down": "• 蓝/红线(成交量)：上涨 = 房贷利率回落或刚需入场，交易活跃（领先房价3~6个月）；下跌 = 高利率锁死流动性、成交萎缩。\n• 黄/绿线(房价)：上涨 = 家庭房产财富效应增强，但也推高未来CPI房租项；下跌 = 资产价格缩水与银行抵押物贬值。",
+            "zones": "• ✅ 合理健康区间：成屋/新屋销量同比 `0% ~ +12%`，20大都市房价同比 `+2.0% ~ +6.0%`（量价温和复苏且不引发房租二次通胀）。\n• 🚨 不合理/过热泡沫区间：房价同比 `>+12%`（购买力恶化且迫使央行维持高利率）。\n• 🚨 不合理/冰冻衰退区间：成屋与新屋销量同比双双 `<-15%` 或房价转负 `<-3%`（地产深度衰退）。",
+            "changes": "• 【组合① 蓝/红线由负转正上冲 + 黄/绿线仍在低位】：量升价稳底部启动，预计3~6个月后核心都市房价(黄线)加速回升。\n• 【组合② 蓝/红线见顶大幅转负 + 黄线仍居高位】：量缩价撑顶背离，成交冰冻后房价将被迫降价补跌。\n• 【组合③ 红线明显强于蓝线 + 绿线走弱而黄线坚挺】：高利率锁死二手房房东置换意愿，买家被迫转向开发商降价促销的新房。\n• 【组合④ 四线全线深陷负值区】：地产深度去库周期，家居建材与地区银行承压。",
             "signal": "💡 量化风控信号：新屋(红线)与成屋(蓝线)销售同比连续3个月站稳 0% 上方，是做多地产建筑商(ITB/XHB)与家装零售的右侧确认信号。",
         },
         {
@@ -909,9 +897,10 @@ def build_all_charts() -> list:
             "right_cols": ["二手车价格指数"],
             "left_title": "销量(百万辆) / 同比(%)",
             "right_title": "二手车CPI指数",
-            "what": "• 蓝线(左轴)：全美轻型汽车月度折年总销量(百万辆) —— 疫情前健康中枢为1650~1750万辆\n• 红线(左轴)：全美汽车销量年度同比增速(%)\n• 黄线(右轴)：美国CPI二手车与卡车价格指数 —— 核心商品通胀最敏感的领先风向标",
-            "how": "汽车是美国家庭仅次于住房的第二大耐用消费品，超过80%购车依赖车贷融资，因此对利率变化极为敏感。将销量与二手车CPI交叉对比，可同时研判大件消费意愿与美联储最关注的核心商品通胀走向。",
-            "changes": "• 【组合① 蓝线稳步攀升(>1600万辆) + 黄线温和下行】：最佳「无通胀复苏组合」，芯片与库存恢复顺畅、车价回归理性，刺激居民换车需求。\n• 【组合② 黄线暴涨 + 蓝线跌破1450万辆】：典型「供给瓶颈/高通胀滞胀组合」，车价飙升反噬购买力，同时推高核心CPI迫使美联储维持紧缩。\n• 【组合③ 蓝线跌破1400万辆 + 红线负增长 + 黄线加速下跌】：「需求坍塌式通缩」，高车贷利率与就业担忧全面抑制大件开支，车企被迫打价格战去库。\n• 【组合④ 红线转正但蓝线仍在1500万辆下方】：低基数下的弱修复，尚未恢复至充分扩张水平。",
+            "what": "• 蓝线(左轴)：全美轻型汽车月度折年总销量(百万辆)\n• 红线(左轴)：全美汽车销量年度同比增速(%)\n• 黄线(右轴)：美国CPI二手车与卡车价格指数",
+            "up_down": "• 蓝/红线(汽车销量)：上涨 = 居民大件耐用品消费信心强、车贷融资顺畅；下跌 = 高车贷利率或就业担忧抑制换车。\n• 黄线(二手车价)：上涨 = 供应链偏紧或车价反弹，推高核心商品CPI；下跌 = 车市供给充足、核心通胀降温。",
+            "zones": "• ✅ 合理健康区间：月度折年销量 `1600~1750万辆`、销量同比 `0% ~ +8%`、二手车指数温和下行或走平。\n• 🚨 不合理/通胀过热区间：黄线(二手车指数)单边急升（核心CPI反弹警报）。\n• 🚨 不合理/需求萎缩区间：蓝线(销量)跌破 `1400万辆` 且红线持续负增长（大件消费熄火）。",
+            "changes": "• 【组合① 蓝线稳步攀升(>1600万辆) + 黄线温和下行】：最佳无通胀复苏组合，车价回归理性刺激换车需求。\n• 【组合② 黄线暴涨 + 蓝线跌破1450万辆】：供给瓶颈/滞胀组合，车价飙升反噬购买力并推高核心CPI。\n• 【组合③ 蓝线跌破1400万辆 + 红线负增长 + 黄线加速下跌】：需求坍塌式通缩，车企被迫打价格战去库。\n• 【组合④ 红线转正但蓝线仍在1500万辆下方】：低基数下的弱修复，尚未恢复至充分扩张水平。",
             "signal": "💡 量化风控信号：二手车价格指数(黄线)持续下行是核心CPI降温的领先指标；月度折年销量重返 1600万辆 上方代表消费终端韧性强劲。",
         },
         {
@@ -923,9 +912,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "同比增速 (%)",
             "right_title": "",
-            "what": "• 蓝线：美国总体零售与食品服务销售额同比(%) —— 含汽车、加油站与餐饮消费\n• 红线：核心零售（剔除高波动汽车及零部件）同比(%) —— 反映日常商品与餐饮真实消费\n• 黄线：非实体店零售（以亚马逊/Shopify为代表的电商网购）同比(%)",
-            "how": "最直观追踪美国消费者日常刷卡热度的月度晴雨表。注意零售数据为「名义金额」，必须结合CPI通胀对比：若名义零售增速低于CPI，说明剔除涨价后的「实际消费量」已在萎缩。",
-            "changes": "• 【组合① 蓝/红线稳居3.5%~6% + 黄线维持8%~12%】：消费结构健康扩张，线上渗透率稳步提升，消费龙头与支付网络盈利稳健。\n• 【组合② 黄线(电商)逆势走强而红线(核心零售)走弱】：「消费降级与渠道迁移」，通胀压力下居民减少线下冲动购物，转向线上比价与折扣电商。\n• 【组合③ 蓝线大幅低于红线】：油价下跌或汽车销量疲软拖累表面数据，但核心日常消费依然坚挺，不宜误判为消费崩溃。\n• 【组合④ 蓝线与红线同步跌破1.5%甚至转负】：剔除通胀后实际消费全面负增长，企业营收下滑与经济衰退高度确立。",
+            "what": "• 蓝线：总体零售与食品服务销售额同比(%) —— 含汽车与加油站\n• 红线：核心零售(剔除高波动汽车)同比(%) —— 反映日常商品与餐饮真实消费\n• 黄线：电商非实体店零售同比(%)",
+            "up_down": "• 蓝/红线(整体与核心零售)：上涨 = 消费者日常刷卡热度上升；下跌 = 居民缩减日常开支。\n• 黄线(电商零售)：上涨 = 线上消费渗透率提升；若黄线远强于红线，往往伴随消费者转向线上比价与折扣消费。",
+            "zones": "• ✅ 合理健康区间：总体与核心零售 `+3.5% ~ +6.0%`，电商零售 `+8.0% ~ +12.0%`（名义增速稳健跑赢2%~3%温和通胀）。\n• 🚨 不合理/过热区间：蓝/红线 `>+8.5%`（需求过热推高商品通胀）。\n• 🚨 不合理/实际萎缩区间：红线 `<+1.5%` 且低于同期 CPI（剔除涨价后实际消费量已在萎缩）。",
+            "changes": "• 【组合① 蓝/红线稳居3.5%~6% + 黄线维持8%~12%】：消费结构健康扩张，消费龙头与支付网络盈利稳健。\n• 【组合② 黄线(电商)逆势走强而红线(核心零售)走弱】：消费降级与渠道迁移，居民减少线下冲动购物转向线上比价。\n• 【组合③ 蓝线大幅低于红线】：油价下跌或汽车销量疲软拖累表面数据，但核心日常消费依然坚挺。\n• 【组合④ 蓝线与红线同步跌破1.5%甚至转负】：剔除通胀后实际消费全面负增长，衰退高度确立。",
             "signal": "⚠️ 量化风控阈值：核心零售同比(红线)跌破 1.0% 且持续低于同期 CPI 增速，代表实际购买力萎缩，需回避可选消费与百货零售股。",
         },
         # --- 二、供给端 ---
@@ -938,9 +928,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "同比变化 (%)",
             "right_title": "",
-            "what": "• 蓝线：私人住宅建房许可同比(%) —— 开发商申请施工许可证阶段（地产供给链最前端）\n• 红线：新屋开工同比(%) —— 实际破土动工建设阶段（滞后建房许可1~2个月）\n• 黄线：待售新房库存同比(%) —— 完工及在建待售总库存（滞后开工6~12个月）\n• 绿线：20大都市房价同比(%)",
-            "how": "完整刻画房地产供给侧生命周期：「建房许可(蓝) → 新屋开工(红) → 竣工形成库存(黄) → 供需缺口决定未来房价与房租通胀(绿)」。",
-            "changes": "• 【组合① 蓝/红线拐头转正 + 黄线库存低位负增长 + 绿线企稳】：最典型「供不应求主升浪」，库存偏低叠加需求回暖，未来6~12个月房价与住宅投资将拉动GDP。\n• 【组合② 黄线库存同比飙升(>12%) + 蓝线持续深度负增长】：典型「供给过剩去库周期」，开发商积压大量现房被迫降价促销，并大幅削减新拿地与开工。\n• 【组合③ 蓝线显著跑赢红线】：开发商已拿到许可并积极储备项目，预示未来1~2个季度施工活动与建材采购将明显提速。\n• 【组合④ 绿线房价高位但蓝/红线持续下滑】：高利率抑制新供给，未来一旦降息将引发新一轮房荒与房价反弹。",
+            "what": "• 蓝线：私人住宅建房许可同比(%)  • 红线：新屋开工同比(%)\n• 黄线：待售新房库存同比(%)  • 绿线：20大都市房价同比(%)",
+            "up_down": "• 蓝/红线(许可与开工)：上涨 = 开发商看好后市、扩大拿地施工（拉动建材家电）；下跌 = 开发商收缩新项目。\n• 黄线(新房库存)：上涨 = 现房与在建库存积压，开发商面临降价去库压力；下跌 = 库存偏紧支撑房价。",
+            "zones": "• ✅ 合理健康区间：建房许可与开工 `0% ~ +10%`，待售库存同比 `-5% ~ +5%`（供需紧平衡）。\n• 🚨 不合理/过热区间：许可与开工 `>+18%` 且房价 `>+10%`（地产施工与通胀过热）。\n• 🚨 不合理/供给过剩区间：黄线(库存) `>+15%` 叠加蓝/红线 `<-10%`（库存积压迫使开发商大幅降价促销）。",
+            "changes": "• 【组合① 蓝/红线拐头转正 + 黄线库存低位负增长 + 绿线企稳】：供不应求主升浪，未来6~12个月房价与住宅投资拉动GDP。\n• 【组合② 黄线库存同比飙升(>12%) + 蓝线持续深度负增长】：供给过剩去库周期，开发商积压现房被迫降价并削减开工。\n• 【组合③ 蓝线显著跑赢红线】：开发商已拿到许可并积极储备项目，预示未来1~2个季度施工与建材采购提速。\n• 【组合④ 绿线房价高位但蓝/红线持续下滑】：高利率抑制新供给，未来一旦降息将引发新一轮房荒与房价反弹。",
             "signal": "💡 量化风控信号：建房许可(蓝线)增速领先未来6~9个月建材、家电与家居需求；待售库存回落 + 许可转正是地产建筑商(ITB)最佳配置窗口。",
         },
         {
@@ -952,9 +943,10 @@ def build_all_charts() -> list:
             "right_cols": ["ISM制造业PMI", "ISM非制造业PMI"],
             "left_title": "订单同比 (%)",
             "right_title": "ISM PMI 指数 (50为荣枯线)",
-            "what": "• 蓝线(左轴)：全美耐用品新增订单同比(%) —— 含波动极大的商用飞机与国防军工大单\n• 红线(左轴)：核心资本品订单同比(%) —— 剔除国防与飞机，纯粹衡量企业设备投资(CapEx)意愿\n• 黄线(右轴)：ISM制造业PMI  • 绿线(右轴)：ISM非制造业(服务业)PMI（50为扩张与收缩荣枯分界线）",
-            "how": "企业接到资本品订单后需3~6个月采购原材料、排产与交付。将企业硬订单（左轴）与采购经理人软景气调查（右轴）结合，可精准判断制造业与服务业是否出现「双轮驱动」或「冷热撕裂」。",
-            "changes": "• 【组合① 红线转正上行 + 黄线(制造业PMI)>50 + 绿线(服务业PMI)>52】：经济「全面复苏扩张组合」，企业扩产与服务消费共振，顺周期工业(XLI)、金融与科技齐涨。\n• 【组合② 蓝线暴涨暴跌而红线走平】：仅受波音大飞机或军工订单单月集中入账扰动，属于统计噪音，不代表制造业基本面反转。\n• 【组合③ 黄线深陷50下方收缩 + 绿线稳居52以上】：「服务强、制造弱的K型分化」，工业去库但服务消费托底，利率保持高位，资金抱团AI科技与服务龙头。\n• 【组合④ 红线持续负增长 + 黄/绿线双双跌破50】：制造业收缩向服务业蔓延，全面衰退警报拉响。",
+            "what": "• 蓝线(左轴)：耐用品总订单同比(%)  • 红线(左轴)：核心资本品订单同比(%)\n• 黄线(右轴)：ISM制造业PMI  • 绿线(右轴)：ISM非制造业(服务业)PMI",
+            "up_down": "• 蓝/红线(订单同比)：上涨 = 企业设备投资(CapEx)与扩产意愿增强；下跌 = 企业削减资本开支。\n• 黄/绿线(PMI)：站上50并上涨 = 行业加速扩张；跌破50并下跌 = 行业陷入萎缩。",
+            "zones": "• ✅ 合理健康区间：核心资本品订单 `+2% ~ +8%`，制造业PMI `50.0 ~ 55.0`，服务业PMI `52.0 ~ 57.0`。\n• 🚨 不合理/过热区间：双PMI `>59.0` 且订单 `>+12%`（供应链瓶颈与通胀飙升）。\n• 🚨 不合理/全面萎缩区间：核心资本品订单负增长且制造业与服务业PMI双双 `<48.5`（实体经济全面衰退）。",
+            "changes": "• 【组合① 红线转正上行 + 黄线(制造业PMI)>50 + 绿线(服务业PMI)>52】：全面复苏扩张组合，顺周期工业(XLI)、金融与科技齐涨。\n• 【组合② 蓝线暴涨暴跌而红线走平】：仅受波音大飞机或军工订单单月集中入账扰动，属于统计噪音。\n• 【组合③ 黄线深陷50下方收缩 + 绿线稳居52以上】：服务强、制造弱的K型分化，资金抱团AI科技与服务龙头。\n• 【组合④ 红线持续负增长 + 黄/绿线双双跌破50】：制造业收缩向服务业蔓延，全面衰退警报拉响。",
             "signal": "⚠️ 量化风控信号：核心资本品订单(红线)连续3个月正增长且 ISM 制造业 PMI(黄线)站上 50 荣枯线，确认工业补库周期开启。",
         },
         {
@@ -966,9 +958,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "WEI 年化GDP增速映射 (%)",
             "right_title": "",
-            "what": "• 蓝线：纽约联储每周经济指数 (Weekly Economic Index, WEI) —— 实时映射美国季度实际GDP同比年化增速(%)",
-            "how": "整合红皮书同店零售、初请/续请失业金、原钢产量、发电量、铁路货运、燃油消费、临时工就业等10项高频周度实体数据，比官方季度GDP报告提前2~3个月揭示实体经济拐点。",
-            "changes": "• 【情景① 蓝线稳居 1.5% ~ 2.8% 黄金走廊】：最理想的「金发姑娘经济(Goldilocks)」，经济温和增长且不引发恶性通胀，最利于美股长牛。\n• 【情景② 蓝线持续攀升突破 3.0%】：实体经济动能强劲，企业盈利预期上修，但需警惕经济过热推升10年期美债收益率、压制高估值成长股。\n• 【情景③ 蓝线从高位连续跌破 1.5% 向 0.5% 俯冲】：高频货运、发电与零售同步走弱，实体经济快速失速，美债收益率将见顶暴跌。\n• 【情景④ 蓝线跌破 0% 负值区】：历史上高度对应美国经济已陷入实质性衰退（如2008年、2020年）。",
+            "what": "• 蓝线：纽约联储每周经济指数 (WEI) —— 整合10项高频实体指标，实时映射季度实际GDP年化同比增速(%)",
+            "up_down": "• 蓝线上涨：全美高频零售、货运、发电、原钢与用工活动加速，未来季度GDP预期上修。\n• 蓝线下跌：高频实体经济动能走弱，未来季度GDP增速放缓甚至转负。",
+            "zones": "• ✅ 合理健康区间：`+1.5% ~ +2.8%`（最理想的金发姑娘经济走廊，温和增长且不引发恶性通胀）。\n• 🚨 不合理/过热区间：`>+3.2%`（经济过热推升10年期美债收益率，压制高估值成长股）。\n• 🚨 不合理/衰退区间：`<+0.5%` 并跌破 `0.0%`（历史上高度对应美国经济已陷入实质性衰退）。",
+            "changes": "• 【情景① 蓝线稳居 1.5% ~ 2.8% 黄金走廊】：金发姑娘经济，最利于美股长牛。\n• 【情景② 蓝线持续攀升突破 3.0%】：实体经济动能强劲，企业盈利上修，但需警惕利率上行。\n• 【情景③ 蓝线从高位连续跌破 1.5% 向 0.5% 俯冲】：高频货运、发电与零售同步走弱，美债收益率将见顶暴跌。\n• 【情景④ 蓝线跌破 0% 负值区】：实质性衰退确认，全面切入防御与长债。",
             "signal": "🚨 量化风控阈值：WEI 连续3周站上 3.0% 提示警惕再通胀与利率上行；一旦跌破 0.5% 并逼近 0% 零轴，立即启动衰退防守配置。",
         },
         {
@@ -976,13 +969,14 @@ def build_all_charts() -> list:
             "category": "供给",
             "chart_type": "LINE",
             "title": "09. 铜金比与PPI/PMI (Industrial & PPI)",
-            "df": align_tail([copper_gold, ppi_yoy, mfg_pmi], freq="W-FRI", n=180, max_ffill_steps=8),
+            "df": align_tail([copper_gold, ppi_yoy, mfg_pmi], freq="W-FRI", n=180, max_ffill_steps=10),
             "right_cols": ["PPI出厂价格同比(%)", "ISM制造业PMI"],
             "left_title": "铜金比 (×1000)",
             "right_title": "PPI同比(%) / ISM制造业PMI",
-            "what": "• 蓝线(左轴)：铜金比（COMEX铜期货 ÷ 黄金期货 × 1000）—— 全球实体工业需求 vs 货币避险情绪的高频晴雨表\n• 红线(右轴)：美国工业品出厂价格指数 PPI 同比(%) —— 衡量上游制造业通胀压力\n• 黄线(右轴)：美国 ISM 制造业采购经理人指数 PMI（50为荣枯线）",
-            "how": "铜被誉为「铜博士」，广泛用于电网、建筑、新能源与AI数据中心，代表全球实体工业景气；黄金代表货币避险与实际利率预期。两者相除剔除了美元汇率干扰，趋势拐点通常领先官方 PPI 与制造业 PMI 2~4 个月。",
-            "changes": "• 【组合① 蓝线(铜金比)持续走强 + 黄线(PMI)回升 + 红线(PPI)抬头】：标准「全球工业再通胀共振」，实体制造需求压倒避险，利好工业(XLI)、原材料(XLB)与顺周期资源股。\n• 【组合② 蓝线提前见顶大幅下挫 + 红线(PPI)仍在高位】：「上游通胀见顶顶背离」，预示未来1~2个季度工业品价格将回落、制造业PMI承压，长久期美债迎来配置良机。\n• 【组合③ 蓝线在低位率先拐头向上 + 红线/黄线仍处低谷】：「工业复苏领先底背离」，聪明资金已开始定价补库复苏，是左侧布局顺周期板块的高胜率信号。\n• 【组合④ 蓝线破位下跌 + 黄线深陷48以下】：全球制造业通缩与避险情绪双杀，黄金显著跑赢工业金属。",
+            "what": "• 蓝线(左轴)：铜金比（COMEX铜 ÷ 黄金 × 1000）  • 红线(右轴)：PPI工业出厂价格同比(%)  • 黄线(右轴)：ISM制造业PMI",
+            "up_down": "• 蓝线(铜金比)：上涨 = 全球实体工业需求跑赢货币避险（领先PPI与PMI 2~4个月）；下跌 = 工业需求萎缩或避险升温。\n• 红线(PPI)：上涨 = 上游原材料与出厂通胀压力增大；下跌 = 制造业通缩压力上升。\n• 黄线(制造业PMI)：上涨 = 制造业景气扩张；下跌 = 制造业收缩。",
+            "zones": "• ✅ 合理健康区间：铜金比稳步温和上行、PPI同比 `0.0% ~ +3.0%`、制造业PMI `50.0 ~ 54.0`。\n• 🚨 不合理/过热通胀区间：铜金比急飙且 PPI `>+6.0%`（上游成本恶性通胀挤压中下游利润）。\n• 🚨 不合理/工业通缩区间：铜金比破位暴跌且 PPI `<-2.0%`、PMI `<47.0`（全球制造业深度通缩）。",
+            "changes": "• 【组合① 蓝线(铜金比)持续走强 + 黄线(PMI)回升 + 红线(PPI)抬头】：全球工业再通胀共振，利好工业(XLI)、原材料(XLB)与资源股。\n• 【组合② 蓝线提前见顶大幅下挫 + 红线(PPI)仍在高位】：上游通胀见顶顶背离，未来1~2个季度PPI将回落，长久期美债迎来配置良机。\n• 【组合③ 蓝线在低位率先拐头向上 + 红线/黄线仍处低谷】：工业复苏领先底背离，左侧布局顺周期的高胜率信号。\n• 【组合④ 蓝线破位下跌 + 黄线深陷48以下】：全球制造业通缩与避险情绪双杀，黄金显著跑赢工业金属。",
             "signal": "💡 量化风控信号：铜金比是宏观交易员的「高频工业先行指标」，当蓝线趋势方向与红线(PPI)背离持续超过8周时，官方PPI与PMI大概率向铜金比方向回归。",
         },
         {
@@ -990,13 +984,14 @@ def build_all_charts() -> list:
             "category": "供给",
             "chart_type": "LINE",
             "title": "10. 油金比与CPI (Energy & CPI)",
-            "df": align_tail([oil_gold, cpi_yoy], freq="W-FRI", n=180, max_ffill_steps=8),
+            "df": align_tail([oil_gold, cpi_yoy], freq="W-FRI", n=180, max_ffill_steps=10),
             "right_cols": ["CPI通胀同比(%)"],
             "left_title": "油金比 (×100)",
             "right_title": "CPI通胀同比 (%)",
-            "what": "• 蓝线(左轴)：油金比（WTI原油期货 ÷ 黄金期货 × 100）—— 剔除纯粹货币贬值因素后的真实能源成本压力\n• 红线(右轴)：美国消费者物价指数 CPI 同比(%) —— 美联储货币政策最核心的盯住目标",
-            "how": "原油是现代社会交通、航空、化工、农业与物流的总成本之母。用原油除以黄金得到「油金比」，能剥离单纯由央行印钞引起的名义价格上涨，精准领先反映终端消费通胀 CPI 的大方向（领先约1~3个月）。",
-            "changes": "• 【组合① 蓝线(油金比)持续飙升 + 红线(CPI)同步抬头】：典型「能源驱动型二次通胀」，油价向物流与食品传导，美联储被迫推迟降息甚至重启加息，股债估值双承压。\n• 【组合② 蓝线见顶大幅回落 + 红线(CPI)滞后高位】：「通胀见顶确认组合」，能源成本回落将在未来1~3个月拉低整体CPI，打开降息通道，科技成长股(QQQ)与美债(TLT)迎来估值修复。\n• 【组合③ 蓝线低位徘徊 + 红线(CPI)顽固居于3%以上】：说明当前通胀并非由能源驱动，而是由房租与薪资等「核心服务业粘性通胀」主导，降息节奏将极为缓慢。\n• 【组合④ 蓝线急跌 + 红线跌破2%】：能源与需求双弱，通缩预期升温，防御板块与黄金占优。",
+            "what": "• 蓝线(左轴)：油金比（WTI原油 ÷ 黄金 × 100）  • 红线(右轴)：美国CPI消费者物价指数同比(%)",
+            "up_down": "• 蓝线(油金比)：上涨 = 剔除货币贬值后的真实能源成本上升（领先CPI 1~3个月）；下跌 = 能源成本压力缓解、通胀趋降。\n• 红线(CPI同比)：上涨 = 终端消费通胀反弹，限制美联储降息空间；下跌 = 通胀回落，利好货币宽松。",
+            "zones": "• ✅ 合理健康区间：油金比低位平稳或温和下行、CPI同比 `+1.8% ~ +2.8%`（贴近美联储2%目标）。\n• 🚨 不合理/二次通胀区间：油金比单边飙升且 CPI `>+3.5%`（能源驱动型二次通胀，股债估值双杀）。\n• 🚨 不合理/通缩衰退区间：油金比暴跌且 CPI `<+1.0%`（总需求坍塌引发通缩担忧）。",
+            "changes": "• 【组合① 蓝线(油金比)持续飙升 + 红线(CPI)同步抬头】：能源驱动型二次通胀，美联储被迫推迟降息甚至加息。\n• 【组合② 蓝线见顶大幅回落 + 红线(CPI)滞后高位】：通胀见顶确认组合，能源成本回落将在1~3个月内拉低CPI，利好科技股(QQQ)与美债(TLT)。\n• 【组合③ 蓝线低位徘徊 + 红线(CPI)顽固居于3%以上】：通胀由房租与薪资等核心服务业粘性主导，降息节奏缓慢。\n• 【组合④ 蓝线急跌 + 红线跌破2%】：能源与需求双弱，通缩预期升温，防御板块与黄金占优。",
             "signal": "💡 量化风控信号：油金比(蓝线)大幅回落是「通胀见顶、10年美债利率下行、科技成长股估值扩张」最可靠的高频前置信号之一。",
         },
         {
@@ -1008,9 +1003,10 @@ def build_all_charts() -> list:
             "right_cols": ["10年期美债收益率(%)"],
             "left_title": "铜金比 / 油金比",
             "right_title": "10年美债收益率 (%)",
-            "what": "• 蓝线(左轴)：铜金比 —— 全球万亿资金投票的「真实经济增长预期」\n• 红线(左轴)：油金比 —— 全球万亿资金投票的「真实通胀压力预期」\n• 黄线(右轴)：美国10年期国债收益率(%) —— 全球无风险利率与资产定价之锚",
-            "how": "美林时钟的实时高频量化版！铜、油、黄金与美债在全球每日23小时连续交易，不受官方统计滞后与大幅修正干扰。通过「增长(蓝) × 通胀(红) × 利率(黄)」三线四象限组合，可一秒锁定当前全球宏观交易主线。",
-            "changes": "• 【象限① 蓝涨 + 红涨 + 黄涨】：「经济过热 / 再通胀交易」，增长与通胀齐升推高美债利率，超配能源(XLE)、金融(XLF)、工业(XLI)与大宗商品，规避长债(TLT)。\n• 【象限② 蓝涨 + 红跌 + 黄稳/微降】：「金发姑娘复苏交易」，经济向好而能源通胀回落，美股科技(XLK)与成长股迎来最佳牛市环境。\n• 【象限③ 蓝跌 + 红跌 + 黄跌】：「经济衰退 / 降息避险交易」，增长与通胀双双熄火，资金疯狂涌入10年期美债(TLT)与黄金(GLD)赚取资本利得。\n• 【象限④ 蓝跌 + 红涨 + 黄涨】：「最凶险滞胀交易(Stagflation)」，经济下滑但油价推高通胀与利率，股债双杀，唯黄金与现金为王。\n• 【背离警示 蓝/红线双跌但黄线(10Y美债)逆势飙升】：多为美债天量发债供给冲击或财政赤字担忧，美债利率往往在随后向增长预期回归。",
+            "what": "• 蓝线(左轴)：铜金比(全球增长预期)  • 红线(左轴)：油金比(全球通胀预期)  • 黄线(右轴)：10年期美债收益率(%)",
+            "up_down": "• 蓝线上涨/下跌 = 市场定价经济增长加速 / 放缓。\n• 红线上涨/下跌 = 市场定价能源通胀升温 / 降温。\n• 黄线上涨/下跌 = 无风险利率走高（压制股票估值）/ 利率走低（支撑股票估值与长债价格）。",
+            "zones": "• ✅ 合理健康区间：蓝线温和上行 + 红线低位平稳 + 黄线(10年美债)运行在 `3.50% ~ 4.30%`（无通胀温和复苏）。\n• 🚨 不合理/利率冲击区间：黄线急升突破 `4.75% ~ 5.00%`（高利率直接刺破高估值成长股）。\n• 🚨 不合理/滞胀与衰退区间：蓝跌+红涨+黄涨（最凶险滞胀）或蓝跌+红跌+黄线暴跌破 `3.20%`（深度衰退避险）。",
+            "changes": "• 【象限① 蓝涨 + 红涨 + 黄涨】：经济过热/再通胀交易，超配能源(XLE)、金融(XLF)、工业(XLI)，规避长债(TLT)。\n• 【象限② 蓝涨 + 红跌 + 黄稳/微降】：金发姑娘复苏交易，美股科技(XLK)与成长股迎来最佳牛市环境。\n• 【象限③ 蓝跌 + 红跌 + 黄跌】：经济衰退/降息避险交易，资金涌入10年期美债(TLT)与黄金(GLD)。\n• 【象限④ 蓝跌 + 红涨 + 黄涨】：滞胀交易(Stagflation)，股债双杀，唯黄金与现金为王。",
             "signal": "💡 量化风控信号：当 10年期美债收益率(黄线)与 铜金比(蓝线)出现持续2个月以上的反向背离时，通常是跨资产均值回归套利的黄金窗口。",
         },
         # --- 三、利率端 ---
@@ -1023,9 +1019,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "年化利率 (%)",
             "right_title": "",
-            "what": "• 蓝线：美联储有效联邦基金利率(DFF)  • 紫线：3个月期美债利率（最紧贴政策利率）\n• 绿线：2年期美债收益率（市场对未来2年美联储路径预期）  • 黄线：5年期美债  • 红线：10年期美债收益率（长期增长与通胀预期）",
-            "how": "完整刻画美债收益率曲线的形态演变（倒挂 vs 陡峭化）。短端利率由美联储直接掌控，长端利率由市场自由交易。曲线形态直接决定商业银行净息差与全社会信用扩张意愿。",
-            "changes": "• 【形态① 紫/绿线 > 红线（短端高于长端）】：「收益率曲线倒挂」，代表货币政策处于限制性紧缩区间，银行借短贷长无利可图，信用逐步收缩。\n• 【形态② 倒挂后绿线(2Y)暴跌、红线(10Y)平稳】：「牛市变陡(Bull Steepener)」，市场抢跑定价美联储被迫紧急大幅降息，历史上往往对应经济衰退正式落地与股市剧烈震荡。\n• 【形态③ 红线(10Y)飙升速度快于绿线(2Y)】：「熊市变陡(Bear Steepener)」，市场定价长期通胀失控或美债供给过剩，长久期科技股与美债双双承压。\n• 【形态④ 蓝/紫/绿/红线有序排列(10Y > 5Y > 2Y > 3M)且温和下行】：健康正常的正向收益率曲线与预防式降息周期，最利好美股长牛。",
+            "what": "• 蓝线：联邦基金利率  • 紫线：3个月美债  • 绿线：2年期美债  • 黄线：5年期美债  • 红线：10年期美债",
+            "up_down": "• 短端(蓝/紫/绿)上涨/下跌 = 市场定价美联储加息 / 降息预期。\n• 长端(红线10Y)上涨/下跌 = 长期名义GDP增速与通胀预期升温 / 降温。",
+            "zones": "• ✅ 合理健康区间：正常正向收益率曲线，长端高于短端（`红 > 黄 > 绿 > 紫`，10Y减2Y利差 `+0.4% ~ +1.5%`）。\n• 🚨 不合理/紧缩倒挂区间：短端高于长端（`紫/绿 > 红`，**收益率曲线倒挂**，银行借短贷长无利可图，信用逐步收缩）。\n• 🚨 不合理/衰退牛陡区间：长期倒挂后绿线(2Y)突然暴跌下穿红线(10Y)并迅速拉开正利差（市场抢跑衰退紧急降息，伴随股市剧震）。",
+            "changes": "• 【形态① 紫/绿线 > 红线（短端高于长端）】：收益率曲线倒挂，货币政策处于限制性紧缩区间。\n• 【形态② 倒挂后绿线(2Y)暴跌、红线(10Y)平稳】：牛市变陡(Bull Steepener)，往往对应经济衰退正式落地与股市剧烈震荡。\n• 【形态③ 红线(10Y)飙升速度快于绿线(2Y)】：熊市变陡(Bear Steepener)，市场定价长期通胀或财政赤字供给过剩。\n• 【形态④ 10Y > 5Y > 2Y > 3M 有序排列且温和下行】：健康正向曲线与预防式降息周期，最利好美股长牛。",
             "signal": "🚨 宏观警报：收益率曲线倒挂持续期间股市未必立刻下跌，但「倒挂结束、2Y-10Y利差迅速转正变陡（绿线下穿红线并拉开距离）」时，往往伴随美股波动率飙升。",
         },
         {
@@ -1037,9 +1034,10 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "CCC信用利差(%) / VIX指数",
             "right_title": "标普500点位",
-            "what": "• 蓝线(左轴)：ICE BofA CCC级高收益垃圾债期权调整信用利差(%) —— 资质最弱企业融资的违约风险溢价\n• 红线(左轴)：CBOE VIX恐慌指数 —— 标普500未来30天隐含波动率\n• 黄线(右轴)：标普500指数",
-            "how": "债券市场机构投资者对企业现金流与违约风险的嗅觉远比股票市场敏锐。信用利差是衡量金融体系「流动性血管是否畅通」的终极体温计。",
-            "changes": "• 【组合① 蓝线低位平稳(<7.5%) + 红线(VIX)<18 + 黄线稳步上行】：信用融资极度宽松，违约率低，美股处于低波动慢牛黄金期。\n• 【组合② 黄线(标普)仍在高位但蓝线(信用利差)提前抬头扩大】：「债市先行顶背离预警」，聪明资金已开始撤离高风险公司债，股市大概率随后补跌。\n• 【组合③ 红线(VIX)脉冲跳升(>25)但蓝线(信用利差)纹丝不动】：仅为股市技术性洗盘或期权短期对冲扰动，未伤及实体信用根基，反而是逢低买入机会。\n• 【组合④ 蓝线急剧飙升(>11%~13%) + 红线突破30~35】：系统性信用紧缩与流动性危机爆发，机构被迫去杠杆抛售资产，必须果断降仓防守。",
+            "what": "• 蓝线(左轴)：CCC级高收益垃圾债信用利差(%)  • 红线(左轴)：VIX恐慌指数  • 黄线(右轴)：标普500指数",
+            "up_down": "• 蓝线(信用利差)：上涨 = 弱资质企业融资成本飙升、违约风险恶化；下跌 = 信用融资环境宽松、企业违约率低。\n• 红线(VIX)：上涨 = 期权市场恐慌对冲升温、股市波动率扩大；下跌 = 市场情绪平稳。",
+            "zones": "• ✅ 合理健康区间：CCC级信用利差 `5.5% ~ 8.0%`，VIX恐慌指数 `12.0 ~ 19.0`（信用血管畅通，低波动慢牛）。\n• 🚨 不合理/自满低波区间：VIX `<11.5` 且信用利差 `<5.2%`（市场过度自满，对突发黑天鹅毫无防备）。\n• 🚨 不合理/系统性危机区间：CCC利差 `>11.0%` 且 VIX `>30.0`（信用紧缩与流动性危机爆发，机构被迫去杠杆抛售）。",
+            "changes": "• 【组合① 蓝线低位平稳(<7.5%) + 红线(VIX)<18 + 黄线稳步上行】：信用融资宽松，美股处于低波动慢牛黄金期。\n• 【组合② 黄线(标普)仍在高位但蓝线(信用利差)提前抬头扩大】：债市先行顶背离预警，聪明资金撤离公司债，股市随后补跌。\n• 【组合③ 红线(VIX)脉冲跳升(>25)但蓝线(信用利差)纹丝不动】：仅为股市技术性洗盘或期权短期对冲扰动，是逢低买入机会。\n• 【组合④ 蓝线急剧飙升(>11%~13%) + 红线突破30~35】：系统性信用紧缩爆发，必须果断降仓防守。",
             "signal": "🚨 危机阈值：CCC信用利差突破 11% 且 VIX 站上 30 为系统性流动性警报；当利差冲高至 13%~15% 极值后首次拐头向下时，是全市场最具确定性的长线抄底信号。",
         },
         # --- 四、市场端 ---
@@ -1054,9 +1052,10 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "看涨减看跌净差值 (%)",
             "right_title": "标普500点位",
-            "what": "• 蓝线(左轴)：AAII散户看涨比例减去看跌比例的净差值(%) —— 每周四发布的美国个人投资者协会调查\n• 红线(左轴)：散户情绪净差值的20周移动平均线(%) —— 过滤单周情绪噪音的中期心理趋势\n• 黄线(右轴)：标普500指数",
-            "how": "华尔街最经典的逆向情绪指标！个人投资者天生具有「追涨杀跌」倾向：在牛市顶部附近极度看多（潜在增量买盘耗尽），在回调底部附近极度看空（割肉抛压出清）。",
-            "changes": "• 【组合① 蓝线飙升至 +25% 以上 + 红线同步突破 +15%】：散户看多情绪极度拥挤，场外增量资金已基本入场，市场对任何利空都极度脆弱，易发生技术性回调。\n• 【组合② 蓝线暴跌至 -25% 以下 + 黄线(标普)回踩关键支撑】：散户陷入恐慌性割肉，抛压接近衰竭，历史统计未来3~6个月正收益概率超80%。\n• 【组合③ 黄线(标普)高位震荡小跌，但蓝线迅速由正转负】：最健康的「牛市洗盘结构」，指数未跌多少但散户已被吓跑，为下一波主升浪腾出空间。\n• 【组合④ 蓝线长期徘徊在 -10%~0% 偏谨慎区间而黄线稳步创新高】：典型的「在怀疑中上涨(Wall of Worry)」，牛市生命力极其持久。",
+            "what": "• 蓝线(左轴)：AAII散户看涨%减看跌%净差值  • 红线(左轴)：20周移动均线  • 黄线(右轴)：标普500指数",
+            "up_down": "• 蓝/红线上涨 = 个人投资者越来越乐观追涨（反向指标，增量买盘逐步耗尽）。\n• 蓝/红线下跌 = 个人投资者恐慌看空割肉（反向指标，卖盘抛压逐步出清）。",
+            "zones": "• ✅ 合理健康区间：`-10% ~ +15%`（多空分歧适度，牛市在怀疑中稳步推进）。\n• 🚨 不合理/散户极度亢奋区间：`>+25%`（散户全面满仓追涨，市场对利空极度脆弱，易发生技术性回调）。\n• 🚨 不合理/散户恐慌出清区间：`<-25%`（尤其跌破 `-30%`，恐慌割肉盘耗尽，未来3~6个月正收益概率超80%）。",
+            "changes": "• 【组合① 蓝线飙升至 +25% 以上 + 红线同步突破 +15%】：散户看多极度拥挤，易发生技术性回调。\n• 【组合② 蓝线暴跌至 -25% 以下 + 黄线(标普)回踩支撑】：散户恐慌性割肉，抛压接近衰竭，高胜率逆向买点。\n• 【组合③ 黄线(标普)高位小跌，但蓝线迅速由正转负】：最健康的牛市洗盘结构，指数未跌多少但散户已被吓跑。\n• 【组合④ 蓝线长期徘徊在 -10%~0% 而黄线创新高】：在怀疑中上涨(Wall of Worry)，牛市生命力持久。",
             "signal": "🎯 逆向交易阈值：净差值 > +25% 逢高减仓或买入保护性Put；净差值 < -25%（尤其跌破 -30%）是高胜率左侧分批建仓区。",
         },
         {
@@ -1070,9 +1069,10 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "机构资管多头仓位占比 (%)",
             "right_title": "标普500点位",
-            "what": "• 蓝线(左轴)：CFTC 资管机构(共同基金/养老金/保险/主权基金)标普500期货真实多头占比(%)\n• 红线(左轴)：机构多头占比20周移动均线(%)  • 黄线(右轴)：标普500指数",
-            "how": "直接追踪全球最大长线真金白银机构（Asset Managers）的每周实际多空仓位（替代已转为付费闭源的NAAIM调查）。由于机构受季度排名与风控线约束，同样存在「高位满仓子弹打光」与「低位被动砍仓后踏空回补」的周期律。",
-            "changes": "• 【组合① 蓝线升至 84%~88% 历史极限高位 + 贴近或高于红线】：长线机构子弹基本打光，多头仓位极度拥挤，一旦宏观数据不及预期易引发踩踏式减仓。\n• 【组合② 蓝线大幅下穿红线并回落至 65% 以下】：机构风控去杠杆砍仓接近尾声，卖盘充分出清，市场一旦企稳将引发机构踏空逼空买盘。\n• 【组合③ 黄线(标普)创新高，但蓝线持续低于红线且重心下移】：「机构派发顶背离」，长线大资金正在借指数冲高悄然减仓，需高度警惕中期见顶。\n• 【组合④ 蓝线强势上穿红线且黄线同步放量突破】：长线资管机构开启新一轮季度配置加仓，趋势行情确立。",
+            "what": "• 蓝线(左轴)：CFTC资管机构(共同基金/养老金/保险)标普500期货真实多头占比(%)  • 红线(左轴)：20周均线  • 黄线(右轴)：标普500指数",
+            "up_down": "• 蓝线上涨 = 长线大型资管机构真金白银加仓做多股票。\n• 蓝线下跌 = 长线资管机构触发风控减仓或获利派发。",
+            "zones": "• ✅ 合理健康区间：`72% ~ 82%`（机构仓位健康且仍有增量加仓空间）。\n• 🚨 不合理/机构极度拥挤区间：`≥85%`（长线机构子弹基本打光，一旦宏观数据不及预期易引发踩踏式减仓）。\n• 🚨 不合理/机构去杠杆出清区间：`≤65%`（机构被动砍仓接近尾声，市场一旦企稳将引发踏空逼空买盘）。",
+            "changes": "• 【组合① 蓝线升至 84%~88% 历史极限高位 + 贴近或高于红线】：长线机构子弹打光，多头仓位极度拥挤。\n• 【组合② 蓝线大幅下穿红线并回落至 65% 以下】：机构风控去杠杆砍仓接近尾声，卖盘充分出清。\n• 【组合③ 黄线(标普)创新高，但蓝线持续低于红线且重心下移】：机构派发顶背离，长线大资金正在借指数冲高悄然减仓。\n• 【组合④ 蓝线强势上穿红线且黄线同步突破】：长线资管机构开启新一轮季度配置加仓，趋势行情确立。",
             "signal": "🎯 机构仓位阈值：机构多头占比 ≥ 85% 警惕仓位拥挤见顶；回落至 65%~70% 区间往往对应长线机构出清后的波段黄金买点。",
         },
         {
@@ -1086,9 +1086,10 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "看跌/看涨成交量比值",
             "right_title": "标普500点位",
-            "what": "• 蓝线(左轴)：CBOE个股看跌期权(Put) ÷ 看涨期权(Call)每日成交量比值\n• 红线(左轴)：Put/Call比值的20日移动平均线（平滑单日脉冲）  • 黄线(右轴)：标普500指数",
-            "how": "期权市场汇聚了最敏锐的杠杆交易员与机构对冲盘。比值越高，说明市场花重金买入看跌期权(Put)防暴跌的恐慌情绪越浓烈；比值越低，说明市场疯狂买入看涨期权(Call)赌上涨。",
-            "changes": "• 【组合① 蓝线单日脉冲冲高(>0.95) + 红线(20日均线)显著抬升(>0.75)】：恐慌性买Put对冲达到高潮，做空力量集中宣泄，往往对应美股短期重要底部拐点。\n• 【组合② 蓝线持续压低至 0.48 以下 + 红线跌破 0.55】：投机者沉迷买入Call追涨，市场自满情绪极度膨胀，短期极易出现快速洗盘爆多。\n• 【组合③ 黄线(标普)继续创新低，但蓝线高点逐步下移】：「恐慌钝化底背离」，说明该买保险的资金已买完，下跌动能衰竭，反弹一触即发。\n• 【组合④ 蓝线温和运行在 0.58~0.70 区间】：多空对冲均衡，市场沿着主趋势稳健推进。",
+            "what": "• 蓝线(左轴)：CBOE个股看跌期权(Put) ÷ 看涨期权(Call)每日成交量比值  • 红线(左轴)：20日均线  • 黄线(右轴)：标普500指数",
+            "up_down": "• 蓝/红线上涨 = 市场花重金买入Put防暴跌，恐慌对冲情绪升温。\n• 蓝/红线下跌 = 市场疯狂买入Call追涨，投机自满情绪膨胀。",
+            "zones": "• ✅ 合理健康区间：`0.55 ~ 0.72`（多空对冲均衡，市场沿主趋势稳健推进）。\n• 🚨 不合理/极度自满低波区间：单日 `<0.48` 或 20日均线 `<0.55`（投机Call过度拥挤，极易出现快速洗盘爆多）。\n• 🚨 不合理/恐慌买Put高潮区间：单日 `>0.95` 或 20日均线 `>0.78`（恐慌情绪集中宣泄，对应短期重要底部）。",
+            "changes": "• 【组合① 蓝线单日脉冲冲高(>0.95) + 红线(20日均线)显著抬升(>0.75)】：恐慌性买Put达到高潮，对应短期重要底部拐点。\n• 【组合② 蓝线持续压低至 0.48 以下 + 红线跌破 0.55】：投机者沉迷买入Call追涨，短期极易快速洗盘。\n• 【组合③ 黄线(标普)继续创新低，但蓝线高点逐步下移】：恐慌钝化底背离，下跌动能衰竭，反弹一触即发。\n• 【组合④ 蓝线温和运行在 0.58~0.70 区间】：多空对冲均衡，沿主趋势推进。",
             "signal": "🎯 期权逆向阈值：Equity Put/Call 单日突破 1.0 或 20日均线(红线)升破 0.78，为高胜率短线抄底信号；低于 0.50 警惕短期回调。",
         },
         {
@@ -1102,9 +1103,10 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "非商业净持仓 (万手)",
             "right_title": "标普500点位",
-            "what": "• 蓝线(左轴)：CFTC CME E-Mini标普500期货大型投机者（对冲基金/CTA）净多空持仓(万手)\n• 红线(右轴)：标普500指数",
-            "how": "0轴上方代表对冲基金整体净做多，0轴下方代表整体净做空。在期货零和博弈中，极端拥挤的空头头寸一旦遭遇市场企稳，就会转化为猛烈的空头回补买盘（轧空行情）。",
-            "changes": "• 【组合① 蓝线深陷极端净空区(-15万手以下) + 红线(标普)拒绝下跌并站稳均线】：典型「史诗级轧空(Short Squeeze)前夜」，空头被迫止损平仓买入，驱动指数凌厉逼空上涨。\n• 【组合② 蓝线持续攀升至历史极端净多(+15万手以上) + 红线滞涨】：投机多头高度拥挤，若无新资金接力，极易触发CTA程序化止盈抛盘。\n• 【组合③ 蓝线从深度净空区稳步向0轴回升 + 红线同步上行】：趋势资金持续平空翻多，提供源源不断的增量买盘支撑。\n• 【组合④ 蓝线由净多快速翻空跌破0轴 + 红线破位】：宏观对冲基金集中建立空头头寸，中期调整趋势确立。",
+            "what": "• 蓝线(左轴)：CFTC 标普500期货大型投机者(对冲基金/CTA)净多空持仓(万手)  • 红线(右轴)：标普500指数",
+            "up_down": "• 蓝线上涨 = 对冲基金与CTA趋势策略平空翻多、加仓做多。\n• 蓝线下跌 = 对冲基金多头止盈或主动建立空头头寸。",
+            "zones": "• ✅ 合理健康区间：`-8万手 ~ +10万手`（投机仓位中性健康，无极端踩踏风险）。\n• 🚨 不合理/多头极端拥挤区间：`>+15万手`（杠杆多头过于拥挤，缺乏增量资金接力）。\n• 🚨 不合理/空头极端拥挤区间：`<-15万手`（空头头寸极度拥挤，一旦市场企稳极易触发史诗级轧空暴涨）。",
+            "changes": "• 【组合① 蓝线深陷极端净空区(-15万手以下) + 红线(标普)拒绝下跌并站稳均线】：史诗级轧空(Short Squeeze)前夜。\n• 【组合② 蓝线持续攀升至历史极端净多(+15万手以上) + 红线滞涨】：投机多头高度拥挤，极易触发CTA程序化止盈抛盘。\n• 【组合③ 蓝线从深度净空区稳步向0轴回升 + 红线同步上行】：趋势资金持续平空翻多，提供增量买盘支撑。\n• 【组合④ 蓝线由净多快速翻空跌破0轴 + 红线破位】：宏观对冲基金集中建立空头，中期调整确立。",
             "signal": "🎯 轧空交易信号：当标普投机净持仓(蓝线)处于近3年最低10%分位（深度净空）且标普指数重新站上20日均线时，重点关注空头回补主升浪。",
         },
         {
@@ -1118,9 +1120,10 @@ def build_all_charts() -> list:
             "right_cols": ["纳斯达克100指数"],
             "left_title": "非商业净持仓 (万手)",
             "right_title": "纳斯达克100点位",
-            "what": "• 蓝线(左轴)：CFTC 纳斯达克100期货大型投机者净多空持仓(万手)\n• 红线(右轴)：纳斯达克100指数",
-            "how": "专门追踪杠杆机构对「大型科技成长与AI龙头」的资金押注。核心用法是与「图17（标普500投机持仓）」进行双图交叉对比，识别华尔街对冲基金的「多科技、空传统」配对交易结构。",
-            "changes": "• 【跨图组合① 图17(标普)深度净空 + 本图(纳指)维持净多】：典型的「科技巨头发力抱团结构」，机构做多AI与纳指巨头、做空传统权重股，纳指大幅跑赢标普与罗素小盘。\n• 【组合② 本图蓝线触及历史极端净多高位后拐头向下】：科技股杠杆多头拥挤度过高，警惕财报季获利了结与估值消化回调。\n• 【组合③ 本图蓝线跌入深度净空区后回升 + 红线(纳指)止跌】：科技板块经历充分去杠杆洗盘，迎来新一轮配置窗口。\n• 【跨图组合④ 图17与图18同步大幅翻空】：机构无差别削减全市场股票风险敞口，进入全面防御阶段。",
+            "what": "• 蓝线(左轴)：CFTC 纳指100期货大型投机者净多空持仓(万手)  • 红线(右轴)：纳斯达克100指数",
+            "up_down": "• 蓝线上涨 = 杠杆机构加码押注大型科技成长与AI龙头。\n• 蓝线下跌 = 杠杆资金削减科技股多头敞口或对冲回调风险。",
+            "zones": "• ✅ 合理健康区间：`-2万手 ~ +5万手`（科技板块杠杆资金流向健康）。\n• 🚨 不合理/科技多头拥挤区间：`>+7万手`（科技股杠杆多头拥挤度过高，警惕财报季获利了结）。\n• 🚨 不合理/科技超跌净空区间：`<-4万手`（科技股去杠杆充分，酝酿超跌反弹）。",
+            "changes": "• 【跨图组合① 图17(标普)深度净空 + 本图(纳指)维持净多】：机构做多AI与纳指巨头、做空传统权重股，纳指大幅跑赢。\n• 【组合② 本图蓝线触及历史极端净多高位后拐头向下】：科技股杠杆拥挤度过高，警惕财报季回调。\n• 【组合③ 本图蓝线跌入深度净空区后回升 + 红线(纳指)止跌】：科技板块经历充分去杠杆洗盘，迎来新一轮配置窗口。\n• 【跨图组合④ 图17与图18同步大幅翻空】：机构无差别削减全市场股票敞口，进入全面防御。",
             "signal": "💡 跨图联动信号：对比图17与图18的净持仓方向剪刀差，可精准判断当前是「AI科技独立抱团牛市」还是「全市场风格切换」。",
         },
         {
@@ -1134,9 +1137,10 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "站上均线成分股占比 (%)",
             "right_title": "标普500点位",
-            "what": "• 蓝线(左轴)：标普500成分股中收盘价高于50日均线的股票占比(%) —— 衡量中期涨跌广度\n• 红线(左轴)：标普500成分股中收盘价高于200日均线的股票占比(%) —— 衡量长线牛熊分界广度\n• 黄线(右轴)：标普500指数",
-            "how": "穿透权重股失真效应的「市场X光机」。标普500前七大科技巨头占总市值超30%，市场宽度能敏锐捕捉「少数巨头掩护多数个股下跌」的危险背离，以及「全市场恐慌错杀」的黄金大底。",
-            "changes": "• 【组合① 黄线(标普)创新高 + 蓝线(50日宽度)与红线(200日宽度)重心明显下移】：「危险顶部背离」，仅靠少数巨头硬撑指数，内部多数个股已步入下跌趋势，警惕指数补跌。\n• 【组合② 蓝线暴跌至 15% 以下 + 红线仍稳居 45% 以上】：牛市中的「健康深度洗盘」，85%以上股票短期超卖但长线牛市结构未坏，是极佳波段买点。\n• 【组合③ 蓝线(<15%) 与 红线(<20%) 双双跌入极端冰点后蓝线率先拐头向上】：「罕见熊市出清大底」，全市场泥沙俱下后迎来级别最大的一轮全面反弹。\n• 【组合④ 蓝线突破 85% + 红线突破 80%】：全市场普涨亢奋，短期追高盈亏比下降，易出现震荡整固。",
+            "what": "• 蓝线(左轴)：标普500高于50日均线成分股占比(%)  • 红线(左轴)：高于200日均线成分股占比(%)  • 黄线(右轴)：标普500指数",
+            "up_down": "• 蓝/红线上涨 = 上涨行情向多数成分股扩散，牛市根基牢固。\n• 蓝/红线下跌 = 内部多数个股走弱（若此时黄线指数仍涨，则是少数巨头掩护撤退的危险背离）。",
+            "zones": "• ✅ 合理健康区间：50日宽度 `45% ~ 75%`，200日宽度 `55% ~ 78%`（健康的轮动普涨结构）。\n• 🚨 不合理/短期过热区间：50日宽度 `>85%` 且 200日宽度 `>80%`（全市场普涨亢奋，短期追高盈亏比下降）。\n• 🚨 不合理/极端超卖大底区间：50日宽度 `<15%`（短期极度超卖；若50日与200日宽度同时 `<15%`，为数年一遇中长线战略大底）。",
+            "changes": "• 【组合① 黄线(标普)创新高 + 蓝线与红线重心明显下移】：危险顶部背离，仅靠少数巨头硬撑指数，警惕指数补跌。\n• 【组合② 蓝线暴跌至 15% 以下 + 红线仍稳居 45% 以上】：牛市中的健康深度洗盘，长线牛市未坏，极佳波段买点。\n• 【组合③ 蓝线(<15%) 与 红线(<20%) 双双跌入冰点后蓝线拐头向上】：罕见熊市出清大底，迎来级别最大全面反弹。\n• 【组合④ 蓝线突破 85% + 红线突破 80%】：全市场普涨亢奋，易出现震荡整固。",
             "signal": "🎯 宽度买卖极区：50日宽度 > 85% 提示短期过热；< 15% 提示短期超卖。若 50日与200日宽度同时 < 15%，为数年一遇的中长线战略抄底区！",
         },
         {
@@ -1146,11 +1150,12 @@ def build_all_charts() -> list:
             "title": "20A. 美股进攻与成长板块轮动 (6大进攻板块)",
             "df": sec_off_df,
             "right_cols": [],
-            "left_title": "相对全市场VTI强弱 (起点=100)",
+            "left_title": "相对全市场VTI强弱 (同一起点=100)",
             "right_title": "",
-            "what": "• 6大进攻/周期板块ETF ÷ 全市场VTI 标准化相对强弱（1年前起点=100）：\n• 蓝:科技XLK | 红:通讯XLC | 黄:可选消费XLY | 绿:金融XLF | 紫:工业XLI | 青:能源XLE",
-            "how": "每条曲线代表该板块相对美股全市场(VTI)的超额收益轨迹：曲线向上倾斜 = 跑赢大盘（资金持续流入）；曲线向下倾斜 = 跑输大盘（资金净流出）。",
-            "changes": "• 【组合① 科技XLK(蓝) + 通讯XLC(红) 领跑且稳居100上方】：AI科技与互联网巨头主导牛市，风险偏好高涨，成长风格占优。\n• 【组合② 金融XLF(绿) + 工业XLI(紫) + 能源XLE(青) 接力走强，科技走平】：「经济软着陆与再通胀风格切换」，资金从高估值科技向顺周期价值板块扩散。\n• 【组合③ 可选消费XLY(黄) 率先破位下行】：居民消费承压的股市先行映射，警惕零售与消费链盈利下修。\n• 【组合④ 六大进攻板块全线跌破100且斜率向下】：机构全面撤出进攻头寸，必须结合图20B确认避险防御。",
+            "what": "• 6大进攻/周期板块ETF ÷ 全市场VTI 标准化相对强弱（同一起点=100）：\n• 蓝:科技XLK | 红:通讯XLC | 黄:可选消费XLY | 绿:金融XLF | 紫:工业XLI | 青:能源XLE",
+            "up_down": "• 曲线上涨(斜率向上) = 该板块持续跑赢美股大盘，机构资金净流入。\n• 曲线下跌(斜率向下) = 该板块持续跑输美股大盘，机构资金净流出。",
+            "zones": "• ✅ 合理健康区间：各进攻板块围绕 `95 ~ 112` 有序轮动接力，领涨主线稳居 `100` 上方。\n• 🚨 不合理/单一拥挤区间：单一板块冲高突破 `125` 以上且斜率垂直陡峭（资金极度抱团泡沫，防风格切换急跌）。\n• 🚨 不合理/全线撤退区间：六大进攻板块全部跌破 `100` 且斜率向下（机构全面撤出风险资产）。",
+            "changes": "• 【组合① 科技XLK(蓝) + 通讯XLC(红) 领跑且稳居100上方】：AI科技与互联网巨头主导牛市，成长风格占优。\n• 【组合② 金融XLF(绿) + 工业XLI(紫) + 能源XLE(青) 接力走强，科技走平】：软着陆与再通胀风格切换，顺周期补涨。\n• 【组合③ 可选消费XLY(黄) 率先破位下行】：居民消费承压的股市先行映射，警惕零售与消费链盈利下修。\n• 【组合④ 六大进攻板块全线跌破100且斜率向下】：机构全面撤出进攻头寸，结合图20B确认避险。",
             "signal": "🎯 轮动配置法则：始终超配斜率最陡峭、稳居100基准线上方的1~2个领涨主线板块，果断剔除连续跑输大盘的弱势板块。",
         },
         {
@@ -1160,14 +1165,15 @@ def build_all_charts() -> list:
             "title": "20B. 美股防御与利率敏感板块轮动 (5大防御/周期板块)",
             "df": sec_def_df,
             "right_cols": [],
-            "left_title": "相对全市场VTI强弱 (起点=100)",
+            "left_title": "相对全市场VTI强弱 (同一起点=100)",
             "right_title": "",
-            "what": "• 5大防御/利率敏感板块ETF ÷ 全市场VTI 标准化相对强弱（1年前起点=100）：\n• 蓝:医疗XLV(防御) | 红:必需消费XLP(防御) | 黄:公用事业XLU(防御) | 绿:房地产XLRE | 紫:原材料XLB",
-            "how": "医疗、必需消费与公用事业盈利刚性强，是机构躲避经济衰退的「避风港」；房地产XLRE对10年期美债利率下行最敏感；原材料XLB挂钩全球大宗商品价格周期。",
-            "changes": "• 【组合① 医疗XLV(蓝) + 必需消费XLP(红) + 公用事业XLU(黄) 集体抬头跑赢大盘】：典型「Risk-Off 系统性避险信号」，机构正在抛售高贝塔成长股、躲入防御堡垒。\n• 【组合② 房地产XLRE(绿) + 公用事业XLU(黄) 同步走强】：市场正在抢跑定价「美债收益率见顶下行与美联储降息周期」，高股息类债资产受追捧。\n• 【组合③ 原材料XLB(紫) 领涨而三大防御板块走弱】：全球制造业补库与商品涨价交易主导，与图09铜金比上升相互印证。\n• 【组合④ 三大防御板块持续单边垫底】：市场风险偏好极度旺盛，资金全线进攻风险资产。",
+            "what": "• 5大防御/利率敏感板块ETF ÷ 全市场VTI 标准化相对强弱（同一起点=100）：\n• 蓝:医疗XLV(防御) | 红:必需消费XLP(防御) | 黄:公用事业XLU(防御) | 绿:房地产XLRE | 紫:原材料XLB",
+            "up_down": "• 三大防御(蓝/红/黄)上涨 = 机构抛售高波动成长股、躲入避风港（Risk-Off信号）。\n• 房地产(绿)上涨 = 市场抢跑定价美债利率下行与降息；原材料(紫)上涨 = 全球制造业补库与商品涨价。",
+            "zones": "• ✅ 合理健康区间：防御板块运行在 `90 ~ 103` 区间（市场风险偏好正常，进攻板块主导）。\n• 🚨 不合理/系统性避险区间：医疗XLV、必需消费XLP、公用事业XLU同步飙升突破 `106 ~ 110`（典型衰退或股灾避险特征）。\n• 🚨 不合理/利率紧缩重创区间：房地产XLRE单边暴跌破 `85`（高利率严重压制利率敏感型资产）。",
+            "changes": "• 【组合① 医疗XLV(蓝) + 必需消费XLP(红) + 公用事业XLU(黄) 集体抬头跑赢大盘】：Risk-Off系统性避险信号。\n• 【组合② 房地产XLRE(绿) + 公用事业XLU(黄) 同步走强】：市场抢跑定价美债收益率见顶下行与降息周期。\n• 【组合③ 原材料XLB(紫) 领涨而三大防御板块走弱】：全球制造业补库与商品涨价交易主导，与图09铜金比印证。\n• 【组合④ 三大防御板块持续单边垫底】：市场风险偏好极度旺盛，资金全线进攻风险资产。",
             "signal": "🚨 避险警报：当必需消费(XLP)与公用事业(XLU)连续3周以上显著跑赢科技(XLK)时，大盘往往面临系统性回调压力。",
         },
-        # --- 五、核心焦点扩展模块（共5张：AI强弱 + 全球24个月7大资产资金流柱状图 + CFTC机构7大资产24个月净比柱状图 + 全球流出恐慌图 + 美元指数跨资产跷跷板对比图） ---
+        # --- 五、核心焦点扩展模块 ---
         {
             "id": "21",
             "category": "扩展",
@@ -1175,11 +1181,12 @@ def build_all_charts() -> list:
             "title": "21. AI板块对比标普与三大股指强弱比 (AI vs Indices)",
             "df": ai_df,
             "right_cols": [],
-            "left_title": "相对强弱指数 (1.5年前起点=100)",
+            "left_title": "相对强弱指数 (同一起点=100)",
             "right_title": "",
             "what": "• 蓝:AI芯片SMH÷标普SPY | 红:AI应用AIQ÷标普SPY | 黄:AI机器人BOTZ÷标普SPY\n• 绿:AI芯片SMH÷纳指QQQ | 紫:AI芯片SMH÷罗素小盘IWM | 青:AI芯片SMH÷道指DIA",
-            "how": "精确量化AI核心产业链相对美股四大宽基指数（标普500、纳指100、罗素2000小盘、道琼斯工业）的超额收益与资金虹吸力度，识别AI内部「硬件算力 vs 软件应用」及大盘「高低切换」节奏。",
-            "changes": "• 【组合① 蓝线(SMH/SPY) + 红线(AIQ/SPY) + 绿线(SMH/QQQ) 同步上行】：AI全产业链处于最强主升浪，算力芯片不仅跑赢大盘，甚至大幅跑赢纳指本身。\n• 【组合② 蓝线(SMH/SPY)高位走平，而红线(AIQ/SPY)接力陡峭上升】：「AI行情第二阶段扩散」，资金从高估值芯片硬件向AI软件应用与商业变现端轮动。\n• 【组合③ 紫线(SMH/IWM) 与 青线(SMH/DIA) 同步大幅回落】：「资金高低切换」，市场从AI科技巨头撤出，流向降息受益的罗素小盘股与传统蓝筹补涨。\n• 【组合④ 六条强弱比曲线全线跌破中期上升趋势线】：AI资本开支放缓担忧升温，需阶段性降低半导体与AI仓位。",
+            "up_down": "• 曲线上涨 = AI核心产业链跑赢对应宽基指数，资金虹吸效应增强。\n• 曲线下跌 = AI板块跑输宽基指数，资金向传统蓝筹或中小盘股高低切换。",
+            "zones": "• ✅ 合理健康区间：强弱比沿中期均线稳步阶梯抬升（`100 ~ 135`），芯片与应用良性接力。\n• 🚨 不合理/算力泡沫拥挤区间：SMH/SPY 与 SMH/QQQ 短期垂直飙升偏离均线过高（筹码极度拥挤，财报稍有不及预期即暴跌）。\n• 🚨 不合理/主线退潮区间：六条强弱比曲线同步跌破中期上升趋势线且跌破 `100`（AI资本开支放缓担忧升温）。",
+            "changes": "• 【组合① 蓝线(SMH/SPY) + 红线(AIQ/SPY) + 绿线(SMH/QQQ) 同步上行】：AI全产业链处于最强主升浪。\n• 【组合② 蓝线(SMH/SPY)高位走平，而红线(AIQ/SPY)接力陡峭上升】：AI行情第二阶段扩散，资金从芯片向AI软件应用轮动。\n• 【组合③ 紫线(SMH/IWM) 与 青线(SMH/DIA) 同步大幅回落】：资金高低切换，流向降息受益的罗素小盘与传统蓝筹补涨。\n• 【组合④ 六条强弱比曲线全线跌破中期上升趋势线】：AI资本开支放缓担忧升温，阶段性降低半导体与AI仓位。",
             "signal": "🎯 轮动信号：SMH/SPY 与 SMH/QQQ 趋势向上时坚定持有AI算力龙头；若 SMH/IWM 跌破趋势线，及时切分仓位至中小盘与顺周期。",
         },
         {
@@ -1191,9 +1198,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "月均20日资金流净强弱 (%)",
             "right_title": "",
-            "what": "• 近24个月(2年)全球旗舰ETF月均资金流净强弱分组柱状图(%)（0轴上方=资金净流入，0轴下方=资金净流出）：\n• 蓝:美股SPY | 红:科技QQQ | 黄:新兴市场EEM | 绿:美债TLT | 紫:黄金GLD | 青:商品DBC | 洋红:比特币IBIT",
-            "how": "基于每日成交价位在高低区间的相对位置与成交额加权计算（Chaikin Money Flow），按月聚合呈现近2年宽柱对比，直观揭示全球二级市场资金在「美股、科技、新兴市场、美债、黄金、商品与比特币」七大资产间的真实迁徙轨迹。",
-            "changes": "• 【组合① 蓝(SPY)+红(QQQ)+洋红(IBIT) 齐现高正柱】：全球风险偏好极度旺盛，流动性充裕，美股与加密资产同步吸金。\n• 【组合② 绿(TLT)+紫(GLD) 转为高正柱，而蓝(SPY)/红(QQQ)出现负柱】：「典型避险切换」，资金从风险股市撤出，涌入美债与黄金寻求庇护。\n• 【组合③ 黄(EEM)+紫(GLD)+青(DBC) 同步强净流入】：美元走弱驱动「非美与实物再通胀行情」，新兴市场与大宗商品跑赢美股。\n• 【组合④ 七大资产柱体集体跌入0轴下方负值区】：「无差别流动性紧缩(Cash Dash)」，机构抛售一切资产回笼美元现金。",
+            "what": "• 近24个月(2年)全球旗舰ETF月均资金流净强弱分组柱状图(%)：\n• 蓝:美股SPY | 红:科技QQQ | 黄:新兴市场EEM | 绿:美债TLT | 紫:黄金GLD | 青:商品DBC | 洋红:比特币IBIT",
+            "up_down": "• 0轴上方正柱(柱体越高) = 资金主动买盘推升，月度净流入强度越强。\n• 0轴下方负柱(柱体越深) = 资金主动抛压打压，月度净流出强度越深。",
+            "zones": "• ✅ 合理健康区间：`-8% ~ +15%`（各大类资产在股、债、黄金、商品间有序轮动）。\n• 🚨 不合理/单资产极度拥挤区间：单类资产柱体冲高 `>+25%`（资金过度拥挤，警惕获利回吐）。\n• 🚨 不合理/全局流动性挤兑区间：七大资产柱体集体跌入 `<-10%` 负值区（无差别抛售一切资产回笼美元现金）。",
+            "changes": "• 【组合① 蓝(SPY)+红(QQQ)+洋红(IBIT) 齐现高正柱】：全球风险偏好旺盛，美股与加密资产同步吸金。\n• 【组合② 绿(TLT)+紫(GLD) 转为高正柱，而蓝(SPY)/红(QQQ)出现负柱】：典型避险切换，资金从股市撤出涌入美债与黄金。\n• 【组合③ 黄(EEM)+紫(GLD)+青(DBC) 同步强净流入】：美元走弱驱动非美与实物再通胀行情。\n• 【组合④ 七大资产柱体集体跌入0轴下方负值区】：无差别流动性紧缩(Cash Dash)，现金为王。",
             "signal": "🎯 资金流阈值：单月资金流强弱柱体站稳 +10% 代表机构持续建仓净流入强劲；跌破 -10% 代表机构持续派发净流出。",
         },
         {
@@ -1205,9 +1213,10 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "机构真实资金净流入/流出比 (%)",
             "right_title": "",
-            "what": "• 美国 CFTC 官方大型机构（非商业头寸）真实多空净比 = (多头-空头)/(多头+空头)×100%（近24个月柱状图）：\n• 蓝:美股标普500 | 红:美股科技纳指 | 黄:10年期美债 | 绿:实物黄金 | 紫:WTI原油 | 青:美元指数 | 洋红:比特币BTC",
-            "how": "直接取自美国政府 CFTC 每周强制披露的期货大户持仓真金白银头寸（含CME比特币期货）。0轴上方正柱=大型机构净做多资金净流入；0轴下方负柱=大型机构净做空资金净流出。与图22（ETF二级市场流向）交叉验证可识破机构「明修栈道、暗度陈仓」。",
-            "changes": "• 【组合① 绿(黄金)+洋红(BTC)+红(纳指) 齐现高正柱】：「货币贬值对冲 + AI进攻杠铃配置」，大型机构同时配置硬通货资产与科技成长。\n• 【组合② 黄(10年期美债)从深度负柱(-40%以下)快速收窄并翻正】：大型对冲基金集中平仓美债空头、做多美债，预示10年期美债收益率即将见顶回落。\n• 【组合③ 青(美元指数)正柱飙升 + 蓝/黄/绿柱集体转负】：机构大举做多美元、全面做空股债商品，全球美元流动性收紧警报拉响。\n• 【跨图背离 图22 ETF资金仍净流入，但图23 CFTC机构柱体已大幅转负】：散户与被动ETF仍在高位接盘，但华尔街聪明钱已在期货市场布局空单对冲派发！",
+            "what": "• 美国 CFTC 官方大型机构(非商业头寸)真实多空净比 = (多头-空头)/(多头+空头)×100%（近24个月柱状图）：\n• 蓝:美股标普500 | 红:美股科技纳指 | 黄:10年期美债 | 绿:实物黄金 | 紫:WTI原油 | 青:美元指数 | 洋红:比特币BTC",
+            "up_down": "• 0轴上方正柱(柱体越高) = 华尔街大型机构在期货市场真金白银净做多（真实资金流入）。\n• 0轴下方负柱(柱体越深) = 华尔街大型机构净做空（真实资金流出或大规模对冲）。",
+            "zones": "• ✅ 合理健康区间：`-25% ~ +35%`（机构多空配置理性均衡）。\n• 🚨 不合理/机构多头极度拥挤区间：`>+45%`（如黄金或BTC净比长期超+50%，多头过度拥挤防踩踏回调）。\n• 🚨 不合理/机构空头极度拥挤区间：`<-35%`（如10年美债或标普净比跌破-40%，空头极度拥挤，一旦基本面改善极易触发猛烈轧空）。",
+            "changes": "• 【组合① 绿(黄金)+洋红(BTC)+红(纳指) 齐现高正柱】：货币贬值对冲 + AI进攻杠铃配置，大型机构同时配置硬通货与科技成长。\n• 【组合② 黄(10年期美债)从深度负柱(-40%以下)快速收窄并翻正】：对冲基金集中平仓美债空头，预示10年美债收益率即将见顶回落。\n• 【组合③ 青(美元指数)正柱飙升 + 蓝/黄/绿柱集体转负】：机构大举做多美元、全面做空股债商品，全球美元流动性收紧。\n• 【跨图背离 图22 ETF资金仍净流入，但图23 CFTC机构柱体已大幅转负】：散户与被动ETF在高位接盘，华尔街聪明钱已在期货市场做空派发！",
             "signal": "🎯 机构头寸极值：单类资产机构净比突破 +45% 为多头极度拥挤；跌破 -35% 为极端净空头，一旦基本面改善极易触发猛烈轧空反转。",
         },
         {
@@ -1219,9 +1228,10 @@ def build_all_charts() -> list:
             "right_cols": ["VIX恐慌指数"],
             "left_title": "流出恐慌指数 / 净流出资产占比 (%)",
             "right_title": "VIX 恐慌指数",
-            "what": "• 蓝线(左轴)：全球资产流出恐慌指数(0~100，综合跨资产资金净流出+CCC信用利差+波动率)\n• 红线(左轴)：恐慌指数10周移动均线  • 黄线(左轴)：同步净流出资产占比(%)  • 绿线(右轴)：VIX恐慌指数",
-            "how": "专为监测「全球系统性流动性挤兑与无差别抛售（Cash Dash）」设计的风控雷达。正常市场中资金只是在股、债、黄金间轮动（黄线处于30%~60%）；只有当所有资产同时失去避险功能、相关性趋近于1时，蓝线与黄线才会同步飙升至极值。",
-            "changes": "• 【组合① 蓝线 < 35 + 黄线 < 50% + 绿线(VIX) < 18】：全球流动性充裕，资产间良性轮动，无系统性抛售风险。\n• 【组合② 绿线(VIX)脉冲跳升(>25) 但 黄线(净流出资产占比) ≤ 57%】：仅单一市场局部波动（如美股回调但美债与黄金资金净流入），避险机制依然有效。\n• 【组合③ 蓝线飙升突破 65~80 + 黄线高达 85%~100%（七大资产全线净流出）】：最高级别「全球流动性危机警报」，机构为补缴保证金无差别抛售股、债、黄金与BTC换取现金。\n• 【组合④ 蓝线突破 75 极值后首次拐头下穿红线(10周均线)】：恐慌抛售高潮已过、央行救市或流动性见底，迎来全局性抄底窗口。",
+            "what": "• 蓝线(左轴)：全球资产流出恐慌指数(0~100)  • 红线(左轴)：10周均线\n• 黄线(左轴)：同步净流出资产占比(%)  • 绿线(右轴)：VIX恐慌指数",
+            "up_down": "• 蓝/黄/绿线上涨 = 全球跨资产同步抛售压力与流动性紧张加剧。\n• 蓝/黄/绿线下跌 = 恐慌抛售消退，市场恢复正常轮动与流动性宽松。",
+            "zones": "• ✅ 合理健康区间：恐慌指数 `<35`、同步净流出资产占比 `<50%`、VIX `<19.0`（资产间良性轮动，股债跷跷板有效）。\n• 🚨 不合理/局部波动区间：VIX `22~28` 但同步净流出占比 `≤57%`（仅单一市场回调，美债与黄金仍发挥避险作用）。\n• 🚨 不合理/全局流动性危机区间：恐慌指数 `>65` 且同步净流出资产占比 `≥85%`（七大资产全线失血，机构为补保证金无差别抛售一切资产）。",
+            "changes": "• 【组合① 蓝线 < 35 + 黄线 < 50% + 绿线(VIX) < 18】：全球流动性充裕，无系统性抛售风险。\n• 【组合② 绿线(VIX)脉冲跳升(>25) 但 黄线(净流出占比) ≤ 57%】：仅单一市场局部波动，避险机制依然有效。\n• 【组合③ 蓝线飙升突破 65~80 + 黄线高达 85%~100%】：最高级别全球流动性危机警报，必须降杠杆并保留现金。\n• 【组合④ 蓝线突破 75 极值后首次拐头下穿红线(10周均线)】：恐慌抛售高潮已过、流动性见底，迎来全局性抄底窗口。",
             "signal": "🚨 恐慌熔断线：全球资产流出恐慌指数 > 65 且同步净流出资产占比 ≥ 85% 为最高级别流动性警报，必须降杠杆并保留现金；蓝线高位下穿红线则是危机后的抄底信号。",
         },
         {
@@ -1231,11 +1241,12 @@ def build_all_charts() -> list:
             "title": "25. 美元指数(DXY)强弱对比与全球资产跷跷板效应 (USD vs Global Assets)",
             "df": dxy_compare_df,
             "right_cols": [],
-            "left_title": "标准化相对表现 (2年前起点=100)",
+            "left_title": "标准化相对表现 (同一起点=100)",
             "right_title": "",
-            "what": "• 近2年(104周)标准化跨资产强弱对比（2年前起点=100）：\n• 蓝:美元指数DXY(全球流动性总阀门) | 红:美股标普500(SPY) | 黄:新兴市场(EEM)\n• 绿:实物黄金(GLD) | 紫:美债长债(TLT) | 青:比特币ETF(IBIT)",
-            "how": "美元是全球贸易结算与跨境融资的计价锚。美元指数(DXY)走强等同于收紧全球美元流动性（抽水机效应）；美元指数走弱等同于向全球释放流动性（开闸放水）。本图将美元与五大核心资产置于同一标尺，清晰呈现跷跷板博弈。",
-            "changes": "• 【组合① 蓝线(美元DXY)单边飙升 + 黄(新兴市场EEM)/紫(美债TLT)/青(BTC)集体下挫】：典型「强美元流动性抽水行情」，非美资产与长久期资产承压，仅美元现金与美股防御板块抗跌。\n• 【组合② 蓝线(美元DXY)破位下行 + 绿(黄金GLD)+黄(EEM)+青(BTC)全线暴涨】：经典「弱美元全球流动性牛市」，黄金、加密资产与新兴市场爆发力最强。\n• 【组合③ 蓝线(美元DXY)与绿线(黄金GLD)罕见同步上涨】：「地缘危机或主权信用重估组合」，说明全球央行与避险资金因地缘或财政赤字风险同时买入美元与黄金，此时新兴市场与风险资产风险极高。\n• 【组合④ 蓝线(美元DXY)高位滞涨回落 + 红线(美股SPY)稳步上行】：美国经济一枝独秀转向全球温和复苏，美股与非美资产迎来共振上涨。",
+            "what": "• 近2年(104周)同一起点(`100`)标准化跨资产强弱对比：\n• 蓝:美元指数DXY(全球流动性总阀门) | 红:美股标普500(SPY) | 黄:新兴市场(EEM)\n• 绿:实物黄金(GLD) | 紫:美债长债(TLT) | 青:比特币ETF(IBIT)",
+            "up_down": "• 蓝线(美元DXY)上涨 = 全球美元流动性抽紧（抽水机效应，压制新兴市场、黄金、美债与比特币）。\n• 蓝线(美元DXY)下跌 = 全球美元流动性释放（开闸放水，助推黄金、比特币与新兴市场爆发）。",
+            "zones": "• ✅ 合理健康区间：蓝线(DXY)围绕 `96 ~ 104`（标准化 `95 ~ 103`）区间温和震荡，全球资本有序配置。\n• 🚨 不合理/强美元抽水危机区间：蓝线单边急飙突破 `105+`（新兴市场汇率承压、全球风险资产面临美元流动性紧缩）。\n• 🚨 不合理/信用重估避险区间：蓝线(DXY)与绿线(黄金GLD)罕见同步急涨（地缘危机或主权财政赤字引发无差别避险）。",
+            "changes": "• 【组合① 蓝线(美元DXY)单边飙升 + 黄(EEM)/紫(TLT)/青(BTC)集体下挫】：强美元流动性抽水行情，仅美元现金与美股防御板块抗跌。\n• 【组合② 蓝线(美元DXY)破位下行 + 绿(黄金GLD)+黄(EEM)+青(BTC)全线暴涨】：弱美元全球流动性牛市，黄金、加密资产与新兴市场爆发力最强。\n• 【组合③ 蓝线(美元DXY)与绿线(黄金GLD)罕见同步上涨】：地缘危机或主权信用重估组合，此时新兴市场与风险资产风险极高。\n• 【组合④ 蓝线(美元DXY)高位滞涨回落 + 红线(美股SPY)稳步上行】：美国经济一枝独秀转向全球温和复苏，美股与非美资产共振上涨。",
             "signal": "🎯 美元总阀门法则：当美元指数(蓝线)跌破中期趋势线且新兴市场(黄线)与黄金(绿线)同步站上100基准线上方时，果断加配黄金、比特币与非美资产。",
         },
     ]
@@ -1243,26 +1254,37 @@ def build_all_charts() -> list:
 
 
 # ==========================================
-# 4. 26 张图表数据完整性与真实性自检器
+# 4. 26 张图表数据真实性与异常值自动体检器
 # ==========================================
 def verify_charts_integrity(charts: list):
-    print("\n" + "=" * 76)
-    print("🔍 全量 26 张图表数据真实性与连续性核验报告")
-    print("=" * 76)
+    print("\n" + "=" * 84)
+    print("🔍 全量 26 张图表数据真实性、基准对齐与异常值体检报告")
+    print("=" * 84)
+    now_ts = pd.Timestamp.now()
     for c in charts:
         df = c["df"]
         if df.empty:
-            print(f"❌ [缺失] {c['title']} -> DataFrame 为空！")
+            print(f"❌ [严重缺失] {c['title']} -> DataFrame 为空！")
             continue
         start_d = df.index[0].strftime("%Y-%m-%d")
         end_d = df.index[-1].strftime("%Y-%m-%d")
+        lag_days = (now_ts - df.index[-1]).days
+        lag_flag = f" ⚠️滞后{lag_days}天" if lag_days > 45 else ""
+
         col_stats = []
         for col in df.columns:
-            valid_n = int(df[col].notna().sum())
-            last_v = df[col].dropna().iloc[-1] if valid_n > 0 else np.nan
-            col_stats.append(f"{col}:{valid_n}点(最新={last_v:.2f})")
-        print(f"✅ [{c['id']}] {c['title']} | {start_d} ~ {end_d} | " + " | ".join(col_stats))
-    print("=" * 76 + "\n")
+            s_valid = df[col].dropna()
+            valid_n = len(s_valid)
+            if valid_n == 0:
+                col_stats.append(f"{col}:❌全空")
+                continue
+            last_v = float(s_valid.iloc[-1])
+            std_v = float(s_valid.std()) if valid_n > 1 else 0.0
+            flat_warn = "(⚠️零波动)" if std_v < 1e-6 else ""
+            col_stats.append(f"{col}:{valid_n}点[最新={last_v:.2f}]{flat_warn}")
+
+        print(f"✅ [{c['id']}] {c['title']} | {start_d} ~ {end_d}{lag_flag} | " + " | ".join(col_stats))
+    print("=" * 84 + "\n")
 
 
 # ==========================================
@@ -1286,8 +1308,8 @@ def generate_ai_summary(charts: list) -> str:
         try:
             prompt = (
                 "你是资深美股宏观与量化策略师。请根据以下最新拉取的26张核心图表数据快照，"
-                "用简洁有力的中文写一段250字以内的【本期宏观、AI强弱、机构资金流与美元跷跷板总评】，依次点明："
-                "1) 消费与供给趋势；2) 利率与信用风险；3) AI板块相对大盘强弱、CFTC大型机构全球七大资产(含BTC)真实流入/流出比、全球资产流出恐慌指数及美元指数(DXY)跨资产联动状态。\n\n"
+                "用简洁有力的中文写一段260字以内的【本期宏观、AI强弱、机构资金流与美元跷跷板总评】，依次点明："
+                "1) 消费与供给是否处于合理健康区间；2) 利率与信用风险；3) AI强弱、CFTC大型机构七大资产(含BTC)真实净比、全球流出恐慌指数及美元指数(DXY)跨资产联动状态。\n\n"
                 f"{context_text}"
             )
             resp = requests.post(
@@ -1300,7 +1322,7 @@ def generate_ai_summary(charts: list) -> str:
                     "model": "gpt-4o-mini",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.3,
-                    "max_tokens": 500,
+                    "max_tokens": 520,
                 },
                 timeout=30,
             )
@@ -1310,9 +1332,9 @@ def generate_ai_summary(charts: list) -> str:
             print(f"[Warning] OpenAI 摘要生成失败，切换至规则摘要: {e}")
 
     return (
-        "全量26张核心图表已同步至最新交易日。请重点核查：① 纽约联储WEI指数与油金/铜金比通胀方向；"
-        "② 10年与2年期美债利率及CCC信用利差；③ 标普500市场宽度与CFTC资管机构持仓敞口；"
-        "④ AI板块相对强弱、近24个月全球七大资产资金流柱状图、CFTC机构七大资产(含BTC)真实净比柱状图、全球流出恐慌指数及美元指数(DXY)跨资产跷跷板。"
+        "全量26张核心图表已同步至最新交易日并完成同起点基准校验。请重点核查：① 纽约联储WEI指数与油金/铜金比所处区间；"
+        "② 美债收益率曲线形态与CCC信用利差；③ 标普500市场宽度与CFTC资管机构持仓；"
+        "④ AI强弱、近24个月全球七大资产资金流柱状图、CFTC机构七大资产(含BTC)真实净比柱状图、全球流出恐慌指数及美元指数(DXY)跨资产跷跷板。"
     )
 
 
@@ -1342,13 +1364,14 @@ def compute_axis_bounds(df: pd.DataFrame, cols: list, is_column: bool = False) -
 
 
 # ==========================================
-# 6. 写入底层数据并渲染高清 26 图扩容看板
+# 6. 写入底层数据并渲染高清 26 图五段式指南看板
 # ==========================================
 def render_to_google_sheets(charts: list, ai_summary: str):
     sh = gc.open_by_key(SPREADSHEET_ID)
 
-    # 26 张图（每张 34 行）+ 5 个分类横幅 + 顶部标题区，总行数设为 965 行
-    total_dash_rows = 965
+    # 26 张图（每张 44 行）+ 5 个分类横幅 + 顶部标题区，总行数设为 1220 行
+    CARD_ROWS = 44
+    total_dash_rows = 1220
     raw_rows_cap = 450
     raw_cols_cap = 240
 
@@ -1482,14 +1505,14 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         ).execute()
 
     # ------------------------------------------
-    # B. 构建 Dashboard 文本卡片与扩容四段式深度读图指南
+    # B. 构建 Dashboard 文本卡片与五段式深度读图指南
     # ------------------------------------------
     tz_cst = timezone(timedelta(hours=8))
     now_str = datetime.now(tz_cst).strftime("%Y-%m-%d %H:%M (UTC+8)")
 
     dash_grid = [[""] * 16 for _ in range(total_dash_rows)]
     dash_grid[1][1] = "📈 美股核心 26 张宏观、机构全球资金流比(含BTC)、恐慌与美元跷跷板全景看板"
-    dash_grid[2][1] = f"自动更新时间：{now_str}   |   数据来源：FRED 美联储 · CFTC 官方持仓(含CME比特币) · CBOE · Redfin · Yahoo Finance · AAII"
+    dash_grid[2][1] = f"自动更新时间：{now_str}   |   数据来源：FRED 美联储 · CFTC 官方标准合约(含CME比特币) · CBOE · Redfin · Yahoo Finance · AAII"
     dash_grid[3][1] = f"🤖 AI 宏观与资金流总评：{ai_summary}"
 
     category_banners = {
@@ -1504,9 +1527,6 @@ def render_to_google_sheets(charts: list, ai_summary: str):
     current_cat = None
     layout_blocks = []
 
-    # 每张图卡片扩容至 34 行，充分容纳多维组合情景与背离对比矩阵
-    CARD_ROWS = 34
-
     for c in charts:
         cat = c["category"]
         if cat != current_cat:
@@ -1517,15 +1537,17 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             row_cursor += 2
 
         r0 = row_cursor
-        dash_grid[r0][9] = f"📌 {c['title']} — 深度读图与多维组合实战指南"
-        dash_grid[r0 + 1][9] = "【① 曲线/柱体与坐标轴精确定义】"
+        dash_grid[r0][9] = f"📌 {c['title']} — 五段式深度读图、区间阈值与组合指南"
+        dash_grid[r0 + 1][9] = "【① 每根线/柱体与坐标轴精确定义】"
         dash_grid[r0 + 2][9] = c["what"]
-        dash_grid[r0 + 7][9] = "【② 底层宏观机制与跨市场传导链条】"
-        dash_grid[r0 + 8][9] = c["how"]
-        dash_grid[r0 + 14][9] = "【③ 多维组合情景与背离对比矩阵】"
-        dash_grid[r0 + 15][9] = c["changes"]
-        dash_grid[r0 + 28][9] = "【④ 量化触发阈值与实战仓位对策】"
-        dash_grid[r0 + 29][9] = c["signal"]
+        dash_grid[r0 + 7][9] = "【② 每根线上涨与下跌分别代表什么】"
+        dash_grid[r0 + 8][9] = c["up_down"]
+        dash_grid[r0 + 15][9] = "【③ 合理区间 vs 不合理（极端警戒）区间划分】"
+        dash_grid[r0 + 16][9] = c["zones"]
+        dash_grid[r0 + 24][9] = "【④ 多维组合情景与背离对比矩阵】"
+        dash_grid[r0 + 25][9] = c["changes"]
+        dash_grid[r0 + 38][9] = "【⑤ 量化触发阈值与实战仓位对策】"
+        dash_grid[r0 + 39][9] = c["signal"]
 
         layout_blocks.append({
             "type": "chart_card",
@@ -1544,11 +1566,11 @@ def render_to_google_sheets(charts: list, ai_summary: str):
     raw_id = raw_ws.id
     requests_batch = []
 
-    # 列宽分配：左侧 1~8 列共 848px 放置高清图表，右侧 9~14 列共 810px 放置深度组合指南
+    # 列宽分配：左侧 1~8 列共 856px 放置高清图表，右侧 9~14 列共 840px 放置五段式深度指南
     col_widths = (
         [(0, 1, 20)]
-        + [(i, i + 1, 106) for i in range(1, 9)]
-        + [(i, i + 1, 135) for i in range(9, 15)]
+        + [(i, i + 1, 107) for i in range(1, 9)]
+        + [(i, i + 1, 140) for i in range(9, 15)]
     )
     for start_c, end_c, px in col_widths:
         requests_batch.append({
@@ -1635,7 +1657,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         {
             "updateDimensionProperties": {
                 "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": 3, "endIndex": 4},
-                "properties": {"pixelSize": 64},
+                "properties": {"pixelSize": 66},
                 "fields": "pixelSize",
             }
         },
@@ -1680,7 +1702,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         requests_batch.append({
             "updateDimensionProperties": {
                 "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + CARD_ROWS},
-                "properties": {"pixelSize": 23},
+                "properties": {"pixelSize": 22},
                 "fields": "pixelSize",
             }
         })
@@ -1707,7 +1729,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             },
         ])
 
-        for sr in [r0 + 1, r0 + 7, r0 + 14, r0 + 28]:
+        for sr in [r0 + 1, r0 + 7, r0 + 15, r0 + 24, r0 + 38]:
             requests_batch.extend([
                 {
                     "mergeCells": {
@@ -1732,12 +1754,18 @@ def render_to_google_sheets(charts: list, ai_summary: str):
 
         body_blocks = [
             (r0 + 2, r0 + 7),
-            (r0 + 8, r0 + 14),
-            (r0 + 15, r0 + 28),
-            (r0 + 29, r0 + 34),
+            (r0 + 8, r0 + 15),
+            (r0 + 16, r0 + 24),
+            (r0 + 25, r0 + 38),
+            (r0 + 39, r0 + 44),
         ]
         for idx_b, (br_start, br_end) in enumerate(body_blocks):
-            bg = {"red": 0.99, "green": 0.96, "blue": 0.95} if idx_b == 3 else {"red": 0.98, "green": 0.99, "blue": 1.0}
+            if idx_b == 2:
+                bg = {"red": 0.96, "green": 0.99, "blue": 0.96}
+            elif idx_b == 4:
+                bg = {"red": 0.99, "green": 0.96, "blue": 0.95}
+            else:
+                bg = {"red": 0.98, "green": 0.99, "blue": 1.0}
             requests_batch.extend([
                 {
                     "mergeCells": {
@@ -1878,8 +1906,8 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                             "anchorCell": {"sheetId": dash_id, "rowIndex": r0, "columnIndex": 1},
                             "offsetXPixels": 2,
                             "offsetYPixels": 2,
-                            "widthPixels": 842,
-                            "heightPixels": 768,
+                            "widthPixels": 850,
+                            "heightPixels": 950,
                         }
                     },
                 }
@@ -1894,7 +1922,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         ).execute()
         time.sleep(1)
 
-    print("✅ 全部 26 张高清图表（含24个月清晰柱状图、BTC机构头寸、美元指数对比及扩容组合指南）已更新完毕！")
+    print("✅ 全部 26 张高清图表（含数据精度修复 + 五段式全量读图与区间指南）已更新完毕！")
 
 
 if __name__ == "__main__":
