@@ -7,6 +7,7 @@ import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urljoin
 
 import gspread
 import numpy as np
@@ -161,8 +162,7 @@ def _normalize_header_table(raw: pd.DataFrame, required_keywords: list) -> pd.Da
 
 
 def fetch_aaii_sentiment() -> pd.DataFrame:
-    """多源容错抓取 AAII 散户情绪调查 (看涨% - 看跌%)，消除 Pandas 3/4 xlrd 警告"""
-    # 通道 1: 官方数据文件（优先 calamine / 自动引擎 / HTML 伪装表解析）
+    """多源容错抓取 AAII 散户情绪调查 (看涨% - 看跌%)"""
     try:
         url = "https://www.aaii.com/files/surveys/sentiment.xls"
         r = requests.get(url, headers=HEADERS, timeout=30)
@@ -197,14 +197,13 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
                 df[bear_col] *= 100.0
             spread = (df[bull_col] - df[bear_col]).rename("散户净看涨差值(%)")
             ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
-            res = pd.concat([spread, ma20], axis=1).dropna()
+            res = pd.concat([spread, ma20], axis=1, sort=True).dropna()
             if len(res) > 20:
                 print(f"[OK] AAII 散户情绪成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
                 return res
     except Exception as e:
         print(f"[Info] AAII 文件通道切换至网页直抓: {e}")
 
-    # 通道 2: AAII 官网情绪调查结果 HTML 表格
     try:
         page = requests.get("https://www.aaii.com/sentimentsurvey/sent_results", headers=HEADERS, timeout=30)
         page.raise_for_status()
@@ -223,7 +222,7 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
                 df = df.dropna().set_index(d_col).sort_index()
                 spread = (df[b_col] - df[s_col]).rename("散户净看涨差值(%)")
                 ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
-                res = pd.concat([spread, ma20], axis=1).dropna()
+                res = pd.concat([spread, ma20], axis=1, sort=True).dropna()
                 if not res.empty:
                     print(f"[OK] AAII 网页通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
                     return res
@@ -232,67 +231,100 @@ def fetch_aaii_sentiment() -> pd.DataFrame:
     return pd.DataFrame()
 
 
+def _parse_naaim_df(raw: pd.DataFrame) -> pd.DataFrame:
+    """统一清洗 NAAIM 数据表"""
+    raw = _normalize_header_table(raw, ["date"])
+    d_candidates = [c for c in raw.columns if "date" in c]
+    d_col = d_candidates[0] if d_candidates else raw.columns[0]
+    v_candidates = [c for c in raw.columns if "mean" in c or "number" in c or "exposure" in c]
+    v_col = v_candidates[0] if v_candidates else raw.columns[1]
+    df = raw[[d_col, v_col]].copy()
+    df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
+    df[v_col] = pd.to_numeric(df[v_col].astype(str).str.replace("%", ""), errors="coerce")
+    df = df.dropna().set_index(d_col).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    exp = df[v_col].rename("机构风险敞口(%)")
+    ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+    return pd.concat([exp, ma20], axis=1, sort=True).dropna()
+
+
 def fetch_naaim_exposure() -> pd.DataFrame:
-    """多源容错抓取 NAAIM 机构投资经理风险敞口"""
+    """多源容错抓取 NAAIM 机构投资经理风险敞口（支持 WordPress 附件直链、Datawrapper 与内嵌脚本解析）"""
     try:
         base_url = "https://www.naaim.org/programs/naaim-exposure-index/"
         page = requests.get(base_url, headers=HEADERS, timeout=30)
         page.raise_for_status()
+        html = page.text
 
-        # 通道 1: 自动提取页面中的官方 Excel/CSV 数据直链
-        file_links = re.findall(
-            r'href=["\']([^"\']+(?:NAAIM|Exposure|Data)[^"\']*\.(?:xlsx|xls|csv))["\']',
-            page.text,
-            flags=re.I,
+        # 通道 1: 提取页面上所有 Excel / CSV 附件链接（不限文件名关键字，优先匹配含 naaim/exposure/uploads 的链接）
+        all_links = re.findall(r'href=["\']([^"\']+\.(?:xlsx|xls|csv)(?:\?[^"\']*)?)["\']', html, flags=re.I)
+        all_links = sorted(
+            set(all_links),
+            key=lambda u: (0 if any(k in u.lower() for k in ["naaim", "exposure", "uploads"]) else 1),
         )
-        for link in file_links:
-            if link.startswith("/"):
-                link = "https://www.naaim.org" + link
+        for link in all_links:
+            full_url = urljoin(base_url, link)
             try:
-                fr = requests.get(link, headers=HEADERS, timeout=30)
-                if fr.status_code == 200:
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        if link.lower().endswith(".csv"):
-                            raw = pd.read_csv(io.BytesIO(fr.content))
-                        else:
-                            raw = pd.read_excel(io.BytesIO(fr.content))
-                    raw = _normalize_header_table(raw, ["date"])
-                    d_col = [c for c in raw.columns if "date" in c][0]
-                    v_candidates = [c for c in raw.columns if "mean" in c or "number" in c or "exposure" in c]
-                    v_col = v_candidates[0] if v_candidates else raw.columns[1]
-                    df = raw[[d_col, v_col]].copy()
-                    df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
-                    df[v_col] = pd.to_numeric(df[v_col], errors="coerce")
-                    df = df.dropna().set_index(d_col).sort_index()
-                    exp = df[v_col].rename("机构风险敞口(%)")
-                    ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
-                    res = pd.concat([exp, ma20], axis=1).dropna()
-                    if len(res) > 20:
-                        print(f"[OK] NAAIM 文件通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
-                        return res
+                fr = requests.get(full_url, headers=HEADERS, timeout=30)
+                if fr.status_code != 200:
+                    continue
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    if ".csv" in full_url.lower():
+                        raw = pd.read_csv(io.BytesIO(fr.content))
+                    else:
+                        raw = pd.read_excel(io.BytesIO(fr.content))
+                res = _parse_naaim_df(raw)
+                if len(res) > 20:
+                    print(f"[OK] NAAIM 附件通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
+                    return res
             except Exception:
                 continue
 
-        # 通道 2: 解析页面内嵌 HTML 表格
-        tables = pd.read_html(io.StringIO(page.text))
-        for tbl in tables:
-            tbl = _normalize_header_table(tbl, ["date"])
-            cols = list(tbl.columns)
-            if len(cols) >= 2:
-                d_col = cols[0]
-                v_candidates = [c for c in cols if "mean" in c or "number" in c or "exposure" in c]
-                v_col = v_candidates[0] if v_candidates else cols[1]
-                df = tbl[[d_col, v_col]].copy()
-                df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
-                df[v_col] = pd.to_numeric(df[v_col], errors="coerce")
-                df = df.dropna().set_index(d_col).sort_index()
-                exp = df[v_col].rename("机构风险敞口(%)")
-                ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
-                res = pd.concat([exp, ma20], axis=1).dropna()
+        # 通道 2: 检测页面内嵌的 Datawrapper 图表 iframe，直接读取其 dataset.csv
+        dw_links = re.findall(r'https?://datawrapper\.dwcdn\.net/([A-Za-z0-9]+)/\d+/?', html)
+        for chart_id in set(dw_links):
+            for dw_csv in [
+                f"https://datawrapper.dwcdn.net/{chart_id}/1/dataset.csv",
+                f"https://datawrapper.dwcdn.net/{chart_id}/2/dataset.csv",
+                f"https://datawrapper.dwcdn.net/{chart_id}/3/dataset.csv",
+            ]:
+                try:
+                    dr = requests.get(dw_csv, headers=HEADERS, timeout=15)
+                    if dr.status_code == 200 and "," in dr.text:
+                        raw = pd.read_csv(io.StringIO(dr.text))
+                        res = _parse_naaim_df(raw)
+                        if len(res) > 20:
+                            print(f"[OK] NAAIM Datawrapper通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
+                            return res
+                except Exception:
+                    continue
+
+        # 通道 3: 解析 WordPress Visualizer / Highcharts 内嵌 JS JSON 数据序列
+        js_pairs = re.findall(r'\[\s*["\'](\d{4}-\d{2}-\d{2})["\']\s*,\s*(-?\d+(?:\.\d+)?)\s*\]', html)
+        if len(js_pairs) > 20:
+            s = pd.Series(
+                [float(v) for _, v in js_pairs],
+                index=pd.to_datetime([d for d, _ in js_pairs]),
+                name="机构风险敞口(%)",
+            )
+            s = s[~s.index.duplicated(keep="last")].sort_index()
+            ma20 = s.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+            res = pd.concat([s, ma20], axis=1, sort=True).dropna()
+            if len(res) > 20:
+                print(f"[OK] NAAIM 内嵌图通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
+                return res
+
+        # 通道 4: 若存在 HTML 表格则解析
+        if "<table" in html.lower():
+            tables = pd.read_html(io.StringIO(html))
+            for tbl in tables:
+                res = _parse_naaim_df(tbl)
                 if len(res) > 20:
-                    print(f"[OK] NAAIM 网页通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
+                    print(f"[OK] NAAIM 网页表格通道成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
                     return res
+
+        print("[Warning] NAAIM 页面未发现可解析的数据链接或图表")
     except Exception as e:
         print(f"[Warning] NAAIM 数据抓取异常: {e}")
     return pd.DataFrame()
@@ -327,10 +359,7 @@ def _fetch_single_cboe_day(d_str: str):
 
 
 def fetch_cboe_put_call() -> pd.DataFrame:
-    """
-    并发直连 CBOE 官方每日市场统计 CDN 接口拉取真实 Put/Call 比值
-    （已彻底移除 Yahoo Finance 已下线的 ^CPCE / ^CPC）
-    """
+    """并发直连 CBOE 官方每日市场统计 CDN 接口拉取真实 Put/Call 比值"""
     try:
         today = datetime.now(timezone.utc).date()
         candidate_dates = [
@@ -355,7 +384,7 @@ def fetch_cboe_put_call() -> pd.DataFrame:
             )
             pcr = pcr[~pcr.index.duplicated(keep="last")].sort_index()
             ma20 = pcr.rolling(20, min_periods=5).mean().rename("20日均线")
-            out = pd.concat([pcr, ma20], axis=1).dropna()
+            out = pd.concat([pcr, ma20], axis=1, sort=True).dropna()
             print(f"[OK] CBOE Put/Call 成功拉取 {len(out)} 个交易日数据 (最新: {out.index[-1].strftime('%Y-%m-%d')})")
             return out
         else:
@@ -409,7 +438,7 @@ def fetch_cftc_cot() -> pd.DataFrame:
             .sort_index()
             .rename("纳指100投机净持仓(万手)")
         )
-        res = pd.concat([sp_net, nq_net], axis=1)
+        res = pd.concat([sp_net, nq_net], axis=1, sort=True)
         print(f"[OK] CFTC COT 持仓成功拉取 {len(res)} 周数据 (最新: {res.index[-1].strftime('%Y-%m-%d')})")
         return res
     except Exception as e:
@@ -442,7 +471,7 @@ def fetch_sp500_breadth() -> pd.DataFrame:
         valid_200 = ma200.notna().sum(axis=1).replace(0, np.nan)
         b50 = ((prices > ma50).sum(axis=1) / valid_50 * 100.0).rename("50日市场宽度(%)")
         b200 = ((prices > ma200).sum(axis=1) / valid_200 * 100.0).rename("200日市场宽度(%)")
-        df = pd.concat([b50, b200], axis=1).dropna()
+        df = pd.concat([b50, b200], axis=1, sort=True).dropna()
         print(f"[OK] S&P 500 市场宽度计算完成 ({len(df)} 个交易日)")
         return df.iloc[-300:]
     except Exception as e:
@@ -453,14 +482,15 @@ def fetch_sp500_breadth() -> pd.DataFrame:
 def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=3) -> pd.DataFrame:
     """
     防截断、防虚假平拉的时间序列对齐函数：
-    1) 不使用全局 dropna()，避免某一条短序列或发布滞后指标砍掉其他曲线的历史数据；
-    2) 仅在各序列自身的有效时间区间内做有限步长填充，绝不将过期数据向未来无限平拉。
+    1) 使用 sort=True 兼容 Pandas 3.x / 4.x，消除弃用警告；
+    2) 不使用全局 dropna()，避免某一条短序列或发布滞后指标砍掉其他曲线的历史数据；
+    3) 仅在各序列自身的有效时间区间内做有限步长填充。
     """
     valid_series = [s for s in series_list if s is not None and not s.empty]
     if not valid_series:
         return pd.DataFrame()
 
-    df = pd.concat(valid_series, axis=1).sort_index()
+    df = pd.concat(valid_series, axis=1, sort=True)
     if freq:
         df = df.resample(freq).last()
 
@@ -1025,17 +1055,42 @@ def render_to_google_sheets(charts: list, ai_summary: str):
     dash_ws.clear()
     raw_ws.clear()
 
-    # 清除旧图表对象
+    # 清除旧图表对象 + 彻底解除旧版合并单元格（修复 mergeCells 400 冲突）
     meta = sheets_service.spreadsheets().get(spreadsheetId=SPREADSHEET_ID).execute()
-    delete_requests = []
+    reset_requests = [
+        {
+            "unmergeCells": {
+                "range": {
+                    "sheetId": dash_ws.id,
+                    "startRowIndex": 0,
+                    "endRowIndex": total_dash_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 16,
+                }
+            }
+        },
+        {
+            "repeatCell": {
+                "range": {
+                    "sheetId": dash_ws.id,
+                    "startRowIndex": 0,
+                    "endRowIndex": total_dash_rows,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": 16,
+                },
+                "cell": {"userEnteredFormat": {}},
+                "fields": "userEnteredFormat",
+            }
+        },
+    ]
     for s in meta.get("sheets", []):
         if s["properties"]["sheetId"] == dash_ws.id:
             for ch in s.get("charts", []):
-                delete_requests.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
-    if delete_requests:
-        sheets_service.spreadsheets().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID, body={"requests": delete_requests}
-        ).execute()
+                reset_requests.append({"deleteEmbeddedObject": {"objectId": ch["chartId"]}})
+
+    sheets_service.spreadsheets().batchUpdate(
+        spreadsheetId=SPREADSHEET_ID, body={"requests": reset_requests}
+    ).execute()
 
     # ------------------------------------------
     # A. 写入 Raw_Data 底层数据
