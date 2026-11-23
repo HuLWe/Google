@@ -25,8 +25,10 @@ SPREADSHEET_ID = os.environ["SPREADSHEET_ID"].strip()
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    )
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
 }
 
 SCOPES = [
@@ -41,11 +43,22 @@ sheets_service = build("sheets", "v4", credentials=creds)
 DASH_SHEET_NAME = "📊 宏观与市场看板"
 RAW_SHEET_NAME = "📁 底层数据明细"
 
+# 高对比度色板，防止相邻曲线颜色接近粘连
+PALETTE = [
+    {"red": 0.12, "green": 0.47, "blue": 0.71},  # 1. 经典蓝
+    {"red": 0.84, "green": 0.15, "blue": 0.16},  # 2. 警示红
+    {"red": 0.95, "green": 0.58, "blue": 0.05},  # 3. 琥珀橙黄
+    {"red": 0.17, "green": 0.63, "blue": 0.17},  # 4. 翠绿
+    {"red": 0.58, "green": 0.40, "blue": 0.74},  # 5. 紫罗兰
+    {"red": 0.09, "green": 0.75, "blue": 0.81},  # 6. 青蓝
+    {"red": 0.89, "green": 0.47, "blue": 0.76},  # 7. 洋红
+]
+
 
 # ==========================================
-# 2. 真实数据抓取与资金流计算函数（带容错处理）
+# 2. 真实数据抓取与资金流计算函数（全量容错与防截断）
 # ==========================================
-def fetch_fred(series_id: str, start_date: str = "2021-01-01") -> pd.Series:
+def fetch_fred(series_id: str, start_date: str = "2019-01-01") -> pd.Series:
     """从 St. Louis Fed (FRED) 拉取官方时间序列"""
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
@@ -79,28 +92,31 @@ def fetch_fred(series_id: str, start_date: str = "2021-01-01") -> pd.Series:
 
 def yoy_pct(s: pd.Series, periods: int = 12) -> pd.Series:
     """计算同比变化百分比 (%)"""
-    if s is None or s.empty:
+    if s is None or s.empty or len(s) <= periods:
         return pd.Series(dtype=float, name=getattr(s, "name", ""))
     return (s.pct_change(periods=periods) * 100).dropna()
 
 
-def fetch_yf_ohlcv(tickers: list, period: str = "4y") -> dict:
-    """批量拉取 Yahoo Finance 完整 OHLCV 数据"""
-    raw = yf.download(tickers, period=period, auto_adjust=True, progress=False)
+def fetch_yf_ohlcv(tickers: list, period: str = "5y") -> dict:
+    """批量拉取 Yahoo Finance 完整 OHLCV 数据（兼容新版 MultiIndex 结构）"""
+    raw = yf.download(tickers, period=period, auto_adjust=True, progress=False, group_by="column")
     data = {}
     for field in ["Open", "High", "Low", "Close", "Volume"]:
-        df = raw[field].copy()
-        if isinstance(df, pd.Series):
-            df = df.to_frame(name=tickers[0])
+        if isinstance(raw.columns, pd.MultiIndex):
+            df = raw[field].copy()
+        else:
+            df = raw[[field]].copy()
+            df.columns = [tickers[0]]
         df.index = pd.to_datetime(df.index).tz_localize(None)
         data[field] = df.sort_index()
     return data
 
 
-def compute_rolling_dollar_flow(ohlcv: dict, ticker_labels: dict, window: int = 20) -> pd.DataFrame:
+def compute_rolling_flow_intensity(ohlcv: dict, ticker_labels: dict, window: int = 20) -> pd.DataFrame:
     """
-    基于机构级 Chaikin Money Flow Dollar Volume 计算滚动资金净流入/流出 (单位: 亿美元)
-    公式: Daily Flow = [((Close - Low) - (High - Close)) / (High - Low)] * Volume * Close
+    计算机构级 Chaikin Money Flow (CMF) 20日资金流净强弱指数 (%)
+    公式: CMF(%) = Sum_20d(CLV * Dollar_Volume) / Sum_20d(Dollar_Volume) * 100
+    说明: 消除 SPY 与 GLD/DBC/IBIT 绝对成交额体量差异，使七大资产处于同一可比量纲 (-30% ~ +30%)
     """
     high = ohlcv["High"]
     low = ohlcv["Low"]
@@ -114,94 +130,197 @@ def compute_rolling_dollar_flow(ohlcv: dict, ticker_labels: dict, window: int = 
         hl_range = (high[ticker] - low[ticker]).replace(0, np.nan)
         clv = ((close[ticker] - low[ticker]) - (high[ticker] - close[ticker])) / hl_range
         clv = clv.fillna(0.0)
-        daily_flow_100m = (clv * vol[ticker] * close[ticker]) / 1e8
-        flow_df[label] = daily_flow_100m.rolling(window=window, min_periods=10).sum()
+        dollar_vol = vol[ticker] * close[ticker]
+        signed_dollar_vol = clv * dollar_vol
 
-    return flow_df.iloc[-250:].resample("W-FRI").last().dropna(how="all")
+        num = signed_dollar_vol.rolling(window=window, min_periods=10).sum()
+        den = dollar_vol.rolling(window=window, min_periods=10).sum().replace(0, np.nan)
+        flow_df[label] = (num / den) * 100.0
+
+    return flow_df.iloc[-260:].resample("W-FRI").last().dropna(how="all")
 
 
 def fetch_aaii_sentiment() -> pd.DataFrame:
-    """抓取 AAII 散户情绪调查 (看涨% - 看跌%)"""
+    """多源容错抓取 AAII 散户情绪调查 (看涨% - 看跌%)"""
+    # 通道 1: 官方 Excel 历史全量表
     try:
         url = "https://www.aaii.com/files/surveys/sentiment.xls"
         r = requests.get(url, headers=HEADERS, timeout=30)
         r.raise_for_status()
-        raw = pd.read_excel(io.BytesIO(r.content))
+        raw = None
+        for engine in [None, "xlrd", "openpyxl"]:
+            try:
+                raw = pd.read_excel(io.BytesIO(r.content), engine=engine)
+                if raw is not None and not raw.empty:
+                    break
+            except Exception:
+                continue
+        if raw is None:
+            tables = pd.read_html(io.BytesIO(r.content))
+            raw = tables[0]
+
         raw.columns = [str(c).strip().lower() for c in raw.columns]
         date_col = [c for c in raw.columns if "date" in c][0]
         bull_col = [c for c in raw.columns if "bull" in c][0]
         bear_col = [c for c in raw.columns if "bear" in c][0]
         df = raw[[date_col, bull_col, bear_col]].copy()
         df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[bull_col] = pd.to_numeric(df[bull_col], errors="coerce")
+        df[bear_col] = pd.to_numeric(df[bear_col], errors="coerce")
         df = df.dropna().set_index(date_col).sort_index()
         if df[bull_col].max() <= 1.5:
-            df[bull_col] *= 100
-            df[bear_col] *= 100
+            df[bull_col] *= 100.0
+            df[bear_col] *= 100.0
         spread = (df[bull_col] - df[bear_col]).rename("散户净看涨差值(%)")
-        ma20 = spread.rolling(20).mean().rename("20周均线(%)")
-        return pd.concat([spread, ma20], axis=1).dropna()
+        ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+        res = pd.concat([spread, ma20], axis=1).dropna()
+        if len(res) > 20:
+            return res
     except Exception as e:
-        print(f"[Warning] AAII 数据抓取异常: {e}")
-        return pd.DataFrame()
+        print(f"[Info] AAII Excel 通道切换至网页直抓: {e}")
+
+    # 通道 2: AAII 官网情绪调查结果 HTML 表格
+    try:
+        page = requests.get("https://www.aaii.com/sentimentsurvey/sent_results", headers=HEADERS, timeout=30)
+        page.raise_for_status()
+        tables = pd.read_html(io.StringIO(page.text))
+        for tbl in tables:
+            cols = [str(c).strip().lower() for c in tbl.columns]
+            if any("bull" in c for c in cols) and any("bear" in c for c in cols):
+                tbl.columns = cols
+                d_col = cols[0]
+                b_col = [c for c in cols if "bull" in c][0]
+                s_col = [c for c in cols if "bear" in c][0]
+                df = tbl[[d_col, b_col, s_col]].copy()
+                df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
+                for col in [b_col, s_col]:
+                    df[col] = pd.to_numeric(df[col].astype(str).str.replace("%", ""), errors="coerce")
+                df = df.dropna().set_index(d_col).sort_index()
+                spread = (df[b_col] - df[s_col]).rename("散户净看涨差值(%)")
+                ma20 = spread.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+                res = pd.concat([spread, ma20], axis=1).dropna()
+                if not res.empty:
+                    return res
+    except Exception as e:
+        print(f"[Warning] AAII 数据全部通道抓取失败: {e}")
+    return pd.DataFrame()
 
 
 def fetch_naaim_exposure() -> pd.DataFrame:
-    """抓取 NAAIM 机构投资经理风险敞口"""
+    """多源容错抓取 NAAIM 机构投资经理风险敞口"""
     try:
-        page = requests.get(
-            "https://www.naaim.org/programs/naaim-exposure-index/",
-            headers=HEADERS,
-            timeout=30,
-        )
+        base_url = "https://www.naaim.org/programs/naaim-exposure-index/"
+        page = requests.get(base_url, headers=HEADERS, timeout=30)
         page.raise_for_status()
-        tables = pd.read_html(io.StringIO(page.text), flavor="bs4")
-        df = tables[0].copy()
-        df.columns = [str(c).strip().lower() for c in df.columns]
-        date_col = df.columns[0]
-        val_col = [c for c in df.columns if "mean" in c or "number" in c or "exposure" in c][0]
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
-        df = df.dropna().set_index(date_col).sort_index()
-        exp = df[val_col].rename("机构风险敞口(%)")
-        ma20 = exp.rolling(20).mean().rename("20周均线(%)")
-        return pd.concat([exp, ma20], axis=1).dropna()
+
+        # 通道 1: 自动提取页面中的官方 Excel/CSV 数据直链
+        file_links = re.findall(r'href=["\']([^"\']+(?:NAAIM|Exposure)[^"\']*\.(?:xlsx|xls|csv))["\']', page.text, flags=re.I)
+        for link in file_links:
+            if link.startswith("/"):
+                link = "https://www.naaim.org" + link
+            try:
+                fr = requests.get(link, headers=HEADERS, timeout=30)
+                if fr.status_code == 200:
+                    if link.lower().endswith(".csv"):
+                        raw = pd.read_csv(io.BytesIO(fr.content))
+                    else:
+                        raw = pd.read_excel(io.BytesIO(fr.content))
+                    raw.columns = [str(c).strip().lower() for c in raw.columns]
+                    d_col = [c for c in raw.columns if "date" in c][0]
+                    v_col = [c for c in raw.columns if "mean" in c or "number" in c or "exposure" in c][0]
+                    df = raw[[d_col, v_col]].copy()
+                    df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
+                    df[v_col] = pd.to_numeric(df[v_col], errors="coerce")
+                    df = df.dropna().set_index(d_col).sort_index()
+                    exp = df[v_col].rename("机构风险敞口(%)")
+                    ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+                    res = pd.concat([exp, ma20], axis=1).dropna()
+                    if len(res) > 20:
+                        return res
+            except Exception:
+                continue
+
+        # 通道 2: 解析页面内嵌 HTML 表格
+        tables = pd.read_html(io.StringIO(page.text))
+        for tbl in tables:
+            cols = [str(c).strip().lower() for c in tbl.columns]
+            if len(cols) >= 2:
+                tbl.columns = cols
+                d_col = cols[0]
+                v_candidates = [c for c in cols if "mean" in c or "number" in c or "exposure" in c]
+                v_col = v_candidates[0] if v_candidates else cols[1]
+                df = tbl[[d_col, v_col]].copy()
+                df[d_col] = pd.to_datetime(df[d_col], errors="coerce")
+                df[v_col] = pd.to_numeric(df[v_col], errors="coerce")
+                df = df.dropna().set_index(d_col).sort_index()
+                exp = df[v_col].rename("机构风险敞口(%)")
+                ma20 = exp.rolling(20, min_periods=5).mean().rename("20周均线(%)")
+                res = pd.concat([exp, ma20], axis=1).dropna()
+                if len(res) > 20:
+                    return res
     except Exception as e:
         print(f"[Warning] NAAIM 数据抓取异常: {e}")
-        return pd.DataFrame()
+    return pd.DataFrame()
 
 
 def fetch_cboe_put_call() -> pd.DataFrame:
-    """抓取 CBOE 股票看跌/看涨期权成交量比值"""
+    """
+    抓取实时 CBOE 股票看跌/看涨期权成交量比值 (杜绝使用已停更的 2019 静态 CSV)
+    """
+    # 通道 1: Yahoo Finance CBOE Equity Put/Call Ratio (^CPCE) 与 Total Put/Call (^CPC)
+    for ticker in ["^CPCE", "^CPC"]:
+        try:
+            df_yf = yf.download(ticker, period="2y", progress=False)
+            if not df_yf.empty:
+                close_s = df_yf["Close"]
+                if isinstance(close_s, pd.DataFrame):
+                    close_s = close_s.iloc[:, 0]
+                close_s = pd.to_numeric(close_s, errors="coerce").dropna()
+                close_s.index = pd.to_datetime(close_s.index).tz_localize(None)
+                if len(close_s) > 30 and close_s.index[-1] >= pd.Timestamp.now() - pd.Timedelta(days=15):
+                    pcr = close_s.rename("Put/Call比值")
+                    ma20 = pcr.rolling(20, min_periods=5).mean().rename("20日均线")
+                    return pd.concat([pcr, ma20], axis=1).dropna()
+        except Exception:
+            continue
+
+    # 通道 2: CBOE 每日市场统计 JSON 接口（逐日回溯最近 180 个交易日）
     try:
-        url = "https://cdn.cboe.com/resources/options/volume_and_call_put_ratios/equitypc.csv"
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
-        valid_lines = []
-        for ln in r.text.splitlines():
-            s = ln.strip()
-            if s.upper().startswith("DATE,") or re.match(r"^\d{1,2}/\d{1,2}/\d{4},", s):
-                valid_lines.append(s)
-        df = pd.read_csv(io.StringIO("\n".join(valid_lines)))
-        df.columns = [str(c).strip().upper() for c in df.columns]
-        date_col = df.columns[0]
-        ratio_col = [c for c in df.columns if "RATIO" in c or "P/C" in c][-1]
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-        df[ratio_col] = pd.to_numeric(df[ratio_col], errors="coerce")
-        df = df.dropna().set_index(date_col).sort_index()
-        pcr = df[ratio_col].rename("Put/Call比值")
-        ma20 = pcr.rolling(20).mean().rename("20日均线")
-        return pd.concat([pcr, ma20], axis=1).dropna()
+        records = []
+        today = datetime.now(timezone.utc).date()
+        for delta in range(0, 210):
+            d = today - timedelta(days=delta)
+            if d.weekday() >= 5:
+                continue
+            d_str = d.strftime("%Y-%m-%d")
+            u = f"https://cdn.cboe.com/data/us/options/market_statistics/daily/{d_str}_daily_options"
+            r = requests.get(u, headers=HEADERS, timeout=6)
+            if r.status_code == 200:
+                payload = r.json()
+                ratios = payload.get("ratios", [])
+                for item in ratios:
+                    name = str(item.get("name", "")).upper()
+                    if "EQUITY PUT/CALL" in name:
+                        val = float(item.get("value"))
+                        records.append((pd.to_datetime(d_str), val))
+                        break
+        if len(records) >= 20:
+            records.sort(key=lambda x: x[0])
+            pcr = pd.Series([v for _, v in records], index=[dt for dt, _ in records], name="Put/Call比值")
+            ma20 = pcr.rolling(20, min_periods=5).mean().rename("20日均线")
+            return pd.concat([pcr, ma20], axis=1).dropna()
     except Exception as e:
-        print(f"[Warning] CBOE Put/Call 抓取异常: {e}")
-        return pd.DataFrame()
+        print(f"[Warning] CBOE 每日 JSON 统计抓取异常: {e}")
+
+    return pd.DataFrame()
 
 
 def fetch_cftc_cot() -> pd.DataFrame:
-    """抓取 CFTC 标普500 与 纳斯达克100 投机者(非商业)净持仓"""
+    """抓取 CFTC 标普500 与 纳斯达克100 投机者(非商业)净持仓（单位：万手）"""
     try:
         year = datetime.now().year
         frames = []
-        for y in [year - 2, year - 1, year]:
+        for y in [year - 3, year - 2, year - 1, year]:
             url = f"https://www.cftc.gov/files/dea/history/deacot{y}.zip"
             r = requests.get(url, headers=HEADERS, timeout=45)
             if r.status_code != 200:
@@ -220,20 +339,24 @@ def fetch_cftc_cot() -> pd.DataFrame:
         short_col = [c for c in cot.columns if "Noncommercial Positions-Short (All)" in c][0]
 
         cot[date_col] = pd.to_datetime(cot[date_col])
-        sp = cot[cot[name_col].str.contains("E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE", na=False)].copy()
-        nq = cot[cot[name_col].str.contains("NASDAQ MINI - CHICAGO MERCANTILE EXCHANGE", na=False)].copy()
+        sp = cot[cot[name_col].str.contains("E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE", case=False, na=False)].copy()
+        nq = cot[cot[name_col].str.contains("NASDAQ MINI|NASDAQ-100 Consolidated", case=False, na=False)].copy()
 
         sp_net = (
             sp.set_index(date_col)
-            .apply(lambda x: float(x[long_col]) - float(x[short_col]), axis=1)
+            .apply(lambda x: (float(x[long_col]) - float(x[short_col])) / 10000.0, axis=1)
+            .groupby(level=0)
+            .last()
             .sort_index()
-            .rename("标普500投机净持仓(手)")
+            .rename("标普500投机净持仓(万手)")
         )
         nq_net = (
             nq.set_index(date_col)
-            .apply(lambda x: float(x[long_col]) - float(x[short_col]), axis=1)
+            .apply(lambda x: (float(x[long_col]) - float(x[short_col])) / 10000.0, axis=1)
+            .groupby(level=0)
+            .last()
             .sort_index()
-            .rename("纳指100投机净持仓(手)")
+            .rename("纳指100投机净持仓(万手)")
         )
         return pd.concat([sp_net, nq_net], axis=1)
     except Exception as e:
@@ -245,16 +368,28 @@ def fetch_sp500_breadth() -> pd.DataFrame:
     """实时计算标普500成分股高于50日/200日均线的市场宽度比例"""
     try:
         r = requests.get("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", headers=HEADERS, timeout=30)
-        sp_table = pd.read_html(io.StringIO(r.text), flavor="bs4")[0]
+        sp_table = pd.read_html(io.StringIO(r.text))[0]
         tickers = [t.replace(".", "-") for t in sp_table["Symbol"].tolist()]
-        prices = yf.download(tickers, period="2y", auto_adjust=True, progress=False)["Close"]
+    except Exception:
+        # 备用核心 60 只标普权重代表成分股
+        tickers = [
+            "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "BRK-B", "LLY", "AVGO", "JPM",
+            "TSLA", "UNH", "XOM", "V", "PG", "MA", "JNJ", "COST", "HD", "ABBV",
+            "WMT", "NFLX", "MRK", "CRM", "BAC", "CVX", "KO", "AMD", "PEP", "TMO",
+            "LIN", "ORCL", "ADBE", "CSCO", "ACN", "MCD", "ABT", "WFC", "DHR", "QCOM",
+            "TXN", "INTU", "AMGN", "PM", "ISRG", "IBM", "GE", "CAT", "NOW", "VZ",
+            "DIS", "GS", "AMAT", "UBER", "SPGI", "RTX", "LOW", "HON", "UNP", "NEE",
+        ]
+    try:
+        raw = yf.download(tickers, period="2y", auto_adjust=True, progress=False, group_by="column")
+        prices = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw
         prices.index = pd.to_datetime(prices.index).tz_localize(None)
         ma50 = prices.rolling(50).mean()
         ma200 = prices.rolling(200).mean()
-        valid_50 = ma50.notna().sum(axis=1)
-        valid_200 = ma200.notna().sum(axis=1)
-        b50 = ((prices > ma50).sum(axis=1) / valid_50 * 100).rename("50日市场宽度(%)")
-        b200 = ((prices > ma200).sum(axis=1) / valid_200 * 100).rename("200日市场宽度(%)")
+        valid_50 = ma50.notna().sum(axis=1).replace(0, np.nan)
+        valid_200 = ma200.notna().sum(axis=1).replace(0, np.nan)
+        b50 = ((prices > ma50).sum(axis=1) / valid_50 * 100.0).rename("50日市场宽度(%)")
+        b200 = ((prices > ma200).sum(axis=1) / valid_200 * 100.0).rename("200日市场宽度(%)")
         df = pd.concat([b50, b200], axis=1).dropna()
         return df.iloc[-300:]
     except Exception as e:
@@ -262,22 +397,44 @@ def fetch_sp500_breadth() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def align_tail(series_list, freq="W-FRI", n=156, max_ffill_steps=3) -> pd.DataFrame:
+    """
+    防截断、防虚假平拉的时间序列对齐函数：
+    1) 不使用全局 dropna()，避免某一条短序列或发布滞后指标砍掉其他曲线的历史数据；
+    2) 仅在各序列自身的有效时间区间内做有限步长填充，绝不将过期数据向未来无限平拉。
+    """
+    valid_series = [s for s in series_list if s is not None and not s.empty]
+    if not valid_series:
+        return pd.DataFrame()
+
+    df = pd.concat(valid_series, axis=1).sort_index()
+    if freq:
+        df = df.resample(freq).last()
+
+    for col in df.columns:
+        last_valid = df[col].last_valid_index()
+        first_valid = df[col].first_valid_index()
+        if last_valid is not None and first_valid is not None:
+            sub = df.loc[first_valid:last_valid, col].ffill(limit=max_ffill_steps)
+            df.loc[first_valid:last_valid, col] = sub
+
+    df = df.dropna(how="all")
+    return df.iloc[-n:]
+
+
 # ==========================================
-# 3. 组装全部 22 张图表的数据与读图指南
+# 3. 组装全部 23 张图表的数据与超详细四段式读图指南
 # ==========================================
 def build_all_charts() -> list:
     print(">>> 正在拉取市场行情、商品期货、AI板块与全球大类资产 ETF 数据...")
     market_tickers = [
         "^GSPC", "^NDX", "HG=F", "GC=F", "CL=F", "^VIX",
-        # 全市场与11大经济板块
         "VTI", "XLK", "XLF", "XLV", "XLY", "XLP", "XLE", "XLI", "XLB", "XLU", "XLRE", "XLC",
-        # AI 板块与四大宽基指数
         "SMH", "AIQ", "BOTZ", "SPY", "QQQ", "IWM", "DIA",
-        # 全球核心大类资产旗舰 ETF (美股、新兴市场、美债、黄金、商品、比特币)
         "EEM", "TLT", "GLD", "DBC", "IBIT",
     ]
-    ohlcv = fetch_yf_ohlcv(market_tickers, period="4y")
-    mkt = ohlcv["Close"].ffill()
+    ohlcv = fetch_yf_ohlcv(market_tickers, period="5y")
+    mkt = ohlcv["Close"].ffill(limit=5)
 
     spx = mkt["^GSPC"].rename("标普500指数")
     ndx = mkt["^NDX"].rename("纳斯达克100指数")
@@ -292,9 +449,9 @@ def build_all_charts() -> list:
     breadth_df = fetch_sp500_breadth()
 
     print(">>> 正在拉取 FRED 宏观与利率数据...")
-    # 消费端
-    icsa = fetch_fred("ICSA").rename("初请失业金(人)")
-    ccsa = fetch_fred("CCSA").rename("续请失业金(人)")
+    # 一、消费端（量纲统一：初请折算万人，续请折算十万人，避免左右轴量级压扁）
+    icsa_w = (fetch_fred("ICSA") / 10000.0).rename("初请失业金(万人)")
+    ccsa_10w = (fetch_fred("CCSA") / 100000.0).rename("续请失业金(十万人)")
     payems_yoy = yoy_pct(fetch_fred("PAYEMS")).rename("非农就业同比(%)")
 
     pi_yoy = yoy_pct(fetch_fred("PI")).rename("个人收入同比(%)")
@@ -317,64 +474,62 @@ def build_all_charts() -> list:
         ecom_raw = fetch_fred("MRTSSM4541USS")
     ecom_yoy = yoy_pct(ecom_raw).rename("电商非实体零售同比(%)")
 
-    # 供给端
+    # 二、供给端
     permit_yoy = yoy_pct(fetch_fred("PERMIT")).rename("建房许可同比(%)")
     houst_yoy = yoy_pct(fetch_fred("HOUST")).rename("新屋开工同比(%)")
     house_inv_yoy = yoy_pct(fetch_fred("HNFSEPUSSA")).rename("新房库存同比(%)")
 
     dur_yoy = yoy_pct(fetch_fred("DGORDER")).rename("耐用品订单同比(%)")
     core_cap_yoy = yoy_pct(fetch_fred("NEWORDER")).rename("核心资本品订单同比(%)")
-    mfg_pmi = fetch_fred("BSCICP03USM665S").rename("制造业景气PMI指数")
+    mfg_pmi = fetch_fred("BSCICP03USM665S").rename("制造业景气平衡指数")
 
     wei = fetch_fred("WEI").rename("纽约联储WEI周度经济指数")
     ppi_yoy = yoy_pct(fetch_fred("PPIACO")).rename("PPI出厂价格同比(%)")
     cpi_yoy = yoy_pct(fetch_fred("CPIAUCSL")).rename("CPI通胀同比(%)")
 
-    # 利率端（已修复 BAMLH0A3HYCEY 官方代码并增加回退）
+    # 三、利率端
     fed_rate = fetch_fred("DFF").rename("美联储政策利率(%)")
     dgs10 = fetch_fred("DGS10").rename("10年期美债收益率(%)")
     dgs5 = fetch_fred("DGS5").rename("5年期美债收益率(%)")
     dgs2 = fetch_fred("DGS2").rename("2年期美债收益率(%)")
     dgs3m = fetch_fred("DGS3MO").rename("3个月期美债利率(%)")
 
-    ccc_yield = fetch_fred("BAMLH0A3HYCEY")
-    real_10y = fetch_fred("DFII10")
-    if not ccc_yield.empty and not real_10y.empty:
-        credit_spread = (ccc_yield - real_10y).dropna().rename("CCC级信用利差(%)")
-    else:
-        credit_spread = fetch_fred("BAMLH0A3HYC").rename("CCC级信用利差(%)")
+    credit_spread = fetch_fred("BAMLH0A3HYC").rename("CCC级高收益债信用利差(%)")
+    if credit_spread.empty:
+        ccc_y = fetch_fred("BAMLH0A3HYCEY")
+        credit_spread = (ccc_y - dgs10).dropna().rename("CCC级高收益债信用利差(%)")
     vix = mkt["^VIX"].rename("VIX恐慌指数")
 
-    def align_tail(series_list, freq="W-FRI", n=156):
-        valid_series = [s for s in series_list if s is not None and not s.empty]
-        if not valid_series:
-            return pd.DataFrame()
-        df = pd.concat(valid_series, axis=1).sort_index().ffill().dropna()
-        if freq and not df.empty:
-            df = df.resample(freq).last().dropna()
-        return df.iloc[-n:]
-
-    # 图 20：完整 11 个经济部门 ETF 相对全市场 VTI 强弱 (起点=100)
-    sector_map = {
+    # 四、市场端：11大板块拆分为「20A 进攻周期6板块」与「20B 防御利率敏感5板块」，避免11条线缠绕
+    offense_map = {
         "XLK": "科技XLK",
-        "XLF": "金融XLF",
-        "XLV": "医疗XLV(防御)",
+        "XLC": "通讯XLC",
         "XLY": "可选消费XLY",
-        "XLP": "必需消费XLP(防御)",
-        "XLE": "能源XLE",
+        "XLF": "金融XLF",
         "XLI": "工业XLI",
-        "XLB": "原材料XLB",
+        "XLE": "能源XLE",
+    }
+    defense_map = {
+        "XLV": "医疗XLV(防御)",
+        "XLP": "必需消费XLP(防御)",
         "XLU": "公用事业XLU(防御)",
         "XLRE": "房地产XLRE",
-        "XLC": "通讯XLC",
+        "XLB": "原材料XLB",
     }
-    sec_df = pd.DataFrame(index=mkt.index)
-    for code, label in sector_map.items():
-        rel = (mkt[code] / mkt["VTI"]).dropna().iloc[-260:]
-        sec_df[label] = (rel / rel.iloc[0]) * 100
-    sec_df = sec_df.resample("W-FRI").last().dropna()
 
-    # 图 21：AI 板块对比标普500及三大股指相对强弱比 (起点=100)
+    sec_off_df = pd.DataFrame(index=mkt.index)
+    for code, label in offense_map.items():
+        rel = (mkt[code] / mkt["VTI"]).dropna().iloc[-260:]
+        sec_off_df[label] = (rel / rel.iloc[0]) * 100.0
+    sec_off_df = sec_off_df.resample("W-FRI").last().dropna(how="all")
+
+    sec_def_df = pd.DataFrame(index=mkt.index)
+    for code, label in defense_map.items():
+        rel = (mkt[code] / mkt["VTI"]).dropna().iloc[-260:]
+        sec_def_df[label] = (rel / rel.iloc[0]) * 100.0
+    sec_def_df = sec_def_df.resample("W-FRI").last().dropna(how="all")
+
+    # 五、扩展模块：AI强弱 & 全球资产资金流净强弱指数(%)
     ai_ratio_pairs = [
         ("SMH", "SPY", "AI芯片SMH / 标普SPY"),
         ("AIQ", "SPY", "AI应用AIQ / 标普SPY"),
@@ -386,10 +541,9 @@ def build_all_charts() -> list:
     ai_df = pd.DataFrame(index=mkt.index)
     for num, den, label in ai_ratio_pairs:
         rel = (mkt[num] / mkt[den]).dropna().iloc[-260:]
-        ai_df[label] = (rel / rel.iloc[0]) * 100
-    ai_df = ai_df.resample("W-FRI").last().dropna()
+        ai_df[label] = (rel / rel.iloc[0]) * 100.0
+    ai_df = ai_df.resample("W-FRI").last().dropna(how="all")
 
-    # 图 22：全球七大核心资产 20日滚动资金净流入/流出 (亿美元)
     global_flow_tickers = {
         "SPY": "美股大盘(SPY)",
         "QQQ": "美股科技(QQQ)",
@@ -399,7 +553,7 @@ def build_all_charts() -> list:
         "DBC": "大宗商品(DBC)",
         "IBIT": "比特币ETF(IBIT)",
     }
-    global_flow_df = compute_rolling_dollar_flow(ohlcv, global_flow_tickers, window=20)
+    global_flow_df = compute_rolling_flow_intensity(ohlcv, global_flow_tickers, window=20)
 
     charts = [
         # --- 一、消费端 ---
@@ -407,188 +561,203 @@ def build_all_charts() -> list:
             "id": "01",
             "category": "消费",
             "title": "01. 就业市场 (Employment)",
-            "df": align_tail([icsa, ccsa, payems_yoy], freq="W-FRI", n=156),
+            "df": align_tail([icsa_w, ccsa_10w, payems_yoy], freq="W-FRI", n=180),
             "right_cols": ["非农就业同比(%)"],
-            "left_title": "申领人数 (人)",
+            "left_title": "初请(万人) / 续请(十万人)",
             "right_title": "非农同比 (%)",
-            "what": "• 蓝线：初次申领失业金人数（每周新增失业）\n• 红线：连续申领失业金人数（持续失业规模）\n• 黄线(右轴)：非农就业人数年度同比变化(%)",
-            "how": "美国70%GDP靠消费，就业是消费的源头。失业金曲线低位走平、非农同比稳健说明居民有持续收入；若初请/续请连续飙升且非农同比快速下滑，说明劳动力市场恶化。",
-            "signal": "⚠️ 预警信号：初请失业金持续突破 30万人 且续请同步抬头，往往预示消费即将降温。",
+            "what": "• 蓝线(左轴)：初请失业金人数(万人)，每周新增申领失业救济人数\n• 红线(左轴)：续请失业金人数(十万人)，持续处于失业状态的总规模\n• 黄线(右轴)：非农就业总人数同比增速(%)",
+            "how": "美国70%GDP由个人消费驱动，而薪资就业是消费的源头活水。初请反映企业「裁员速度」（高频领先），续请反映失业者「再就业难度」（滞后确认），非农同比衡量整体就业扩张斜率。",
+            "changes": "• 蓝/红线低位走平 + 黄线稳健(>1%)：劳动力市场供需健康，居民消费具备坚实支撑\n• 蓝线率先跳升、随后红线抬头：企业开始裁员且失业者难找新工作，消费即将降温\n• 黄线持续下破1%向0%逼近：全社会岗位扩张停滞，通常对应经济步入衰退前夜",
+            "signal": "⚠️ 实战阈值：初请失业金持续突破 30万人 且续请突破 200万人(红线>20)，为消费失速预警信号。",
         },
         {
             "id": "02",
             "category": "消费",
             "title": "02. 个人财务状况 (Personal Finances)",
-            "df": align_tail([pi_yoy, pce_yoy, psavert], freq="ME", n=48),
+            "df": align_tail([pi_yoy, pce_yoy, psavert], freq="ME", n=60),
             "right_cols": [],
-            "left_title": "百分比 (%)",
+            "left_title": "年度变化率 / 储蓄率 (%)",
             "right_title": "",
-            "what": "• 蓝线：个人总收入同比变化(%)\n• 红线：个人消费支出(PCE)同比变化(%)\n• 黄线：个人储蓄率(%)",
-            "how": "三者互为因果。健康状态是「收入增速 ≥ 消费增速」，储蓄率维持在 5%~8% 区间；若消费支出远高于收入增速，说明居民在透支超额储蓄或依赖信用卡负债。",
-            "signal": "⚠️ 预警信号：个人储蓄率跌破 3.5% 且个人收入同比低于通胀，消费动能将面临断崖风险。",
+            "what": "• 蓝线：个人总收入年度同比增速(%)\n• 红线：个人消费支出(PCE)年度同比增速(%)\n• 黄线：个人储蓄率(%)，即税后可支配收入中未消费的留存比例",
+            "how": "观察美国家庭资产负债表的健康度。可持续的消费必须建立在「收入增长覆盖支出增长」之上；若支出增速长期高于收入增速，说明家庭正在消耗历史超额储蓄或依赖高息信用卡透支。",
+            "changes": "• 蓝线 ≥ 红线 且 黄线位于5%~8%：内生消费健康循环，通胀压力可控\n• 红线持续高于蓝线 + 黄线单边下滑：透支型消费，一旦储蓄耗尽消费将出现断崖式回落\n• 黄线突然急升 + 红线暴跌：居民进入防御性存钱模式，零售与可选消费承压",
+            "signal": "⚠️ 实战阈值：个人储蓄率跌破 3.5% 为历史警戒低位；低于通胀的收入增速预示消费后继乏力。",
         },
         {
             "id": "03",
             "category": "消费",
             "title": "03. 房屋销售与房价 (Home Sales)",
-            "df": align_tail([exhos_yoy, hsn1f_yoy, cs20_yoy, med_new_yoy], freq="ME", n=48),
+            "df": align_tail([exhos_yoy, hsn1f_yoy, cs20_yoy, med_new_yoy], freq="ME", n=60),
             "right_cols": [],
             "left_title": "同比变化 (%)",
             "right_title": "",
-            "what": "• 蓝线：成屋销售同比(%)  • 红线：新屋销售同比(%)\n• 黄线：20大都市房价指数同比(%)\n• 绿线：新房销售中位价同比(%)",
-            "how": "房子是美国家庭最大宗消费，牵动家电、装修、金融等全产业链。成交量（蓝/红线）通常领先房价（黄/绿线）3~6个月见顶或见底。",
-            "signal": "💡 观察要点：量在价先——当成屋/新屋销量同比由负转正并持续回升时，房价随后止跌回暖。",
+            "what": "• 蓝线/蓝点：成屋销售同比(%)（注：NAR官方仅公开近1年数据，圆点为最新值）\n• 红线：新屋销售同比(%)（4年完整周期曲线）\n• 黄线：标普Case-Shiller 20大都市房价指数同比(%)\n• 绿线：全美新房销售中位价同比(%)",
+            "how": "房地产是美国家庭最大宗资产，直接牵动家电、建材、家具、按揭金融全产业链。地产周期严格遵循「量在价先」规律：成交量（蓝/红线）通常领先房价（黄/绿线）3~6个月见顶或见底。",
+            "changes": "• 红线/蓝线由负转正且持续上行：按揭利率压力缓和，买家入市，预计3~6个月后房价止跌回升\n• 红线见顶大幅回落、黄线仍在高位：典型的「量缩价撑」顶背离，预示随后房价将步入阴跌\n• 黄线与绿线剪刀差扩大：豪宅/核心都市房价坚挺，而大众刚需新房正在降价促销",
+            "signal": "💡 实战信号：新屋销售同比连续3个月站稳 0% 上方，是布局地产建筑商(ITB/XHB)与家居链的领先信号。",
         },
         {
             "id": "04",
             "category": "消费",
             "title": "04. 汽车消费与二手车价 (Auto Sales)",
-            "df": align_tail([veh_sales, veh_yoy, used_car], freq="ME", n=48),
+            "df": align_tail([veh_sales, veh_yoy, used_car], freq="ME", n=60),
             "right_cols": ["二手车价格指数"],
             "left_title": "销量(百万辆) / 同比(%)",
-            "right_title": "二手车指数",
-            "what": "• 蓝线：全美汽车月度折年销量(百万辆)\n• 红线：汽车销量同比增速(%)\n• 黄线(右轴)：二手车价格指数",
-            "how": "汽车是第二大耐用消费品。供应链正常时，销量稳定在 1500~1700 万辆区间；若二手车价格指数飙升（如缺芯期），会推高核心CPI并迫使消费者观望。",
-            "signal": "💡 观察要点：二手车价格回落 + 汽车销量同比转正，代表大件消费恢复且商品通胀缓和。",
+            "right_title": "二手车CPI指数",
+            "what": "• 蓝线(左轴)：全美轻型汽车月度折年总销量(百万辆)\n• 红线(左轴)：全美汽车销量年度同比增速(%)\n• 黄线(右轴)：美国CPI二手车与卡车价格指数",
+            "how": "汽车是美国第二大耐用消费品，对车贷利率与供应链极为敏感。结合销量与二手车价格，可同时判断居民大件消费意愿以及核心商品通胀的演变方向。",
+            "changes": "• 蓝线回升至1550~1700万辆 + 黄线平稳回落：供应链顺畅、价格合理，大件消费健康复苏\n• 黄线暴涨 + 蓝线跌破1400万辆：缺芯或通胀推高车价抑制需求，同时抬升美联储核心CPI压力\n• 红线持续处于负值区：高利率抑制车贷需求，耐用消费品处于去库周期",
+            "signal": "💡 实战信号：二手车价格指数持续下行是核心商品通胀回落的先导；销量重返 1600万辆 上方代表消费韧性极强。",
         },
         {
             "id": "05",
             "category": "消费",
             "title": "05. 零售与电商结构 (Retail Sales)",
-            "df": align_tail([retail_yoy, ex_auto_yoy, ecom_yoy], freq="ME", n=48),
+            "df": align_tail([retail_yoy, ex_auto_yoy, ecom_yoy], freq="ME", n=60),
             "right_cols": [],
             "left_title": "同比增速 (%)",
             "right_title": "",
-            "what": "• 蓝线：美国总体零售销售额同比(%)\n• 红线：核心连锁零售(剔除汽车)同比(%)\n• 黄线：非实体店(亚马逊等电商网购)同比(%)",
-            "how": "直接反映美国居民日常消费热度。对比总体零售与电商增速，可判断消费习惯向线上迁移的速度以及实体连锁商超的景气度。",
-            "signal": "⚠️ 预警信号：总体零售同比跌破 0% 负增长，通常对应经济步入实质性衰退。",
+            "what": "• 蓝线：美国总体零售与食品服务销售额同比(%)\n• 红线：核心零售（剔除波动较大的汽车及零部件）同比(%)\n• 黄线：非实体店零售（以亚马逊为代表的电商网购）同比(%)",
+            "how": "最直观反映美国居民日常高频消费热度。通过对比总体零售（蓝）、核心实体零售（红）与电商（黄），可洞察消费渠道的结构性迁移与中低收入群体消费力。",
+            "changes": "• 三线同步维持在3%~6%稳健区间：名义消费扩张健康，零售与消费龙头盈利有保障\n• 黄线显著高于蓝/红线：消费向线上集中，传统百货商超承压，利好电商与物流科技\n• 蓝线与红线同步跌破0%：剔除通胀后实际消费大幅萎缩，经济衰退风险显著升温",
+            "signal": "⚠️ 实战阈值：核心零售同比跌破 0% 负增长往往对应经济实质性衰退；高于 5% 则需警惕消费过热延缓降息。",
         },
         # --- 二、供给端 ---
         {
             "id": "06",
             "category": "供给",
             "title": "06. 房屋营建与库存 (Housing Supply)",
-            "df": align_tail([permit_yoy, houst_yoy, house_inv_yoy, cs20_yoy], freq="ME", n=48),
+            "df": align_tail([permit_yoy, houst_yoy, house_inv_yoy, cs20_yoy], freq="ME", n=60),
             "right_cols": [],
             "left_title": "同比变化 (%)",
             "right_title": "",
-            "what": "• 蓝线：建房许可同比(%)  • 红线：新屋开工同比(%)\n• 黄线：新房库存同比(%)  • 绿线：20大都市房价同比(%)",
-            "how": "建房许可领先新屋开工，开工后约 6~12 个月转化为实际新房供应。最核心看黄线「房屋库存」：库存下降代表供不应求推高房价；库存飙升代表供大于求压制房价。",
-            "signal": "💡 领先规律：建房许可增速拐点领先未来半年新屋供应；库存低位 + 许可回升利好地产链。",
+            "what": "• 蓝线：私人住宅建房许可同比(%)（开发商拿地规划阶段，最领先）\n• 红线：新屋开工同比(%)（实际动工建设阶段）\n• 黄线：待售新房库存同比(%)（供给压力核心指标）\n• 绿线：20大都市房价同比(%)",
+            "how": "完整刻画房地产供给链条：「建房许可(蓝) → 1~2个月后新屋开工(红) → 6~12个月后竣工形成新房库存(黄) → 供需关系决定房价(绿)」。",
+            "changes": "• 蓝线与红线拐头向上 + 黄线库存处于低位负增长：供不应求格局确立，未来半年房价(绿线)具强支撑\n• 黄线库存同比飙升(>10%) + 蓝线持续负增长：新房积压严重，开发商被迫降价促销并削减新开工\n• 蓝线明显强于红线：开发商正在积极储备项目，预示未来一季度施工活动将回暖",
+            "signal": "💡 实战信号：建房许可增速领先未来6~9个月建筑材料与家电需求；库存低位+许可转正是地产股最佳买点。",
         },
         {
             "id": "07",
             "category": "供给",
             "title": "07. 耐用品订单与制造业PMI (Supply Orders)",
-            "df": align_tail([dur_yoy, core_cap_yoy, mfg_pmi], freq="ME", n=48),
-            "right_cols": ["制造业景气PMI指数"],
+            "df": align_tail([dur_yoy, core_cap_yoy, mfg_pmi], freq="ME", n=60),
+            "right_cols": ["制造业景气平衡指数"],
             "left_title": "订单同比 (%)",
-            "right_title": "景气指数 (100为荣枯线)",
-            "what": "• 蓝线：耐用品新增订单同比(%)\n• 红线：核心资本品订单(剔除国防航空)同比(%)\n• 黄线(右轴)：制造业景气PMI指数(100为荣枯分界)",
-            "how": "工厂接单后需 3~6 个月采购备货与生产。订单与PMI下行预示未来半年社会总供给收缩；若此时消费端强劲，就会引发供需缺口与通胀。",
-            "signal": "⚠️ 信号提示：核心资本品订单持续负增长 + PMI跌破100荣枯线，反映企业削减资本开支。",
+            "right_title": "制造业景气指数 (0为荣枯线)",
+            "what": "• 蓝线(左轴)：全美耐用品新增订单同比(%)（含飞机与国防）\n• 红线(左轴)：核心资本品订单同比(%)（剔除国防与飞机，衡量企业真实设备投资）\n• 黄线(右轴)：OECD美国制造业信心景气指数（0为荣枯分界线）",
+            "how": "企业接到订单后需 3~6 个月采购原材料、扩产与交付。红线「核心资本品订单」是衡量美国企业资本开支（CapEx）与制造业补库周期的黄金先行指标。",
+            "changes": "• 红线由负转正 + 黄线上穿0轴：企业开启主动补库存与设备升级，工业、半导体与原材料板块走强\n• 蓝线暴涨暴跌而红线平稳：仅受波音飞机或军工大单扰动，非全面经济过热\n• 红线持续负增长 + 黄线深陷0轴下方：企业削减资本开支，预示未来半年工业产出收缩",
+            "signal": "⚠️ 实战信号：核心资本品订单(红线)连续3个月正增长且制造业景气站上 0 轴，确认制造业复苏周期开启。",
         },
         {
             "id": "08",
             "category": "供给",
             "title": "08. 纽约联储每周经济指数 (WEI Index)",
-            "df": align_tail([wei], freq="W-FRI", n=156),
+            "df": align_tail([wei], freq="W-FRI", n=180),
             "right_cols": [],
             "left_title": "WEI 年化GDP增速映射 (%)",
             "right_title": "",
-            "what": "• 蓝线：纽约联储每周经济指数 (Weekly Economic Index)",
-            "how": "汇总消费、工业与政府部门的10项高频周度指标，是美国季度 GDP 的实时先行风向标，比月度宏观数据更灵敏。",
-            "signal": "🚨 衰退红线：WEI 跌入 0 以下负值区（尤其是连续数周处于负值），大概率预示经济步入衰退。",
+            "what": "• 蓝线：纽约联储每周经济指数 (Weekly Economic Index, WEI)",
+            "how": "整合红皮书零售、初请失业金、钢产量、发电量、铁路货运、燃油消费等10项高频周度实体数据，实时映射美国季度实际GDP的同比年化增长率，比官方季度GDP提前数月揭示拐点。",
+            "changes": "• 蓝线稳定在 1.5% ~ 3.0% 区间：美国经济处于温和扩张的「金发姑娘」状态，利好风险资产\n• 蓝线持续抬升突破 3.0%：实体经济动能强劲，企业盈利上修，但降息预期可能延后\n• 蓝线趋势性跌破 1.0% 并向 0% 俯冲：经济失速迹象明确，市场将快速定价降息与避险交易",
+            "signal": "🚨 衰退红线：WEI 跌破 0% 负值区（尤其是连续3周以上为负），历史上高度对应美国经济实质性衰退。",
         },
         {
             "id": "09",
             "category": "供给",
             "title": "09. 铜金比与PPI/PMI (Industrial & PPI)",
-            "df": align_tail([copper_gold, ppi_yoy, mfg_pmi], freq="W-FRI", n=156),
-            "right_cols": ["PPI出厂价格同比(%)", "制造业景气PMI指数"],
+            "df": align_tail([copper_gold, ppi_yoy, mfg_pmi], freq="W-FRI", n=180),
+            "right_cols": ["PPI出厂价格同比(%)", "制造业景气平衡指数"],
             "left_title": "铜金比 (×1000)",
-            "right_title": "PPI同比(%) / PMI指数",
-            "what": "• 蓝线：铜金比（铜期货 ÷ 黄金期货 ×1000）\n• 红线(右轴)：工业品出厂价格指数 PPI 同比(%)\n• 黄线(右轴)：制造业景气 PMI 指数",
-            "how": "铜代表全球工业需求，黄金代表避险情绪。铜金比衡量「隐含风险溢价的工业景气度」，是 PPI 与制造业 PMI 的高频先行指标。",
-            "signal": "💡 领先规律：铜金比持续走强，预示未来几个月工业景气回升、PPI 通胀压力抬头。",
+            "right_title": "PPI同比(%) / 景气指数",
+            "what": "• 蓝线(左轴)：铜金比（COMEX铜期货 ÷ 黄金期货 × 1000）\n• 红线(右轴)：美国工业品出厂价格指数 PPI 同比(%)\n• 黄线(右轴)：制造业景气平衡指数",
+            "how": "铜广泛用于电力、建筑与高端制造，代表「全球实体工业需求」；黄金代表「货币避险属性」。铜金比剔除了美元汇率干扰，高频领先工业通胀 PPI 与制造业景气度 2~4 个月。",
+            "changes": "• 蓝线持续走强上升：工业需求压倒避险情绪，预示未来数月制造业景气(黄线)回升、PPI(红线)抬头\n• 蓝线持续下挫破位：全球工业需求疲软或避险情绪升温，预示工业品面临通缩压力\n• 蓝线提前拐头向上而红线仍在低位：PPI 即将见底回升，利好顺周期资源股",
+            "signal": "💡 实战信号：铜金比是宏观交易员的「高频工业晴雨表」，其趋势拐点通常领先官方 PPI 与 PMI 约 1~2 个季度。",
         },
         {
             "id": "10",
             "category": "供给",
             "title": "10. 油金比与CPI (Energy & CPI)",
-            "df": align_tail([oil_gold, cpi_yoy], freq="W-FRI", n=156),
+            "df": align_tail([oil_gold, cpi_yoy], freq="W-FRI", n=180),
             "right_cols": ["CPI通胀同比(%)"],
             "left_title": "油金比 (×100)",
-            "right_title": "CPI同比 (%)",
-            "what": "• 蓝线：油金比（WTI原油期货 ÷ 黄金期货 ×100）\n• 红线(右轴)：消费者物价指数 CPI 同比(%)",
-            "how": "原油是百业之母与社会基础运营成本，油金比剔除货币避险扰动后，领先反映终端消费物价 CPI 的涨跌方向。",
-            "signal": "💡 领先规律：油金比见顶回落通常领先 CPI 通胀见顶回落；油金比飙升警惕二次通胀。",
+            "right_title": "CPI通胀同比 (%)",
+            "what": "• 蓝线(左轴)：油金比（WTI原油期货 ÷ 黄金期货 × 100）\n• 红线(右轴)：美国消费者物价指数 CPI 同比(%)",
+            "how": "原油是现代经济交通、化工与物流的基础成本。用原油除以黄金得到「油金比」，可剥离单纯由货币超发引起的名义涨价，精准领先反映终端消费通胀 CPI 的大方向。",
+            "changes": "• 蓝线持续飙升：能源成本向全社会传导，预示未来 1~3 个月 CPI(红线)存在反弹或二次通胀风险\n• 蓝线见顶大幅回落：能源通胀压力解除，CPI 大概率随之降温，为美联储降息打开空间\n• 蓝线低位徘徊而红线仍高：核心服务业粘性通胀主导，需关注薪资与房租分项",
+            "signal": "💡 实战信号：油金比大幅回落是「通胀见顶、长债收益率下行、科技成长股估值修复」的重要前置信号。",
         },
         {
             "id": "11",
             "category": "供给",
             "title": "11. 抽象化的宏观经济 (Macro Consensus)",
-            "df": align_tail([copper_gold, oil_gold, dgs10], freq="W-FRI", n=156),
+            "df": align_tail([copper_gold, oil_gold, dgs10], freq="W-FRI", n=180),
             "right_cols": ["10年期美债收益率(%)"],
             "left_title": "铜金比 / 油金比",
             "right_title": "10年美债收益率 (%)",
-            "what": "• 蓝线：铜金比  • 红线：油金比\n• 黄线(右轴)：美国10年期国债收益率(%)",
-            "how": "铜、油、黄金与美债每日23小时全球交易，凝聚了全球大资金对经济、通胀与货币政策的实时共识，可过滤媒体杂音。",
-            "signal": "💡 观察要点：三者同步上行＝经济扩张/再通胀交易；三者同步下行＝衰退/降息避险交易。",
+            "what": "• 蓝线(左轴)：铜金比（反映经济增长预期）\n• 红线(左轴)：油金比（反映通胀预期）\n• 黄线(右轴)：美国10年期国债收益率(%)（反映无风险利率定价）",
+            "how": "铜、油、黄金与美债在全球每日23小时连续交易，凝聚了万亿级宏观对冲基金用真金白银投票的实时宏观共识，不受滞后统计修正与媒体噪音干扰。",
+            "changes": "• 蓝+红+黄三线同步上行：典型「再通胀/经济过热交易」，利好价值股、能源、金融，利空长久期美债\n• 蓝+红+黄三线同步下行：典型「衰退/降息避险交易」，资金涌入美债(TLT)与黄金(GLD)\n• 蓝线跌、红线涨、黄线涨：最恶劣的「滞胀组合」，股债双杀风险最高",
+            "signal": "💡 实战信号：当 10年美债收益率(黄线)与铜金比(蓝线)出现严重顶背离时，美债利率往往会向铜金比方向回归。",
         },
         # --- 三、利率端 ---
         {
             "id": "12",
             "category": "利率",
             "title": "12. 美联储利率与美债收益率曲线 (Rates)",
-            "df": align_tail([fed_rate, dgs10, dgs5, dgs2, dgs3m], freq="W-FRI", n=156),
+            "df": align_tail([fed_rate, dgs10, dgs5, dgs2, dgs3m], freq="W-FRI", n=180),
             "right_cols": [],
             "left_title": "年化利率 (%)",
             "right_title": "",
-            "what": "• 蓝线：美联储政策利率  • 红线：10年期美债\n• 黄线：5年期美债  • 绿线：2年期美债  • 紫线：3个月美债",
-            "how": "利率是资本成本与资产定价之锚。市场利率（2Y/10Y）往往领先引导美联储政策利率；短端利率高于长端利率称为「利率倒挂」。",
-            "signal": "🚨 宏观警报：3个月/2年期利率高于10年期（倒挂）代表经济异常紧缩；倒挂结束「快速变陡」时风险最高。",
+            "what": "• 蓝线：美联储有效联邦基金利率(DFF)  • 紫线：3个月期美债利率\n• 绿线：2年期美债收益率  • 黄线：5年期美债  • 红线：10年期美债收益率",
+            "how": "利率是全球一切风险资产定价的贴现率之锚。短端利率（3M/2Y）受美联储货币政策直接控制，长端利率（10Y）反映市场对未来长期经济增速与通胀的预期。",
+            "changes": "• 紫/绿线高于红线（短端 > 长端）：称为「收益率曲线倒挂」，代表货币政策极度紧缩，银行放贷意愿受抑\n• 倒挂后绿线暴跌、红线平稳（牛市变陡）：市场抢跑定价美联储被迫紧急降息，往往对应经济衰退正式落地\n• 红线与绿线同步温和下行：通胀受控下的预防式降息周期，最利好美股与科技成长股",
+            "signal": "🚨 宏观警报：倒挂持续期间市场未必立刻下跌，但「倒挂结束、2Y-10Y利差迅速转正变陡」时往往伴随美股剧烈波动。",
         },
         {
             "id": "13",
             "category": "利率",
             "title": "13. 信用利差与系统性风险 (Credit Spread)",
-            "df": align_tail([credit_spread, vix, spx], freq="W-FRI", n=156),
+            "df": align_tail([credit_spread, vix, spx], freq="W-FRI", n=180),
             "right_cols": ["标普500指数"],
-            "left_title": "信用利差(%) / VIX",
+            "left_title": "CCC信用利差(%) / VIX指数",
             "right_title": "标普500点位",
-            "what": "• 蓝线：CCC级高收益债与10年实际美债信用利差(%)\n• 红线：VIX恐慌指数\n• 黄线(右轴)：标普500指数",
-            "how": "评估企业违约与金融系统性风险。当经济恶化、垃圾债违约风险上升时，信用利差会与 VIX 同步飙升，美股往往承压暴跌。",
-            "signal": "🚨 危机信号：信用利差急剧扩大且 VIX 突破 30，说明流动性收紧，需高度防范系统性下跌。",
+            "what": "• 蓝线(左轴)：ICE BofA CCC级高收益垃圾债期权调整信用利差(%)\n• 红线(左轴)：CBOE VIX恐慌指数\n• 黄线(右轴)：标普500指数",
+            "how": "信用利差衡量资质最弱的企业融资相比无风险美债需要支付的额外风险补偿。债券市场往往比股票市场更早嗅到流动性危机与企业违约风险。",
+            "changes": "• 蓝线低位平稳(<8%) + 红线<18：信用市场融资顺畅，流动性充裕，美股处于低波动慢牛环境\n• 黄线仍在高位但蓝线已提前抬头扩大：聪明的债市资金开始撤离垃圾债，股市存在补跌风险\n• 蓝线急剧飙升(>12%) + 红线突破30：流动性危机爆发，金融机构去杠杆，需果断降仓防守",
+            "signal": "🚨 危机阈值：CCC信用利差突破 10%~12% 且 VIX 站上 30，代表系统性信用紧缩；利差见顶回落则是抄底黄金信号。",
         },
         # --- 四、市场端 ---
         {
             "id": "14",
             "category": "市场",
             "title": "14. 散户投资者情绪 (AAII Sentiment)",
-            "df": align_tail([aaii_df["散户净看涨差值(%)"], aaii_df["20周均线(%)"], spx], freq="W-FRI", n=156)
+            "df": align_tail([aaii_df["散户净看涨差值(%)"], aaii_df["20周均线(%)"], spx], freq="W-FRI", n=180)
             if not aaii_df.empty
-            else align_tail([spx], freq="W-FRI", n=156),
+            else align_tail([spx], freq="W-FRI", n=180),
             "right_cols": ["标普500指数"],
-            "left_title": "看涨减看跌差值 (%)",
+            "left_title": "看涨减看跌净差值 (%)",
             "right_title": "标普500点位",
-            "what": "• 蓝线：AAII散户看涨比例减看跌比例差值(%)\n• 红线：该情绪差值的20周移动平均线\n• 黄线(右轴)：标普500指数",
-            "how": "反向指标！散户往往在顶部极度乐观、在底部极度恐慌。观察蓝线触及历史极端正负值时的反向拐点。",
-            "signal": "🎯 逆向阈值：差值 > +25% 提示情绪过热阶段性见顶；差值 < -25% 提示极度悲观阶段性见底。",
+            "what": "• 蓝线(左轴)：AAII散户看涨比例减去看跌比例的净差值(%)\n• 红线(左轴)：该情绪净差值的20周移动平均线(%)\n• 黄线(右轴)：标普500指数",
+            "how": "经典的逆向心理指标！个人投资者往往在市场连续上涨后变得极度乐观（追高），而在市场大跌后陷入极度恐慌（割肉）。观察蓝线触及极端正负值时的均值回归拐点。",
+            "changes": "• 蓝线飙升至 +25% 以上且红线同步高位：散户看多情绪极度拥挤，潜在买盘枯竭，警惕阶段性回调\n• 蓝线暴跌至 -25% 以下：散户极度悲观恐慌，抛压接近尾声，往往对应中短期重要底部\n• 指数回调但蓝线迅速转负：健康的洗盘消化浮筹，牛市趋势未改",
+            "signal": "🎯 逆向阈值：净差值 > +25% 逢高减仓/对冲；净差值 < -25%（尤其 <-30%）是高胜率左侧分批布局区。",
         },
         {
             "id": "15",
             "category": "市场",
             "title": "15. 机构投资者情绪 (NAAIM Exposure)",
-            "df": align_tail([naaim_df["机构风险敞口(%)"], naaim_df["20周均线(%)"], spx], freq="W-FRI", n=156)
+            "df": align_tail([naaim_df["机构风险敞口(%)"], naaim_df["20周均线(%)"], spx], freq="W-FRI", n=180)
             if not naaim_df.empty
-            else align_tail([spx], freq="W-FRI", n=156),
+            else align_tail([spx], freq="W-FRI", n=180),
             "right_cols": ["标普500指数"],
-            "left_title": "机构股票仓位敞口 (%)",
+            "left_title": "机构平均股票仓位 (%)",
             "right_title": "标普500点位",
-            "what": "• 蓝线：NAAIM活跃投资经理平均股票仓位敞口(%)\n• 红线：敞口20周均线  • 黄线(右轴)：标普500指数",
-            "how": "机构同样存在追涨杀跌行为！当机构把仓位加满（接近100%甚至加杠杆）时买盘枯竭；当机构恐慌砍仓至低位时卖盘出清。",
-            "signal": "🎯 逆向阈值：机构敞口 ≥ 95%~100% 警惕短期回调；敞口 ≤ 40% 往往对应波段买点。",
+            "what": "• 蓝线(左轴)：NAAIM美国主动投资经理平均股票仓位敞口(%)（可超100%代表加杠杆）\n• 红线(左轴)：机构仓位20周均线(%)  • 黄线(右轴)：标普500指数",
+            "how": "机构基金经理同样面临季度排名考核压力，存在明显的「追涨杀跌与被迫补仓」行为。当机构满仓加杠杆时，后续增量资金枯竭；当机构砍仓至低位时，一旦市场企稳将引发踏空逼空买盘。",
+            "changes": "• 蓝线升至 95%~105% 满仓区：机构子弹已打光，市场对利空变得极为脆弱，易发生技术性回调\n• 蓝线骤降至 40% 以下：机构风控砍仓接近极限，卖盘出清，市场随时可能迎来报复性反弹\n• 黄线创新高但蓝线重心下移：机构在指数上涨过程中悄悄降仓派发，需警惕顶部背离",
+            "signal": "🎯 逆向阈值：机构敞口 ≥ 95% 警惕短期见顶；敞口 ≤ 40% 往往对应波段重要买点。",
         },
         {
             "id": "16",
@@ -600,37 +769,40 @@ def build_all_charts() -> list:
             "right_cols": ["标普500指数"],
             "left_title": "看跌/看涨成交量比值",
             "right_title": "标普500点位",
-            "what": "• 蓝线：CBOE股票看跌期权(Put)÷看涨期权(Call)成交比\n• 红线：20日移动平均线  • 黄线(右轴)：标普500指数",
-            "how": "真金白银的日度交易情绪。比值越高，说明市场买入看跌期权对冲/做空的恐慌情绪越浓。",
-            "signal": "🎯 逆向阈值：Put/Call 比值 > 1.0（尤其20日均线显著抬升）往往对应市场阶段性底部。",
+            "what": "• 蓝线(左轴)：CBOE个股看跌期权(Put) ÷ 看涨期权(Call)日成交量比值\n• 红线(左轴)：Put/Call比值的20日移动平均线  • 黄线(右轴)：标普500指数",
+            "how": "反映交易员用真金白银押注下跌对冲（买Put）与押注上涨（买Call）的实时比例。比值越高，说明市场花重金买保险对冲暴跌的恐慌情绪越浓烈。",
+            "changes": "• 蓝线单日脉冲冲高(>0.95)且红线显著抬升：市场恐慌性买入看跌期权对冲，做空力量达到高潮，底部临近\n• 蓝线持续压低至 0.50 以下：市场沉迷买入看涨期权追涨，投机过热，短期易出现震荡洗盘\n• 黄线下跌过程中蓝线不再创新高：恐慌情绪边际钝化，卖压衰竭",
+            "signal": "🎯 逆向阈值：Equity Put/Call 单日突破 1.0 或 20日均线升破 0.78，往往对应美股阶段性底部拐点。",
         },
         {
             "id": "17",
             "category": "市场",
             "title": "17. S&P 500 投机者持仓 (CFTC COT)",
-            "df": align_tail([cot_df["标普500投机净持仓(手)"], spx], freq="W-FRI", n=156)
-            if not cot_df.empty and "标普500投机净持仓(手)" in cot_df
-            else align_tail([spx], freq="W-FRI", n=156),
+            "df": align_tail([cot_df["标普500投机净持仓(万手)"], spx], freq="W-FRI", n=180)
+            if not cot_df.empty and "标普500投机净持仓(万手)" in cot_df
+            else align_tail([spx], freq="W-FRI", n=180),
             "right_cols": ["标普500指数"],
-            "left_title": "非商业净持仓 (手)",
+            "left_title": "非商业净持仓 (万手)",
             "right_title": "标普500点位",
-            "what": "• 蓝线：CFTC E-Mini标普500期货大型投机者净多空持仓\n• 红线(右轴)：标普500指数",
-            "how": "正值代表总体净做多，负值代表总体净做空（每周五公布上周二数据）。重点观察极端净空头仓位下的「轧空 (Short Squeeze)」潜力。",
-            "signal": "🎯 轧空提示：当净空头持仓处于历史极低负值区而股指拒跌反弹时，空头平仓止损会引发剧烈上涨。",
+            "what": "• 蓝线(左轴)：CFTC CME E-Mini标普500期货大型投机者（对冲基金）净多空持仓(万手)\n• 红线(右轴)：标普500指数",
+            "how": "0轴上方代表对冲基金整体净做多，0轴下方代表整体净做空（每周五发布截至周二数据）。在衍生品市场中，极端拥挤的空头仓位往往成为未来上涨的最大燃料。",
+            "changes": "• 蓝线处于深幅负值区(-15万手以下)但红线拒跌反弹：空头被套被迫平仓回补，极易触发「轧空(Short Squeeze)」暴涨\n• 蓝线持续攀升至历史高位(+15万手以上)：多头持仓高度拥挤，若无新资金接力易引发获利了结\n• 蓝线随红线同步稳步回升：趋势资金顺势加仓，上涨动能健康",
+            "signal": "🎯 轧空提示：当标普投机净空头处于历史极值区而指数站稳关键均线时，空头回补将驱动凌厉主升浪。",
         },
         {
             "id": "18",
             "category": "市场",
             "title": "18. Nasdaq 100 投机者持仓 (CFTC COT)",
-            "df": align_tail([cot_df["纳指100投机净持仓(手)"], ndx], freq="W-FRI", n=156)
-            if not cot_df.empty and "纳指100投机净持仓(手)" in cot_df
-            else align_tail([ndx], freq="W-FRI", n=156),
+            "df": align_tail([cot_df["纳指100投机净持仓(万手)"], ndx], freq="W-FRI", n=180)
+            if not cot_df.empty and "纳指100投机净持仓(万手)" in cot_df
+            else align_tail([ndx], freq="W-FRI", n=180),
             "right_cols": ["纳斯达克100指数"],
-            "left_title": "非商业净持仓 (手)",
+            "left_title": "非商业净持仓 (万手)",
             "right_title": "纳斯达克100点位",
-            "what": "• 蓝线：CFTC 纳斯达克100期货大型投机者净多空持仓\n• 红线(右轴)：纳斯达克100指数",
-            "how": "对比图17，观察大型机构对「大型科技成长股」与「全市场大盘」的态度分化。",
-            "signal": "💡 观察要点：若标普净空而纳指净多，说明资金抱团AI与科技龙头；若纳指多头极度拥挤则防科技股获利回吐。",
+            "what": "• 蓝线(左轴)：CFTC 纳斯达克100期货大型投机者净多空持仓(万手)\n• 红线(右轴)：纳斯达克100指数",
+            "how": "专门追踪机构资金对「大型科技成长股」的杠杆押注态度。将本图与图17（标普500持仓）交叉对比，可看清主力资金是「全面看多」还是「做多科技、做空传统大盘」的结构化抱团。",
+            "changes": "• 图17净空而本图蓝线净多：机构明显偏好AI与科技龙头，科技股超额收益显著\n• 蓝线触及历史极端净多高位后拐头向下：科技板块抱团松动，需防范高估值成长股获利回吐\n• 蓝线跌入深度净空区后回升：科技股经历充分去杠杆，迎来新一轮配置窗口",
+            "signal": "💡 实战信号：对比图17与图18的剪刀差，可精准识别市场处于「科技抱团」还是「风格切换」阶段。",
         },
         {
             "id": "19",
@@ -640,25 +812,40 @@ def build_all_charts() -> list:
             if not breadth_df.empty
             else align_tail([spx], freq="D", n=250),
             "right_cols": ["标普500指数"],
-            "left_title": "站上均线股票占比 (%)",
+            "left_title": "站上均线成分股占比 (%)",
             "right_title": "标普500点位",
-            "what": "• 蓝线：标普500成分股股价高于50日均线的比例(%)\n• 红线：股价高于200日均线的比例(%)\n• 黄线(右轴)：标普500指数",
-            "how": "最直观的「贪婪与恐惧」实战量化器，识别指数虚涨（少数巨头拉升、多数个股下跌的顶背离）或普跌超卖。",
-            "signal": "🎯 买卖极区：50日宽度 > 85% 提示短期顶部；< 15% 提示短期底部。若50日与200日宽度同时 >85% 或 <15%，常为中长线大拐点！",
+            "what": "• 蓝线(左轴)：标普500成分股中收盘价高于50日均线的股票占比(%)\n• 红线(左轴)：标普500成分股中收盘价高于200日均线的股票占比(%)\n• 黄线(右轴)：标普500指数",
+            "how": "穿透指数表面涨跌的「透视镜」。标普500受前七大权重股影响极大，市场宽度能识别「指数虚涨、多数个股下跌」的危险顶背离，以及「全面超卖」的黄金买点。",
+            "changes": "• 黄线创新高，但蓝线/红线重心明显下移（顶背离）：仅靠少数巨头撑盘，内部多数股票走弱，警惕指数补跌\n• 蓝线暴跌至 15% 以下：85%以上成分股跌破中期均线，短期恐慌超卖极致，随时反弹\n• 红线跌破 20% 后重新站上 30%：熊市全面出清后的长线大牛市启动信号",
+            "signal": "🎯 买卖极区：50日宽度 > 85% 提示短期过热；< 15% 提示短期超卖。若50日与200日宽度同时 < 15%，为罕见中长线大底！",
         },
         {
-            "id": "20",
+            "id": "20A",
             "category": "市场",
-            "title": "20. 美股11大板块相对强度轮动 (11 Sectors)",
-            "df": sec_df,
+            "title": "20A. 美股进攻与成长板块轮动 (6大进攻板块)",
+            "df": sec_off_df,
             "right_cols": [],
-            "left_title": "相对VTI强弱指数 (起点=100)",
+            "left_title": "相对全市场VTI强弱 (起点=100)",
             "right_title": "",
-            "what": "• 全部11个经济部门ETF ÷ 全市场VTI 标准化强弱比值\n• 进攻：科技XLK/可选XLY/金融XLF/通讯XLC/工业XLI/能源XLE/材料XLB/地产XLRE\n• 防御：必需消费XLP/医疗XLV/公用事业XLU",
-            "how": "比值上升代表该板块跑赢大盘，比值下降代表跑输大盘。通过防御板块与进攻板块的跷跷板，判断主力资金的风险偏好。",
-            "signal": "🎯 轮动策略：必需消费/医疗/公用事业走强＝Risk-Off（避险防御）；科技/可选消费走强＝Risk-On（积极进攻）。",
+            "what": "• 6大进攻/周期板块ETF ÷ 全市场VTI 标准化相对强弱（1年前起点=100）：\n• 蓝:科技XLK | 红:通讯XLC | 黄:可选消费XLY | 绿:金融XLF | 紫:工业XLI | 青:能源XLE",
+            "how": "曲线向上倾斜代表该板块跑赢大盘（资金净流入），向下倾斜代表跑输大盘（资金流出）。观察进攻板块内部是由「科技成长」领涨，还是切换至「金融/工业/能源顺周期」。",
+            "changes": "• 科技XLK + 通讯XLC 领跑上升：AI与成长股主导牛市，风险偏好高涨\n• 金融XLF + 工业XLI + 能源XLE 接力走强：经济软着陆与再通胀交易主导，资金向顺周期价值扩散\n• 6大进攻板块全线跌破100走弱：市场进入全面防御避险模式",
+            "signal": "🎯 轮动策略：顺势超配斜率最陡峭、处于100线上方的1~2个领涨板块，回避持续阴跌的弱势板块。",
         },
-        # --- 五、进阶扩展模块 ---
+        {
+            "id": "20B",
+            "category": "市场",
+            "title": "20B. 美股防御与利率敏感板块轮动 (5大防御/周期板块)",
+            "df": sec_def_df,
+            "right_cols": [],
+            "left_title": "相对全市场VTI强弱 (起点=100)",
+            "right_title": "",
+            "what": "• 5大防御/利率敏感板块ETF ÷ 全市场VTI 标准化相对强弱（1年前起点=100）：\n• 蓝:医疗XLV(防御) | 红:必需消费XLP(防御) | 黄:公用事业XLU(防御) | 绿:房地产XLRE | 紫:原材料XLB",
+            "how": "防御板块（医疗、必需消费、公用事业）盈利受经济周期影响小，是机构避险的「资金蓄水池」；房地产XLRE对美债利率下行最敏感；原材料XLB挂钩大宗商品价格。",
+            "changes": "• 蓝/红/黄三线集体抬头跑赢大盘：典型的「Risk-Off 避险预警」，说明机构正在撤出高波动股票转向防御\n• 绿线(房地产XLRE)与黄线(公用事业XLU)同步走强：市场正在交易美债收益率下行与降息周期\n• 三大防御板块持续单边下行：市场风险偏好极强，资金全线进攻",
+            "signal": "🚨 避险警报：当必需消费(XLP)与公用事业(XLU)连续数周显著跑赢科技(XLK)时，大盘往往面临系统性回调压力。",
+        },
+        # --- 五、核心焦点扩展模块 ---
         {
             "id": "21",
             "category": "扩展",
@@ -667,21 +854,23 @@ def build_all_charts() -> list:
             "right_cols": [],
             "left_title": "相对强弱指数 (1年前起点=100)",
             "right_title": "",
-            "what": "• AI芯片SMH ÷ 标普SPY / 纳指QQQ / 罗素小盘IWM / 道指DIA\n• AI应用AIQ ÷ 标普SPY  |  AI机器人BOTZ ÷ 标普SPY",
-            "how": "衡量AI核心资产相对美股四大宽基的超额收益与资金虹吸效应。SMH/SPY持续走高代表AI算力领涨大盘；对比SMH/IWM与SMH/DIA可判断资金是抱团AI科技还是轮动至传统蓝筹与中小盘。",
-            "signal": "🎯 轮动信号：SMH/SPY 与 AIQ/SPY 同步创高＝AI主升浪；若 SMH/SPY 跌破趋势而 SMH/IWM 回落＝资金高低切换（从AI撤向中小盘/价值股）。",
+            "what": "• 蓝:AI芯片SMH÷标普SPY | 红:AI应用AIQ÷标普SPY | 黄:AI机器人BOTZ÷标普SPY\n• 绿:AI芯片SMH÷纳指QQQ | 紫:AI芯片SMH÷罗素小盘IWM | 青:AI芯片SMH÷道指DIA",
+            "how": "精确量化AI核心产业链相对美股四大宽基指数的超额收益与资金虹吸效应。对比「芯片(SMH) vs 应用(AIQ)」可判断AI行情处于算力基建期还是软件变现期；对比「SMH/IWM 与 SMH/DIA」可监测资金高低切换。",
+            "changes": "• 蓝线(SMH/SPY)与红线(AIQ/SPY)同步上行：AI全产业链领涨大盘，主升浪确立\n• 蓝线走平或回落，而红线(AIQ/SPY)接力走强：资金从高估值算力芯片向AI软件与应用端扩散\n• 紫线(SMH/IWM)与青线(SMH/DIA)大幅回落：资金从AI科技巨头撤出，流向中小盘与传统蓝筹补涨",
+            "signal": "🎯 轮动信号：SMH/SPY 趋势向上时坚定持有AI核心龙头；若 SMH/QQQ 与 SMH/IWM 同步跌破中期趋势线，注意科技股阶段休整。",
         },
         {
             "id": "22",
             "category": "扩展",
-            "title": "22. 全球七大核心资产资金净流入/流出 (Global Flows)",
+            "title": "22. 全球七大核心资产资金净流入/流出强度 (Global Flows)",
             "df": global_flow_df,
             "right_cols": [],
-            "left_title": "20日滚动资金净流向 (亿美元)",
+            "left_title": "20日资金流净强弱指数 (%)",
             "right_title": "",
-            "what": "• 旗舰ETF 20日滚动累计主动资金净流向（亿美元）：\n• 美股SPY、科技QQQ、新兴市场EEM、美债TLT、黄金GLD、商品DBC、比特币IBIT",
-            "how": "基于每日成交额与多空收盘强度的机构资金流模型。零轴(0)上方代表过去1个月买盘主导的净流入，零轴下方代表抛盘主导的净流出。",
-            "signal": "🎯 资金风向：SPY/QQQ/IBIT 同步净流入＝全球风险偏好极强；TLT/GLD 净流入而股市净流出＝全球大资金转向避险。",
+            "what": "• 旗舰ETF 20日滚动主动资金净流向强度(%)（消除体量差异，统一量纲）：\n• 蓝:美股SPY | 红:科技QQQ | 黄:新兴市场EEM | 绿:美债TLT | 紫:黄金GLD | 青:商品DBC | 洋红:比特币IBIT",
+            "how": "基于每日成交价格在高低点之间的位置与成交额加权计算的资金流模型。0轴上方代表过去20个交易日买盘主导的资金净流入，0轴下方代表抛盘主导的资金净流出。",
+            "changes": "• 美股SPY/QQQ + 比特币IBIT 同步位于0轴上方：全球流动性充裕，风险资产全面吸金\n• 美债TLT + 黄金GLD 翻正净流入，而股市跌入0轴下方：全球大资金转向防御避险\n• 黄金GLD + 商品DBC 同步强势净流入：通胀预期升温，实物抗通胀资产受追捧",
+            "signal": "🎯 资金风向：资金流强弱指数突破 +10% 代表机构持续建仓趋势强劲；跌破 -10% 代表机构持续派发撤离。",
         },
     ]
     return charts
@@ -698,15 +887,17 @@ def generate_ai_summary(charts: list) -> str:
             continue
         last_row = df.iloc[-1]
         date_str = df.index[-1].strftime("%Y-%m-%d")
-        vals = ", ".join([f"{col}={last_row[col]:.2f}" for col in df.columns[:4]])
+        vals = ", ".join(
+            [f"{col}={last_row[col]:.2f}" for col in df.columns[:4] if pd.notna(last_row[col])]
+        )
         metrics_snapshot.append(f"{c['title']} ({date_str}): {vals}")
     context_text = "\n".join(metrics_snapshot)
 
     if OPENAI_API_KEY:
         try:
             prompt = (
-                "你是资深美股宏观与量化策略师。请根据以下最新拉取的22张核心图表数据快照，"
-                "用简洁有力的中文写一段200字以内的【本期宏观、AI强弱与全球资金流总评】，依次点明："
+                "你是资深美股宏观与量化策略师。请根据以下最新拉取的23张核心图表数据快照，"
+                "用简洁有力的中文写一段220字以内的【本期宏观、AI强弱与全球资金流总评】，依次点明："
                 "1) 消费与供给趋势；2) 利率与信用风险；3) 市场宽度、AI板块相对大盘强弱及全球主要资产净流入方向。\n\n"
                 f"{context_text}"
             )
@@ -720,7 +911,7 @@ def generate_ai_summary(charts: list) -> str:
                     "model": "gpt-4o-mini",
                     "messages": [{"role": "user", "content": prompt}],
                     "temperature": 0.3,
-                    "max_tokens": 380,
+                    "max_tokens": 420,
                 },
                 timeout=30,
             )
@@ -732,28 +923,51 @@ def generate_ai_summary(charts: list) -> str:
     return (
         "数据已自动同步至最新交易日。请重点核查：① 纽约联储WEI指数与油金/铜金比通胀方向；"
         "② 10年与2年期美债利率倒挂状态及CCC信用利差；③ 标普500市场宽度是否触及85%/15%极区；"
-        "④ AI芯片(SMH)/应用(AIQ)相对标普SPY超额强弱，以及全球股/债/黄金/比特币20日资金净流向。"
+        "④ AI芯片(SMH)/应用(AIQ)相对标普SPY超额强弱，以及全球股/债/黄金/比特币20日资金净流向强度。"
     )
 
 
+def compute_axis_bounds(df: pd.DataFrame, cols: list) -> tuple:
+    """动态计算坐标轴合理的最小/最大值，防止曲线被 0 轴压缩粘连"""
+    valid_cols = [c for c in cols if c in df.columns]
+    if not valid_cols:
+        return None, None
+    sub = df[valid_cols].dropna(how="all")
+    if sub.empty:
+        return None, None
+    ymin = float(sub.min().min())
+    ymax = float(sub.max().max())
+    if np.isnan(ymin) or np.isnan(ymax):
+        return None, None
+    if abs(ymax - ymin) < 1e-6:
+        return round(ymin - 1.0, 2), round(ymax + 1.0, 2)
+    pad = (ymax - ymin) * 0.10
+    low = ymin - pad
+    high = ymax + pad
+    if ymin >= 0 and low < 0 and ymin < (ymax - ymin) * 0.15:
+        low = 0.0
+    return round(low, 2), round(high, 2)
+
+
 # ==========================================
-# 5. 写入底层数据并渲染美观的 22 图看板
+# 5. 写入底层数据并渲染高清 23 图看板
 # ==========================================
 def render_to_google_sheets(charts: list, ai_summary: str):
     sh = gc.open_by_key(SPREADSHEET_ID)
 
+    total_dash_rows = 680
     existing_titles = {ws.title: ws for ws in sh.worksheets()}
     if DASH_SHEET_NAME not in existing_titles:
-        dash_ws = sh.add_worksheet(title=DASH_SHEET_NAME, rows=470, cols=16)
+        dash_ws = sh.add_worksheet(title=DASH_SHEET_NAME, rows=total_dash_rows, cols=16)
     else:
         dash_ws = existing_titles[DASH_SHEET_NAME]
-        dash_ws.resize(rows=470, cols=16)
+        dash_ws.resize(rows=total_dash_rows, cols=16)
 
     if RAW_SHEET_NAME not in existing_titles:
-        raw_ws = sh.add_worksheet(title=RAW_SHEET_NAME, rows=420, cols=180)
+        raw_ws = sh.add_worksheet(title=RAW_SHEET_NAME, rows=420, cols=200)
     else:
         raw_ws = existing_titles[RAW_SHEET_NAME]
-        raw_ws.resize(rows=420, cols=180)
+        raw_ws.resize(rows=420, cols=200)
 
     dash_ws.clear()
     raw_ws.clear()
@@ -791,29 +1005,34 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         for j, col_name in enumerate(df.columns):
             raw_grid[1][col_cursor + 1 + j] = col_name
 
+        valid_counts = {}
+        for j, col_name in enumerate(df.columns):
+            valid_counts[col_name] = int(df[col_name].notna().sum())
+
         for i, (dt, row) in enumerate(df.iterrows()):
             raw_grid[2 + i][col_cursor] = dt.strftime("%Y-%m-%d")
             for j, val in enumerate(row):
-                raw_grid[2 + i][col_cursor + 1 + j] = None if pd.isna(val) else round(float(val), 4)
+                raw_grid[2 + i][col_cursor + 1 + j] = "" if pd.isna(val) else round(float(val), 4)
 
         chart_ranges[c["id"]] = {
             "start_col": col_cursor,
             "num_series": n_cols,
             "num_rows": n_rows,
             "columns": list(df.columns),
+            "valid_counts": valid_counts,
         }
         col_cursor += n_cols + 2
 
     raw_ws.update(range_name="A1", values=raw_grid, value_input_option="USER_ENTERED")
 
     # ------------------------------------------
-    # B. 构建 Dashboard 文本卡片与章节结构
+    # B. 构建 Dashboard 文本卡片与四段式详细读图指南
     # ------------------------------------------
     tz_cst = timezone(timedelta(hours=8))
     now_str = datetime.now(tz_cst).strftime("%Y-%m-%d %H:%M (UTC+8)")
 
-    dash_grid = [[""] * 14 for _ in range(465)]
-    dash_grid[1][1] = "📈 美股核心 22 张宏观、AI强弱与全球资金流看板"
+    dash_grid = [[""] * 15 for _ in range(total_dash_rows)]
+    dash_grid[1][1] = "📈 美股核心 23 张宏观、AI强弱与全球资金流全景看板"
     dash_grid[2][1] = f"自动更新时间：{now_str}   |   数据来源：FRED 美联储 · Yahoo Finance · AAII · NAAIM · CBOE · CFTC"
     dash_grid[3][1] = f"🤖 AI 宏观与资金流总评：{ai_summary}"
 
@@ -822,12 +1041,15 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         "供给": ("二、供给端 (Supply — 提前 3~6 个月预判供需缺口与通胀拐点的先行指标)", {"red": 0.08, "green": 0.42, "blue": 0.45}),
         "利率": ("三、利率端 (Interest Rates — 资产定价之锚、曲线倒挂与系统性违约风险标杆)", {"red": 0.34, "green": 0.22, "blue": 0.48}),
         "市场": ("四、市场端 (Market — 群体情绪极值反转、机构持仓拥挤度与11大板块轮动)", {"red": 0.13, "green": 0.42, "blue": 0.32}),
-        "扩展": ("五、核心焦点扩展 (AI 板块对比各大股指相对强弱 & 全球七大资产资金净流入/流出)", {"red": 0.65, "green": 0.24, "blue": 0.14}),
+        "扩展": ("五、核心焦点扩展 (AI 板块对比各大股指相对强弱 & 全球七大资产资金净流入/流出强度)", {"red": 0.65, "green": 0.24, "blue": 0.14}),
     }
 
     row_cursor = 5
     current_cat = None
     layout_blocks = []
+
+    # 每张图占 26 行（25行内容 + 1行间距），配合右侧 5 列宽幅面板，容纳超详细四段式解读
+    CARD_ROWS = 25
 
     for c in charts:
         cat = c["category"]
@@ -839,13 +1061,15 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             row_cursor += 2
 
         r0 = row_cursor
-        dash_grid[r0][9] = f"📌 {c['title']} — 读图指南"
-        dash_grid[r0 + 1][9] = "【曲线分别代表什么】"
+        dash_grid[r0][9] = f"📌 {c['title']} — 深度读图与实战指南"
+        dash_grid[r0 + 1][9] = "【① 曲线与坐标轴含义】"
         dash_grid[r0 + 2][9] = c["what"]
-        dash_grid[r0 + 6][9] = "【怎么看 / 核心逻辑】"
+        dash_grid[r0 + 6][9] = "【② 怎么读 / 核心传导逻辑】"
         dash_grid[r0 + 7][9] = c["how"]
-        dash_grid[r0 + 12][9] = "【关键阈值与信号】"
-        dash_grid[r0 + 13][9] = c["signal"]
+        dash_grid[r0 + 12][9] = "【③ 走势变化深度解读（上升 / 下降 / 背离）】"
+        dash_grid[r0 + 13][9] = c["changes"]
+        dash_grid[r0 + 20][9] = "【④ 关键阈值与实战风控信号】"
+        dash_grid[r0 + 21][9] = c["signal"]
 
         layout_blocks.append({
             "type": "chart_card",
@@ -853,18 +1077,23 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             "chart": c,
             "color": category_banners[cat][1],
         })
-        row_cursor += 18
+        row_cursor += CARD_ROWS + 1
 
     dash_ws.update(range_name="A1", values=dash_grid[: row_cursor + 5], value_input_option="USER_ENTERED")
 
     # ------------------------------------------
-    # C. 批量发送排版样式 + 22张原生图表构建请求
+    # C. 批量发送排版样式 + 23张高清原生图表构建请求
     # ------------------------------------------
     dash_id = dash_ws.id
     raw_id = raw_ws.id
     requests_batch = []
 
-    col_widths = [(0, 1, 24)] + [(i, i + 1, 97) for i in range(1, 9)] + [(i, i + 1, 138) for i in range(9, 13)]
+    # 左侧图表占 B:I (8列 * 102px = 816px)，右侧读图指南占 J:N (5列 * 136px = 680px)
+    col_widths = (
+        [(0, 1, 24)]
+        + [(i, i + 1, 102) for i in range(1, 9)]
+        + [(i, i + 1, 136) for i in range(9, 14)]
+    )
     for start_c, end_c, px in col_widths:
         requests_batch.append({
             "updateDimensionProperties": {
@@ -881,16 +1110,17 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         }
     })
 
+    # 顶部标题与AI总评
     requests_batch.extend([
         {
             "mergeCells": {
-                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 14},
                 "mergeType": "MERGE_ALL",
             }
         },
         {
             "repeatCell": {
-                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": 1, "endRowIndex": 2, "startColumnIndex": 1, "endColumnIndex": 14},
                 "cell": {
                     "userEnteredFormat": {
                         "backgroundColor": {"red": 0.10, "green": 0.15, "blue": 0.23},
@@ -910,13 +1140,13 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         },
         {
             "mergeCells": {
-                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 14},
                 "mergeType": "MERGE_ALL",
             }
         },
         {
             "repeatCell": {
-                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": 2, "endRowIndex": 3, "startColumnIndex": 1, "endColumnIndex": 14},
                 "cell": {
                     "userEnteredFormat": {
                         "backgroundColor": {"red": 0.94, "green": 0.96, "blue": 0.98},
@@ -929,13 +1159,13 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         },
         {
             "mergeCells": {
-                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 14},
                 "mergeType": "MERGE_ALL",
             }
         },
         {
             "repeatCell": {
-                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": 3, "endRowIndex": 4, "startColumnIndex": 1, "endColumnIndex": 14},
                 "cell": {
                     "userEnteredFormat": {
                         "backgroundColor": {"red": 1.0, "green": 0.98, "blue": 0.90},
@@ -950,7 +1180,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         {
             "updateDimensionProperties": {
                 "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": 3, "endIndex": 4},
-                "properties": {"pixelSize": 56},
+                "properties": {"pixelSize": 60},
                 "fields": "pixelSize",
             }
         },
@@ -964,13 +1194,13 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             requests_batch.extend([
                 {
                     "mergeCells": {
-                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 13},
+                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 14},
                         "mergeType": "MERGE_ALL",
                     }
                 },
                 {
                     "repeatCell": {
-                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 13},
+                        "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 1, "endColumnIndex": 14},
                         "cell": {
                             "userEnteredFormat": {
                                 "backgroundColor": col_rgb,
@@ -984,7 +1214,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                 {
                     "updateDimensionProperties": {
                         "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + 1},
-                        "properties": {"pixelSize": 32},
+                        "properties": {"pixelSize": 34},
                         "fields": "pixelSize",
                     }
                 },
@@ -994,22 +1224,23 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         c = blk["chart"]
         requests_batch.append({
             "updateDimensionProperties": {
-                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + 17},
+                "range": {"sheetId": dash_id, "dimension": "ROWS", "startIndex": r0, "endIndex": r0 + CARD_ROWS},
                 "properties": {"pixelSize": 22},
                 "fields": "pixelSize",
             }
         })
 
+        # 卡片主标题栏 (J:N)
         requests_batch.extend([
             {
                 "mergeCells": {
-                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 14},
                     "mergeType": "MERGE_ALL",
                 }
             },
             {
                 "repeatCell": {
-                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                    "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": 9, "endColumnIndex": 14},
                     "cell": {
                         "userEnteredFormat": {
                             "backgroundColor": col_rgb,
@@ -1022,17 +1253,18 @@ def render_to_google_sheets(charts: list, ai_summary: str):
             },
         ])
 
-        for sr in [r0 + 1, r0 + 6, r0 + 12]:
+        # 4 个小节标题栏
+        for sr in [r0 + 1, r0 + 6, r0 + 12, r0 + 20]:
             requests_batch.extend([
                 {
                     "mergeCells": {
-                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 14},
                         "mergeType": "MERGE_ALL",
                     }
                 },
                 {
                     "repeatCell": {
-                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "range": {"sheetId": dash_id, "startRowIndex": sr, "endRowIndex": sr + 1, "startColumnIndex": 9, "endColumnIndex": 14},
                         "cell": {
                             "userEnteredFormat": {
                                 "backgroundColor": {"red": 0.93, "green": 0.95, "blue": 0.98},
@@ -1045,22 +1277,29 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                 },
             ])
 
-        for idx_b, (br_start, br_end) in enumerate([(r0 + 2, r0 + 6), (r0 + 7, r0 + 12), (r0 + 13, r0 + 17)]):
-            bg = {"red": 0.99, "green": 0.96, "blue": 0.95} if idx_b == 2 else {"red": 0.98, "green": 0.99, "blue": 1.0}
+        # 4 个内容正文区
+        body_blocks = [
+            (r0 + 2, r0 + 6),
+            (r0 + 7, r0 + 12),
+            (r0 + 13, r0 + 20),
+            (r0 + 21, r0 + 25),
+        ]
+        for idx_b, (br_start, br_end) in enumerate(body_blocks):
+            bg = {"red": 0.99, "green": 0.96, "blue": 0.95} if idx_b == 3 else {"red": 0.98, "green": 0.99, "blue": 1.0}
             requests_batch.extend([
                 {
                     "mergeCells": {
-                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 14},
                         "mergeType": "MERGE_ALL",
                     }
                 },
                 {
                     "repeatCell": {
-                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 13},
+                        "range": {"sheetId": dash_id, "startRowIndex": br_start, "endRowIndex": br_end, "startColumnIndex": 9, "endColumnIndex": 14},
                         "cell": {
                             "userEnteredFormat": {
                                 "backgroundColor": bg,
-                                "textFormat": {"foregroundColor": {"red": 0.15, "green": 0.18, "blue": 0.22}, "fontSize": 9},
+                                "textFormat": {"foregroundColor": {"red": 0.14, "green": 0.17, "blue": 0.21}, "fontSize": 9},
                                 "wrapStrategy": "WRAP",
                                 "verticalAlignment": "TOP",
                             }
@@ -1070,10 +1309,10 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                 },
             ])
 
-        border_style = {"style": "SOLID", "width": 1, "color": {"red": 0.80, "green": 0.84, "blue": 0.90}}
+        border_style = {"style": "SOLID", "width": 1, "color": {"red": 0.78, "green": 0.83, "blue": 0.89}}
         requests_batch.append({
             "updateBorders": {
-                "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + 17, "startColumnIndex": 9, "endColumnIndex": 13},
+                "range": {"sheetId": dash_id, "startRowIndex": r0, "endRowIndex": r0 + CARD_ROWS, "startColumnIndex": 9, "endColumnIndex": 14},
                 "top": border_style,
                 "bottom": border_style,
                 "left": border_style,
@@ -1088,19 +1327,44 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         sc = info["start_col"]
         nr = info["num_rows"]
         cols = info["columns"]
+        valid_counts = info["valid_counts"]
         right_set = set(c.get("right_cols", []))
+        left_cols = [col for col in cols if col not in right_set]
+        active_right_cols = [col for col in cols if col in right_set]
+
+        # 计算左右轴自适应范围，彻底解决曲线被压缩粘连
+        l_min, l_max = compute_axis_bounds(c["df"], left_cols)
+        left_axis_spec = {"position": "LEFT_AXIS", "title": c["left_title"]}
+        if l_min is not None and l_max is not None:
+            left_axis_spec["viewWindowOptions"] = {
+                "viewWindowMin": l_min,
+                "viewWindowMax": l_max,
+                "viewWindowMode": "EXPLICIT",
+            }
 
         axes = [
             {"position": "BOTTOM_AXIS", "title": "日期"},
-            {"position": "LEFT_AXIS", "title": c["left_title"]},
+            left_axis_spec,
         ]
-        if right_set and any(col in right_set for col in cols):
-            axes.append({"position": "RIGHT_AXIS", "title": c["right_title"]})
+
+        if active_right_cols:
+            r_min, r_max = compute_axis_bounds(c["df"], active_right_cols)
+            right_axis_spec = {"position": "RIGHT_AXIS", "title": c["right_title"]}
+            if r_min is not None and r_max is not None:
+                right_axis_spec["viewWindowOptions"] = {
+                    "viewWindowMin": r_min,
+                    "viewWindowMax": r_max,
+                    "viewWindowMode": "EXPLICIT",
+                }
+            axes.append(right_axis_spec)
 
         series_specs = []
         for j, col_name in enumerate(cols):
             target_ax = "RIGHT_AXIS" if col_name in right_set else "LEFT_AXIS"
-            series_specs.append({
+            color_rgb = PALETTE[j % len(PALETTE)]
+            # 若序列有效点数较少（如成屋销售仅近1年），自动显示圆点标记使其清晰可见
+            pt_size = 5 if valid_counts.get(col_name, 99) <= 15 else 0
+            series_item = {
                 "series": {
                     "sourceRange": {
                         "sources": [{
@@ -1113,11 +1377,16 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                     }
                 },
                 "targetAxis": target_ax,
-            })
+                "color": color_rgb,
+                "lineStyle": {"width": 2, "type": "SOLID"},
+            }
+            if pt_size > 0:
+                series_item["pointStyle"] = {"size": pt_size, "shape": "CIRCLE"}
+            series_specs.append(series_item)
 
-        short_sub = c["what"].replace("\n", " | ")
-        if len(short_sub) > 120:
-            short_sub = short_sub[:117] + "..."
+        short_sub = c["what"].split("\n")[0]
+        if len(short_sub) > 105:
+            short_sub = short_sub[:102] + "..."
 
         requests_batch.append({
             "addChart": {
@@ -1151,15 +1420,15 @@ def render_to_google_sheets(charts: list, ai_summary: str):
                             "anchorCell": {"sheetId": dash_id, "rowIndex": r0, "columnIndex": 1},
                             "offsetXPixels": 2,
                             "offsetYPixels": 2,
-                            "widthPixels": 768,
-                            "heightPixels": 370,
+                            "widthPixels": 808,
+                            "heightPixels": 544,
                         }
                     },
                 }
             }
         })
 
-    chunk_size = 60
+    chunk_size = 55
     for i in range(0, len(requests_batch), chunk_size):
         sheets_service.spreadsheets().batchUpdate(
             spreadsheetId=SPREADSHEET_ID,
@@ -1167,7 +1436,7 @@ def render_to_google_sheets(charts: list, ai_summary: str):
         ).execute()
         time.sleep(1)
 
-    print("✅ 全部 22 张核心图表与读图指南卡片已更新完毕！")
+    print("✅ 全部 23 张高清图表与四段式深度读图指南已更新完毕！")
 
 
 if __name__ == "__main__":
